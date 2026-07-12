@@ -19,6 +19,8 @@
 (defconstant +q6-k-scale-count+ 16)
 (defconstant +ggml-type-f32+ 0)
 (defconstant +ggml-type-f16+ 1)
+(defconstant +ggml-type-q5-0+ 6)
+(defconstant +ggml-type-q8-0+ 8)
 (defconstant +ggml-type-bf16+ 30)
 (defconstant +ggml-type-q4-k+ 12)
 (defconstant +ggml-type-q5-k+ 13)
@@ -374,6 +376,16 @@
 (defun sigmoid (value)
   (coerce (/ 1.0d0 (+ 1.0d0 (exp (- value)))) 'single-float))
 
+(defun softplus (value)
+  (let ((x (coerce value 'single-float)))
+    (if (> x 20.0f0)
+        x
+        (coerce (log (+ 1.0d0 (exp x))) 'single-float))))
+
+(defun relu-squared (value)
+  (let ((x (max 0.0f0 (coerce value 'single-float))))
+    (* x x)))
+
 (defun apply-silu (vector)
   (map 'vector #'silu vector))
 
@@ -400,6 +412,18 @@
     (declare (fixnum index))
     (setf (aref dest index)
           (sigmoid (aref vector index)))))
+
+(defun apply-relu-squared-into (dest vector)
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array single-float (*)) dest vector))
+  (unless (= (length dest) (length vector))
+    (error "APPLY-RELU-SQUARED destination length ~d does not match vector length ~d."
+           (length dest)
+           (length vector)))
+  (dotimes (index (length vector) dest)
+    (declare (fixnum index))
+    (setf (aref dest index)
+          (relu-squared (aref vector index)))))
 
 (defun apply-rope (vector position &key (rope-dimension (length vector)) (theta-base 10000.0d0))
   (unless (evenp rope-dimension)
@@ -654,6 +678,8 @@
                                          (cond
                                            ((string= architecture "gemma4")
                                             (load-gemma4-model mapping kv-pairs tensor-infos))
+                                           ((string= architecture "nemotron_h_moe")
+                                            (load-nemotron-h-moe-model mapping kv-pairs tensor-infos))
                                            ((string= architecture "qwen3next")
                                             (load-qwen3next-model mapping kv-pairs tensor-infos))
                                            (t nil))))
@@ -662,6 +688,7 @@
                                                                (case (intern (string-upcase architecture)
                                                                              :keyword)
                                                                  (:GEMMA4 (make-gemma4-step-function model))
+                                                                 (:NEMOTRON_H_MOE (make-nemotron-h-moe-step-function model))
                                                                  (:QWEN3NEXT (make-qwen3next-step-function model))
                                                                  (otherwise nil)))))
                              (effective-kv-cache (or kv-cache (make-hash-table)))
@@ -822,6 +849,8 @@ Write a haiku about a hacker drinking coffee.<turn|>
   (member type-tag
           (list +ggml-type-f32+
                 +ggml-type-f16+
+                +ggml-type-q5-0+
+                +ggml-type-q8-0+
                 +ggml-type-bf16+
                 +ggml-type-q4-k+
                 +ggml-type-q5-k+
@@ -831,6 +860,8 @@ Write a haiku about a hacker drinking coffee.<turn|>
   (case type-tag
     (#.+ggml-type-f32+ :f32)
     (#.+ggml-type-f16+ :f16)
+    (#.+ggml-type-q5-0+ :q5-0)
+    (#.+ggml-type-q8-0+ :q8-0)
     (#.+ggml-type-bf16+ :bf16)
     (#.+ggml-type-q4-k+ :q4-k)
     (#.+ggml-type-q5-k+ :q5-k)
@@ -840,6 +871,7 @@ Write a haiku about a hacker drinking coffee.<turn|>
 (defun ggml-type-block-size (type-tag)
   (case type-tag
     ((#.+ggml-type-f32+ #.+ggml-type-f16+ #.+ggml-type-bf16+) 1)
+    ((#.+ggml-type-q5-0+ #.+ggml-type-q8-0+) 32)
     (#.+ggml-type-q4-k+ +qk-k+)
     (#.+ggml-type-q5-k+ +qk-k+)
     (#.+ggml-type-q6-k+ +qk-k+)
@@ -849,6 +881,8 @@ Write a haiku about a hacker drinking coffee.<turn|>
   (case type-tag
     (#.+ggml-type-f32+ 4)
     (#.+ggml-type-f16+ 2)
+    (#.+ggml-type-q5-0+ (+ 2 4 16))
+    (#.+ggml-type-q8-0+ (+ 2 32))
     (#.+ggml-type-bf16+ 2)
     (#.+ggml-type-q4-k+ (+ 4 +k-scale-size+ (/ +qk-k+ 2)))
     (#.+ggml-type-q5-k+ (+ 4 +k-scale-size+ (/ +qk-k+ 8) (/ +qk-k+ 2)))
@@ -996,6 +1030,8 @@ Write a haiku about a hacker drinking coffee.<turn|>
     (case type-tag
       (#.+ggml-type-f32+ (load-f32-tensor tensor-pointer element-count))
       (#.+ggml-type-f16+ (load-f16-tensor tensor-pointer element-count))
+      (#.+ggml-type-q5-0+ (dequantize-q5-0 tensor-pointer element-count))
+      (#.+ggml-type-q8-0+ (dequantize-q8-0 tensor-pointer element-count))
       (#.+ggml-type-bf16+ (load-bf16-tensor tensor-pointer element-count))
       (#.+ggml-type-q4-k+ (dequantize-q4-k-m tensor-pointer element-count))
       (#.+ggml-type-q5-k+ (dequantize-q5-k tensor-pointer element-count))
@@ -1138,6 +1174,18 @@ Write a haiku about a hacker drinking coffee.<turn|>
       (declare (fixnum index))
       (incf (aref dest index)
             (* scale (aref source index))))))
+
+(defun vector-add-bias-in-place (dest bias)
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array single-float (*)) dest bias))
+  (unless (= (length dest) (length bias))
+    (error "VECTOR-ADD-BIAS-IN-PLACE destination length ~d does not match bias length ~d."
+           (length dest)
+           (length bias)))
+  (dotimes (index (length dest) dest)
+    (declare (fixnum index))
+    (incf (aref dest index)
+          (aref bias index))))
 
 (defun dot-product (left right)
   (declare (type (vector single-float) left right))
@@ -1301,6 +1349,38 @@ It extracts the underlying simple arrays once before entering the loop to elimin
      weight
      :epsilon epsilon)))
 
+(defun normalize-vector-chunks-with-chunk-weights-into (dest vector chunk-count weights
+                                                             &key (epsilon 1.0e-6))
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array single-float (*)) dest vector weights)
+           (fixnum chunk-count))
+  (unless (plusp chunk-count)
+    (error "CHUNK-COUNT must be positive, got ~a." chunk-count))
+  (unless (= (length dest) (length vector) (length weights))
+    (error "NORMALIZE-VECTOR-CHUNKS-WITH-CHUNK-WEIGHTS-INTO requires destination, vector, and weight lengths to match."))
+  (unless (zerop (mod (length vector) chunk-count))
+    (error "Vector length ~d is not divisible by chunk count ~d."
+           (length vector)
+           chunk-count))
+  (let ((chunk-size (/ (length vector) chunk-count))
+        (epsilon (coerce epsilon 'single-float)))
+    (declare (fixnum chunk-size)
+             (single-float epsilon))
+    (dotimes (chunk-index chunk-count dest)
+      (declare (fixnum chunk-index))
+      (let* ((start (* chunk-index chunk-size))
+             (mean-square (/ (sum-square-elements-range vector start chunk-size)
+                             chunk-size))
+             (scale (/ (sqrt (+ mean-square epsilon)))))
+        (declare (fixnum start)
+                 (single-float mean-square scale))
+        (dotimes (index chunk-size)
+          (declare (fixnum index))
+          (setf (aref dest (+ start index))
+                (* (aref vector (+ start index))
+                   (aref weights (+ start index))
+                   scale)))))))
+
 (defun l2-normalize-vector-chunks-into (dest vector chunk-count &key (epsilon 1.0e-6))
   (declare (optimize (speed 3) (safety 2))
            (type (simple-array single-float (*)) dest vector)
@@ -1439,6 +1519,20 @@ It extracts the underlying simple arrays once before entering the loop to elimin
               kv-head-count
               layer-index)))))
 
+(defun gguf-model-layer-ffn-size (model layer-index)
+  (let ((ffn-size (gguf-model-ffn-size model)))
+    (typecase ffn-size
+      (list
+       (or (nth layer-index ffn-size)
+           (error "Model is missing FFN size for layer ~d." layer-index)))
+      (fixnum ffn-size)
+      (integer ffn-size)
+      (null 0)
+      (t
+       (error "Unsupported FFN size metadata ~s for layer ~d."
+              ffn-size
+              layer-index)))))
+
 (defun gguf-model-kv-layer-count (model)
   (let ((shared-kv-layers (or (gguf-model-shared-kv-layers model) 0)))
     (declare (fixnum shared-kv-layers))
@@ -1512,6 +1606,8 @@ It extracts the underlying simple arrays once before entering the loop to elimin
     (case (getf tensor-info :type-tag)
       (#.+ggml-type-f32+ (load-f32-tensor row-pointer column-count))
       (#.+ggml-type-f16+ (load-f16-tensor row-pointer column-count))
+      (#.+ggml-type-q5-0+ (dequantize-q5-0 row-pointer column-count))
+      (#.+ggml-type-q8-0+ (dequantize-q8-0 row-pointer column-count))
       (#.+ggml-type-bf16+ (load-bf16-tensor row-pointer column-count))
       (#.+ggml-type-q4-k+ (dequantize-q4-k-m row-pointer column-count))
       (#.+ggml-type-q5-k+ (dequantize-q5-k row-pointer column-count))
@@ -1532,11 +1628,59 @@ It extracts the underlying simple arrays once before entering the loop to elimin
     (case (getf tensor-info :type-tag)
       (#.+ggml-type-f32+ (load-f32-tensor-into dest row-pointer column-count))
       (#.+ggml-type-f16+ (load-f16-tensor-into dest row-pointer column-count))
+      (#.+ggml-type-q5-0+ (replace dest (dequantize-q5-0 row-pointer column-count)))
+      (#.+ggml-type-q8-0+ (replace dest (dequantize-q8-0 row-pointer column-count)))
       (#.+ggml-type-bf16+ (load-bf16-tensor-into dest row-pointer column-count))
       (#.+ggml-type-q5-k+ (replace dest (dequantize-q5-k row-pointer column-count)))
       (otherwise
        (replace dest (load-gguf-tensor-row mapping tensor-info row-index))))
     dest))
+
+(defun dequantize-q5-0 (quantized-pointer element-count)
+  (unless (zerop (mod element-count 32))
+    (error "Q5_0 dequantization requires ELEMENT-COUNT to be a multiple of 32."))
+  (let* ((block-size (+ 2 4 16))
+         (block-count (/ element-count 32))
+         (result (make-array element-count :element-type 'single-float)))
+    (dotimes (block-index block-count result)
+      (let* ((block-offset (* block-index block-size))
+             (d (read-fp16-le quantized-pointer block-offset))
+             (qh (read-u32-le quantized-pointer (+ block-offset 2)))
+             (qs-base (+ block-offset 6))
+             (result-base (* block-index 32)))
+        (declare (single-float d)
+                 (fixnum block-offset qh qs-base result-base))
+        (dotimes (pair-index 16)
+          (declare (fixnum pair-index))
+          (let* ((packed (read-u8 quantized-pointer (+ qs-base pair-index)))
+                 (xh-0 (if (logbitp pair-index qh) #x10 0))
+                 (xh-1 (if (logbitp (+ pair-index 16) qh) #x10 0))
+                 (q0 (- (logior (logand packed #x0F) xh-0) 16))
+                 (q1 (- (logior (ash packed -4) xh-1) 16)))
+            (declare (fixnum packed xh-0 xh-1 q0 q1))
+            (setf (aref result (+ result-base pair-index))
+                  (coerce (* d q0) 'single-float))
+            (setf (aref result (+ result-base 16 pair-index))
+                  (coerce (* d q1) 'single-float))))))))
+
+(defun dequantize-q8-0 (quantized-pointer element-count)
+  (unless (zerop (mod element-count 32))
+    (error "Q8_0 dequantization requires ELEMENT-COUNT to be a multiple of 32."))
+  (let* ((block-size (+ 2 32))
+         (block-count (/ element-count 32))
+         (result (make-array element-count :element-type 'single-float)))
+    (dotimes (block-index block-count result)
+      (let* ((block-offset (* block-index block-size))
+             (d (read-fp16-le quantized-pointer block-offset))
+             (qs-base (+ block-offset 2))
+             (result-base (* block-index 32)))
+        (declare (single-float d)
+                 (fixnum block-offset qs-base result-base))
+        (dotimes (lane 32)
+          (declare (fixnum lane))
+          (setf (aref result (+ result-base lane))
+                (coerce (* d (read-s8 quantized-pointer (+ qs-base lane)))
+                        'single-float)))))))
 
 (defun dot-product-with-f16-tensor-data (pointer row-offset vector element-count)
   (declare (optimize (speed 3) (safety 0))
@@ -1563,6 +1707,65 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (declare (fixnum index))
       (incf sum (* (aref vector index)
                    (read-bf16-le pointer (+ row-offset (* index 2))))))))
+
+(defun dot-product-with-q5-0-tensor-data (pointer row-offset vector element-count)
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array single-float (*)) vector)
+           (fixnum row-offset element-count))
+  (unless (zerop (mod element-count 32))
+    (error "Q5_0 dot product requires ELEMENT-COUNT to be a multiple of 32."))
+  (let ((sum 0.0f0)
+        (block-size (+ 2 4 16))
+        (block-count (/ element-count 32)))
+    (declare (single-float sum)
+            (fixnum block-size block-count))
+    (dotimes (block-index block-count (the single-float sum))
+      (declare (fixnum block-index))
+      (let* ((block-offset (+ row-offset (* block-index block-size)))
+            (d (read-fp16-le pointer block-offset))
+            (qh (read-u32-le pointer (+ block-offset 2)))
+            (qs-base (+ block-offset 6))
+            (vector-base (* block-index 32)))
+        (declare (single-float d)
+                (fixnum block-offset qh qs-base vector-base))
+        (dotimes (pair-index 16)
+          (declare (fixnum pair-index))
+          (let* ((packed (read-u8 pointer (+ qs-base pair-index)))
+                (xh-0 (if (logbitp pair-index qh) #x10 0))
+                (xh-1 (if (logbitp (+ pair-index 16) qh) #x10 0))
+                (q0 (- (logior (logand packed #x0F) xh-0) 16))
+                (q1 (- (logior (ash packed -4) xh-1) 16)))
+           (declare (fixnum packed xh-0 xh-1 q0 q1))
+           (incf sum
+                 (* d
+                    (+ (* q0 (aref vector (+ vector-base pair-index)))
+                       (* q1 (aref vector (+ vector-base 16 pair-index))))))))))))
+
+(defun dot-product-with-q8-0-tensor-data (pointer row-offset vector element-count)
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array single-float (*)) vector)
+           (fixnum row-offset element-count))
+  (unless (zerop (mod element-count 32))
+    (error "Q8_0 dot product requires ELEMENT-COUNT to be a multiple of 32."))
+  (let ((sum 0.0f0)
+        (block-size (+ 2 32))
+        (block-count (/ element-count 32)))
+    (declare (single-float sum)
+            (fixnum block-size block-count))
+    (dotimes (block-index block-count (the single-float sum))
+      (declare (fixnum block-index))
+      (let* ((block-offset (+ row-offset (* block-index block-size)))
+            (d (read-fp16-le pointer block-offset))
+            (qs-base (+ block-offset 2))
+            (vector-base (* block-index 32)))
+        (declare (single-float d)
+                (fixnum block-offset qs-base vector-base))
+        (dotimes (lane 32)
+          (declare (fixnum lane))
+          (incf sum
+               (* d
+                  (read-s8 pointer (+ qs-base lane))
+                  (aref vector (+ vector-base lane)))))))))
 
 (defun dot-product-with-f32-tensor-data (pointer row-offset vector element-count)
   (declare (optimize (speed 3) (safety 0))
@@ -2050,8 +2253,20 @@ It extracts the underlying simple arrays once before entering the loop to elimin
         (setf (aref dest row-index)
               (dot-product-with-f16-tensor-data mapping row-offset vector column-count))
         (incf row-offset row-byte-size)))
-      (#.+ggml-type-bf16+
+      (#.+ggml-type-q5-0+
        (dotimes (row-index row-count dest)
+        (declare (fixnum row-index))
+        (setf (aref dest row-index)
+              (dot-product-with-q5-0-tensor-data mapping row-offset vector column-count))
+        (incf row-offset row-byte-size)))
+      (#.+ggml-type-q8-0+
+      (dotimes (row-index row-count dest)
+        (declare (fixnum row-index))
+        (setf (aref dest row-index)
+              (dot-product-with-q8-0-tensor-data mapping row-offset vector column-count))
+        (incf row-offset row-byte-size)))
+      (#.+ggml-type-bf16+
+      (dotimes (row-index row-count dest)
         (declare (fixnum row-index))
         (setf (aref dest row-index)
               (dot-product-with-bf16-tensor-data mapping row-offset vector column-count))
@@ -2928,6 +3143,486 @@ It extracts the underlying simple arrays once before entering the loop to elimin
            model
            (gguf-model-output-tensor-name model)
            (rms-norm-into (compute-buffer-vector compute-buffer :qwen-output-norm hidden-size)
+                          x
+                          (gguf-model-load-vector-tensor model "output_norm.weight")
+                          :epsilon norm-epsilon)))))))
+
+(defun nemotron-h-moe-recurrent-layer-p (model layer-index)
+  (and (zerop (gguf-model-layer-kv-head-count model layer-index))
+       (zerop (gguf-model-layer-ffn-size model layer-index))))
+
+(defun nemotron-h-moe-attention-layer-p (model layer-index)
+  (and (plusp (gguf-model-layer-kv-head-count model layer-index))
+       (zerop (gguf-model-layer-ffn-size model layer-index))))
+
+(defun nemotron-h-moe-ffn-layer-p (model layer-index)
+  (and (zerop (gguf-model-layer-kv-head-count model layer-index))
+       (plusp (gguf-model-layer-ffn-size model layer-index))))
+
+(defun ensure-nemotron-h-moe-recurrent-layer-cache (kv-cache layer-index channel-count kernel-size state-length)
+  (let ((entry (gethash layer-index kv-cache))
+        (conv-state-length (* channel-count (1- kernel-size))))
+    (declare (fixnum channel-count kernel-size state-length conv-state-length))
+    (unless (and entry
+                 (= (length (getf entry :conv-state)) conv-state-length)
+                 (= (length (getf entry :state)) state-length))
+      (setf entry (list :conv-state (make-array conv-state-length
+                                                :element-type 'single-float
+                                                :initial-element 0.0f0)
+                        :state (make-array state-length
+                                           :element-type 'single-float
+                                           :initial-element 0.0f0))
+            (gethash layer-index kv-cache) entry))
+    entry))
+
+(defun nemotron-h-moe-causal-conv1d-step-into (dest current-input conv-state conv-weight conv-bias kernel-size)
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array single-float (*)) dest current-input conv-state conv-weight conv-bias)
+           (fixnum kernel-size))
+  (unless (= (length dest) (length current-input) (length conv-bias))
+    (error "NEMOTRON-H-MOE-CAUSAL-CONV1D-STEP-INTO requires destination, input, and bias lengths to match."))
+  (let* ((channel-count (length current-input))
+         (state-width (1- kernel-size))
+         (expected-state-length (* channel-count state-width))
+         (expected-weight-length (* channel-count kernel-size)))
+    (declare (fixnum channel-count state-width expected-state-length expected-weight-length))
+    (unless (= (length conv-state) expected-state-length)
+      (error "Convolution state length ~d does not match expected length ~d."
+             (length conv-state)
+             expected-state-length))
+    (unless (= (length conv-weight) expected-weight-length)
+      (error "Convolution weight length ~d does not match expected length ~d."
+             (length conv-weight)
+             expected-weight-length))
+    (dotimes (channel-index channel-count dest)
+      (declare (fixnum channel-index))
+      (let* ((state-base (* channel-index state-width))
+             (weight-base (* channel-index kernel-size))
+             (current-value (aref current-input channel-index))
+             (sum (aref conv-bias channel-index)))
+        (declare (fixnum state-base weight-base)
+                 (single-float current-value sum))
+        (dotimes (tap-index state-width)
+          (declare (fixnum tap-index))
+          (incf sum
+                (* (aref conv-state (+ state-base tap-index))
+                   (aref conv-weight (+ weight-base tap-index)))))
+        (incf sum (* current-value
+                     (aref conv-weight (+ weight-base state-width))))
+        (dotimes (tap-index (max 0 (1- state-width)))
+          (declare (fixnum tap-index))
+          (setf (aref conv-state (+ state-base tap-index))
+                (aref conv-state (+ state-base tap-index 1))))
+        (when (plusp state-width)
+          (setf (aref conv-state (+ state-base (1- state-width))) current-value))
+        (setf (aref dest channel-index)
+              (silu sum))))))
+
+(defun nemotron-h-moe-ffn-into (dest model layer-index input compute-buffer
+                                     expert-top-k expert-weight-scale expert-weights-normalized-p)
+  (declare (type (simple-array single-float (*)) dest input)
+           (fixnum layer-index expert-top-k)
+           (single-float expert-weight-scale))
+  (let ((router-info (gguf-model-tensor-info model
+                                             (make-layer-tensor-name layer-index "ffn_gate_inp")
+                                             nil)))
+    (unless router-info
+      (error "Nemotron-H MoE layer ~d is missing router tensor." layer-index))
+    (let* ((expert-count (tensor-row-count router-info))
+           (top-k (min expert-count expert-top-k))
+           (router-logits (compute-buffer-vector compute-buffer :nemotron-router-logits expert-count))
+           (top-indices (compute-buffer-fixnum-vector compute-buffer :nemotron-top-indices top-k))
+           (top-logits (compute-buffer-vector compute-buffer :nemotron-top-logits top-k))
+           (top-weights (compute-buffer-vector compute-buffer :nemotron-top-weights top-k))
+           (router-bias (gguf-model-load-vector-tensor model
+                                                       (make-layer-tensor-path layer-index "exp_probs_b.bias")))
+           (latent-down-info (gguf-model-tensor-info model
+                                                     (make-layer-tensor-name layer-index "ffn_latent_down")
+                                                     nil))
+           (latent-up-info (gguf-model-tensor-info model
+                                                   (make-layer-tensor-name layer-index "ffn_latent_up")
+                                                   nil))
+           (expert-input (if latent-down-info
+                             (compute-buffer-vector compute-buffer
+                                                    :nemotron-expert-input
+                                                    (tensor-row-count latent-down-info))
+                             input))
+           (expert-hidden-size
+            (tensor-row-count
+             (gguf-model-tensor-info model
+                                     (make-layer-tensor-name layer-index "ffn_up_exps")
+                                     t)))
+           (moe-output (if latent-up-info
+                           (compute-buffer-vector compute-buffer
+                                                  :nemotron-moe-output
+                                                  (tensor-column-count latent-up-info))
+                           dest))
+           (expert-up (compute-buffer-vector compute-buffer :nemotron-expert-up expert-hidden-size))
+           (expert-down (compute-buffer-vector compute-buffer :nemotron-expert-down (length moe-output)))
+           (shared-up-info (gguf-model-tensor-info model
+                                                   (make-layer-tensor-name layer-index "ffn_up_shexp")
+                                                   nil))
+           (shared-down-info (gguf-model-tensor-info model
+                                                     (make-layer-tensor-name layer-index "ffn_down_shexp")
+                                                     nil))
+           (shared-up (and shared-up-info
+                           (compute-buffer-vector compute-buffer
+                                                  :nemotron-shared-up
+                                                  (tensor-row-count shared-up-info))))
+           (shared-down (and shared-down-info
+                             (compute-buffer-vector compute-buffer
+                                                    :nemotron-shared-down
+                                                    (tensor-row-count shared-down-info)))))
+      (declare (fixnum expert-count top-k expert-hidden-size))
+      (when latent-down-info
+        (gguf-model-matrix-vector-multiply-into expert-input
+                                                model
+                                                (make-layer-tensor-name layer-index "ffn_latent_down")
+                                                input))
+      (gguf-model-matrix-vector-multiply-into router-logits
+                                              model
+                                              (make-layer-tensor-name layer-index "ffn_gate_inp")
+                                              input)
+      (vector-add-bias-in-place router-logits router-bias)
+      (select-top-k-logits-into top-indices top-logits router-logits top-k)
+      (let ((weight-sum 0.0f0))
+        (declare (single-float weight-sum))
+        (dotimes (selected-index top-k)
+          (declare (fixnum selected-index))
+          (let ((weight (sigmoid (aref top-logits selected-index))))
+            (declare (single-float weight))
+            (setf (aref top-weights selected-index) weight)
+            (incf weight-sum weight)))
+        (when expert-weights-normalized-p
+          (unless (plusp weight-sum)
+            (error "Nemotron-H MoE layer ~d router produced non-positive top-k weight sum."
+                   layer-index))
+          (dotimes (selected-index top-k)
+            (declare (fixnum selected-index))
+            (setf (aref top-weights selected-index)
+                  (/ (aref top-weights selected-index) weight-sum)))))
+      (dotimes (selected-index top-k)
+        (declare (fixnum selected-index))
+        (setf (aref top-weights selected-index)
+              (* expert-weight-scale (aref top-weights selected-index))))
+      (fill moe-output 0.0f0)
+      (dotimes (selected-index top-k)
+        (declare (fixnum selected-index))
+        (let ((expert-index (aref top-indices selected-index))
+              (expert-weight (aref top-weights selected-index)))
+          (declare (fixnum expert-index)
+                   (single-float expert-weight))
+          (gguf-model-expert-matrix-vector-multiply-into expert-up
+                                                         model
+                                                         (make-layer-tensor-name layer-index "ffn_up_exps")
+                                                         expert-index
+                                                         expert-input)
+          (apply-relu-squared-into expert-up expert-up)
+          (gguf-model-expert-matrix-vector-multiply-into expert-down
+                                                         model
+                                                         (make-layer-tensor-name layer-index "ffn_down_exps")
+                                                         expert-index
+                                                         expert-up)
+          (vector-add-scaled-in-place moe-output expert-down expert-weight)))
+      (if latent-up-info
+          (gguf-model-matrix-vector-multiply-into dest
+                                                  model
+                                                  (make-layer-tensor-name layer-index "ffn_latent_up")
+                                                  moe-output)
+          (replace dest moe-output))
+      (when (and shared-up shared-down)
+        (gguf-model-matrix-vector-multiply-into shared-up
+                                                model
+                                                (make-layer-tensor-name layer-index "ffn_up_shexp")
+                                                input)
+        (apply-relu-squared-into shared-up shared-up)
+        (gguf-model-matrix-vector-multiply-into shared-down
+                                                model
+                                                (make-layer-tensor-name layer-index "ffn_down_shexp")
+                                                shared-up)
+        (vector-add-bias-in-place dest shared-down)))))
+
+(defun nemotron-h-moe-attention-into (dest model layer-index input position compute-buffer kv-cache
+                                           head-count rope-dimension rope-base)
+  (declare (type (simple-array single-float (*)) dest input)
+           (fixnum layer-index position head-count rope-dimension))
+  (let* ((kv-head-count (gguf-model-layer-kv-head-count model layer-index))
+         (q-length (tensor-row-count
+                    (gguf-model-tensor-info model
+                                            (make-layer-tensor-name layer-index "attn_q")
+                                            t)))
+         (k-length (tensor-row-count
+                    (gguf-model-tensor-info model
+                                            (make-layer-tensor-name layer-index "attn_k")
+                                            t)))
+         (v-length (tensor-row-count
+                    (gguf-model-tensor-info model
+                                            (make-layer-tensor-name layer-index "attn_v")
+                                            t)))
+         (head-dimension (/ q-length head-count))
+         (q (compute-buffer-vector compute-buffer :nemotron-q q-length))
+         (k (compute-buffer-vector compute-buffer :nemotron-k k-length))
+         (v (compute-buffer-vector compute-buffer :nemotron-v v-length))
+         (context (compute-buffer-vector compute-buffer :nemotron-context q-length))
+         (q-heads nil)
+         (k-heads nil)
+         (v-heads nil))
+    (declare (fixnum kv-head-count q-length k-length v-length head-dimension))
+    (gguf-model-matrix-vector-multiply-into q
+                                            model
+                                            (make-layer-tensor-name layer-index "attn_q")
+                                            input)
+    (gguf-model-matrix-vector-multiply-into k
+                                            model
+                                            (make-layer-tensor-name layer-index "attn_k")
+                                            input)
+    (gguf-model-matrix-vector-multiply-into v
+                                            model
+                                            (make-layer-tensor-name layer-index "attn_v")
+                                            input)
+    (setf q-heads (compute-buffer-chunks compute-buffer :nemotron-q-heads q head-count)
+          k-heads (compute-buffer-chunks compute-buffer :nemotron-k-heads k kv-head-count)
+          v-heads (compute-buffer-chunks compute-buffer :nemotron-v-heads v kv-head-count))
+    (dotimes (head-index head-count)
+      (declare (fixnum head-index))
+      (apply-rope-head-in-place (aref q-heads head-index)
+                                position
+                                rope-dimension
+                                rope-base))
+    (dotimes (head-index kv-head-count)
+      (declare (fixnum head-index))
+      (apply-rope-head-in-place (aref k-heads head-index)
+                                position
+                                rope-dimension
+                                rope-base))
+    (vector-scale-into q q (/ (sqrt head-dimension)))
+    (compute-gemma4-attention-into context
+                                   compute-buffer
+                                   model
+                                   layer-index
+                                   layer-index
+                                   position
+                                   q-heads
+                                   k-heads
+                                   v-heads
+                                   kv-cache)
+    (gguf-model-matrix-vector-multiply-into dest
+                                            model
+                                            (make-layer-tensor-name layer-index "attn_output")
+                                            context)))
+
+(defun nemotron-h-moe-recurrent-into (dest model layer-index input compute-buffer kv-cache
+                                           ssm-inner-size ssm-state-size ssm-group-count
+                                           ssm-head-count norm-epsilon)
+  (declare (type (simple-array single-float (*)) dest input)
+           (fixnum layer-index ssm-inner-size ssm-state-size ssm-group-count ssm-head-count)
+           (single-float norm-epsilon))
+  (let* ((kernel-size
+          (gguf-kv-value (gguf-model-kv-pairs model)
+                         "nemotron_h_moe.ssm.conv_kernel"))
+         (channel-count (+ ssm-inner-size (* 2 ssm-group-count ssm-state-size)))
+         (head-dimension (/ ssm-inner-size ssm-head-count))
+         (heads-per-group (/ ssm-head-count ssm-group-count))
+         (state-length (* ssm-inner-size ssm-state-size))
+         (projected-length (+ (* 2 ssm-inner-size) (* 2 ssm-group-count ssm-state-size) ssm-head-count))
+         (projected (compute-buffer-vector compute-buffer :nemotron-ssm-projected projected-length))
+         (z (compute-buffer-vector compute-buffer :nemotron-ssm-z ssm-inner-size))
+         (conv-input (compute-buffer-vector compute-buffer :nemotron-ssm-conv-input channel-count))
+         (conv-output (compute-buffer-vector compute-buffer :nemotron-ssm-conv-output channel-count))
+         (x (compute-buffer-vector compute-buffer :nemotron-ssm-x ssm-inner-size))
+         (b (compute-buffer-vector compute-buffer :nemotron-ssm-b (* ssm-group-count ssm-state-size)))
+         (c (compute-buffer-vector compute-buffer :nemotron-ssm-c (* ssm-group-count ssm-state-size)))
+         (dt (compute-buffer-vector compute-buffer :nemotron-ssm-dt ssm-head-count))
+         (y (compute-buffer-vector compute-buffer :nemotron-ssm-y ssm-inner-size))
+         (gated (compute-buffer-vector compute-buffer :nemotron-ssm-gated ssm-inner-size))
+         (ssm-a (gguf-model-load-tensor model (make-layer-tensor-path layer-index "ssm_a")))
+         (ssm-d (gguf-model-load-tensor model (make-layer-tensor-path layer-index "ssm_d")))
+         (ssm-dt-bias (gguf-model-load-vector-tensor model (make-layer-tensor-path layer-index "ssm_dt.bias")))
+         (ssm-norm (gguf-model-load-tensor model (make-layer-tensor-name layer-index "ssm_norm")))
+         (conv-weight (gguf-model-load-tensor model (make-layer-tensor-name layer-index "ssm_conv1d")))
+         (conv-bias (gguf-model-load-vector-tensor model (make-layer-tensor-path layer-index "ssm_conv1d.bias")))
+         (cache (ensure-nemotron-h-moe-recurrent-layer-cache kv-cache
+                                                             layer-index
+                                                             channel-count
+                                                             kernel-size
+                                                             state-length))
+         (conv-state (getf cache :conv-state))
+         (recurrent-state (getf cache :state)))
+    (declare (fixnum kernel-size channel-count head-dimension heads-per-group state-length projected-length))
+    (gguf-model-matrix-vector-multiply-into projected
+                                            model
+                                            (make-layer-tensor-name layer-index "ssm_in")
+                                            input)
+    (replace z projected :start2 0 :end2 ssm-inner-size)
+    (replace conv-input projected
+             :start2 ssm-inner-size
+             :end2 (+ ssm-inner-size channel-count))
+    (replace dt projected
+             :start2 (+ (* 2 ssm-inner-size) (* 2 ssm-group-count ssm-state-size))
+             :end2 projected-length)
+    (nemotron-h-moe-causal-conv1d-step-into conv-output
+                                            conv-input
+                                            conv-state
+                                            conv-weight
+                                            conv-bias
+                                            kernel-size)
+    (replace x conv-output :start2 0 :end2 ssm-inner-size)
+    (replace b conv-output
+             :start2 ssm-inner-size
+             :end2 (+ ssm-inner-size (* ssm-group-count ssm-state-size)))
+    (replace c conv-output
+             :start2 (+ ssm-inner-size (* ssm-group-count ssm-state-size))
+             :end2 channel-count)
+    (dotimes (head-index ssm-head-count)
+      (declare (fixnum head-index))
+      (let* ((group-index (floor head-index heads-per-group))
+             (group-base (* group-index ssm-state-size))
+             (head-base (* head-index head-dimension))
+             (dt-softplus (softplus (+ (aref dt head-index)
+                                       (aref ssm-dt-bias head-index))))
+             (decay (coerce (exp (* dt-softplus (aref ssm-a head-index))) 'single-float))
+             (d-value (aref ssm-d head-index)))
+        (declare (fixnum group-index group-base head-base)
+                 (single-float dt-softplus decay d-value))
+        (dotimes (dim-index head-dimension)
+          (declare (fixnum dim-index))
+          (let* ((x-index (+ head-base dim-index))
+                 (state-base (+ (* head-base ssm-state-size)
+                                (* dim-index ssm-state-size)))
+                 (x-value (aref x x-index))
+                 (x-dt (* x-value dt-softplus))
+                 (sum 0.0f0))
+            (declare (fixnum x-index state-base)
+                     (single-float x-value x-dt sum))
+            (dotimes (state-index ssm-state-size)
+              (declare (fixnum state-index))
+              (let* ((offset (+ state-base state-index))
+                     (updated-state (+ (* (aref recurrent-state offset) decay)
+                                       (* (aref b (+ group-base state-index)) x-dt))))
+                (declare (fixnum offset)
+                         (single-float updated-state))
+                (setf (aref recurrent-state offset) updated-state)
+                (incf sum (* updated-state
+                             (aref c (+ group-base state-index))))))
+            (setf (aref y x-index)
+                  (+ sum (* x-value d-value))))))
+    (dotimes (index ssm-inner-size)
+      (declare (fixnum index))
+      (setf (aref gated index)
+            (* (silu (aref z index))
+               (aref y index))))
+    (normalize-vector-chunks-with-chunk-weights-into y
+                                                     gated
+                                                     ssm-group-count
+                                                     ssm-norm
+                                                     :epsilon norm-epsilon)
+    (gguf-model-matrix-vector-multiply-into dest
+                                            model
+                                            (make-layer-tensor-name layer-index "ssm_out")
+                                            y))))
+
+(defun load-nemotron-h-moe-model (mapping kv-pairs tensor-infos)
+  (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
+    (unless (string= architecture "nemotron_h_moe")
+      (error "LOAD-NEMOTRON-H-MOE-MODEL only supports general.architecture = \"nemotron_h_moe\", got ~s."
+             architecture))
+    (let ((tensor-info-table (make-tensor-info-table tensor-infos)))
+      (make-gguf-model
+       :mapping mapping
+       :kv-pairs kv-pairs
+       :tensor-infos tensor-infos
+       :tensor-info-table tensor-info-table
+       :tensor-cache (make-hash-table :test #'equal)
+       :architecture architecture
+       :hidden-size (gguf-kv-value kv-pairs "nemotron_h_moe.embedding_length")
+       :layer-count (gguf-kv-value kv-pairs "nemotron_h_moe.block_count")
+       :head-count (gguf-kv-value kv-pairs "nemotron_h_moe.attention.head_count")
+       :kv-head-count (gguf-kv-value kv-pairs "nemotron_h_moe.attention.head_count_kv")
+       :ffn-size (gguf-kv-value kv-pairs "nemotron_h_moe.feed_forward_length")
+       :norm-epsilon (gguf-kv-value kv-pairs "nemotron_h_moe.attention.layer_norm_rms_epsilon")
+       :rope-base (gguf-kv-value kv-pairs "nemotron_h_moe.rope.freq_base")
+       :rope-dimension (gguf-kv-value kv-pairs "nemotron_h_moe.rope.dimension_count")
+       :output-tensor-name (if (gethash "output.weight" tensor-info-table)
+                               "output.weight"
+                               "token_embd.weight")))))
+
+(defun make-nemotron-h-moe-step-function (model)
+  (let ((head-count (gguf-model-head-count model))
+        (hidden-size (gguf-model-hidden-size model))
+        (norm-epsilon (gguf-model-norm-epsilon model))
+        (rope-dimension (gguf-model-rope-dimension model))
+        (rope-base (gguf-model-rope-base model))
+        (ssm-inner-size (gguf-kv-value (gguf-model-kv-pairs model) "nemotron_h_moe.ssm.inner_size"))
+        (ssm-state-size (gguf-kv-value (gguf-model-kv-pairs model) "nemotron_h_moe.ssm.state_size"))
+        (ssm-group-count (gguf-kv-value (gguf-model-kv-pairs model) "nemotron_h_moe.ssm.group_count"))
+        (ssm-head-count (gguf-kv-value (gguf-model-kv-pairs model) "nemotron_h_moe.ssm.time_step_rank"))
+        (expert-top-k (gguf-kv-value (gguf-model-kv-pairs model) "nemotron_h_moe.expert_used_count"))
+        (expert-weight-scale
+         (coerce (or (gguf-kv-value-or-nil (gguf-model-kv-pairs model) "nemotron_h_moe.expert_weights_scale")
+                     1.0f0)
+                 'single-float))
+        (expert-weights-normalized-p
+         (not (null (gguf-kv-value-or-nil (gguf-model-kv-pairs model) "nemotron_h_moe.expert_weights_norm"))))
+        (compute-buffer (make-compute-buffer)))
+    (lambda (token-id position kv-cache)
+      (let* ((input-embedding (compute-buffer-vector compute-buffer :nemotron-input-embedding hidden-size))
+             (x (compute-buffer-vector compute-buffer :nemotron-x hidden-size))
+             (block-input (compute-buffer-vector compute-buffer :nemotron-block-input hidden-size))
+             (block-output (compute-buffer-vector compute-buffer :nemotron-block-output hidden-size)))
+        (gguf-model-token-row-into input-embedding model "token_embd.weight" token-id)
+        (replace x input-embedding)
+        (dotimes (layer-index (gguf-model-layer-count model))
+          (declare (fixnum layer-index))
+          (rms-norm-into block-input
+                         x
+                         (gguf-model-load-vector-tensor
+                          model
+                          (make-layer-tensor-name layer-index "attn_norm"))
+                         :epsilon norm-epsilon)
+          (cond
+            ((nemotron-h-moe-recurrent-layer-p model layer-index)
+             (nemotron-h-moe-recurrent-into block-output
+                                            model
+                                            layer-index
+                                            block-input
+                                            compute-buffer
+                                            kv-cache
+                                            ssm-inner-size
+                                            ssm-state-size
+                                            ssm-group-count
+                                            ssm-head-count
+                                            norm-epsilon))
+            ((nemotron-h-moe-attention-layer-p model layer-index)
+             (nemotron-h-moe-attention-into block-output
+                                            model
+                                            layer-index
+                                            block-input
+                                            position
+                                            compute-buffer
+                                            kv-cache
+                                            head-count
+                                            rope-dimension
+                                            rope-base))
+            ((nemotron-h-moe-ffn-layer-p model layer-index)
+             (nemotron-h-moe-ffn-into block-output
+                                      model
+                                      layer-index
+                                      block-input
+                                      compute-buffer
+                                      expert-top-k
+                                      expert-weight-scale
+                                      expert-weights-normalized-p))
+            (t
+             (error "Nemotron-H MoE layer ~d has unsupported block pattern: kv-head-count=~s, ffn-size=~s."
+                    layer-index
+                    (gguf-model-layer-kv-head-count model layer-index)
+                    (gguf-model-layer-ffn-size model layer-index))))
+          (vector-add-into x x block-output))
+        (when *compute-gguf-logits*
+          (gguf-model-matrix-vector-multiply
+           model
+           (gguf-model-output-tensor-name model)
+           (rms-norm-into (compute-buffer-vector compute-buffer :nemotron-output-norm hidden-size)
                           x
                           (gguf-model-load-vector-tensor model "output_norm.weight")
                           :epsilon norm-epsilon)))))))

@@ -480,10 +480,227 @@
                   (coerce (/ value sum-exps) 'single-float))
                 shifted-exps))))
 
+(defun apply-repetition-penalty (logits history &optional (penalty 1.15f0))
+  (declare (type (simple-array single-float (*)) logits)
+           (single-float penalty)
+           (optimize (speed 3) (safety 1)))
+  (when (<= penalty 0.0f0)
+    (error "PENALTY must be positive, got ~a." penalty))
+  (labels ((penalize-token-id (token-id)
+             (declare (fixnum token-id))
+             (unless (< -1 token-id (length logits))
+               (error "History token id ~d is out of bounds for logits length ~d."
+                       token-id
+                       (length logits)))
+             (let ((logit (aref logits token-id)))
+               (declare (single-float logit))
+               (cond
+                  ((> logit 0.0f0)
+                   (setf (aref logits token-id)
+                         (coerce (/ logit penalty) 'single-float)))
+                  ((< logit 0.0f0)
+                   (setf (aref logits token-id)
+                         (coerce (* logit penalty) 'single-float)))))))
+    (etypecase history
+      (null logits)
+      (list
+       (do ((cell history (cdr cell)))
+           ((endp cell) logits)
+         (let ((token-id (car cell))
+               (seen-earlier-p nil))
+           (declare (fixnum token-id))
+           (do ((earlier history (cdr earlier)))
+               ((eq earlier cell))
+             (when (= (the fixnum (car earlier)) token-id)
+               (setf seen-earlier-p t)
+               (return)))
+           (unless seen-earlier-p
+             (penalize-token-id token-id)))))
+      (vector
+       (let ((history-length (length history)))
+         (declare (fixnum history-length))
+         (dotimes (index history-length logits)
+           (declare (fixnum index))
+           (let ((token-id (aref history index))
+                  (seen-earlier-p nil))
+             (declare (fixnum token-id))
+             (dotimes (earlier-index index)
+               (declare (fixnum earlier-index))
+               (when (= (the fixnum (aref history earlier-index)) token-id)
+                  (setf seen-earlier-p t)
+                  (return)))
+             (unless seen-earlier-p
+               (penalize-token-id token-id)))))))))
+
+(defun apply-top-k-with-workspace (logits k heap)
+  (declare (type (simple-array single-float (*)) logits)
+           (type (simple-array single-float (*)) heap)
+           (fixnum k)
+           (optimize (speed 3) (safety 1)))
+  (let ((length (length logits)))
+    (declare (fixnum length))
+    (when (< k 0)
+      (error "TOP-K must be non-negative, got ~d." k))
+    (when (or (zerop k)
+             (>= k length))
+      (return-from apply-top-k-with-workspace logits))
+    (unless (<= k (length heap))
+      (error "TOP-K workspace length ~d is too small for k = ~d."
+             (length heap)
+             k))
+    (let ((masked-logit -1.0f30))
+      (declare (single-float masked-logit))
+      (replace heap logits :end1 k :end2 k)
+      (labels ((heapify-down (start-index)
+                (declare (fixnum start-index))
+                (let ((value (aref heap start-index))
+                      (index start-index))
+                  (declare (single-float value)
+                           (fixnum index))
+                  (loop
+                    (let ((left-child (1+ (* 2 index))))
+                      (declare (fixnum left-child))
+                      (when (>= left-child k)
+                        (return))
+                      (let* ((right-child (1+ left-child))
+                             (smaller-child
+                              (if (and (< right-child k)
+                                       (< (aref heap right-child)
+                                          (aref heap left-child)))
+                                  right-child
+                                  left-child)))
+                        (declare (fixnum right-child smaller-child))
+                        (when (<= value (aref heap smaller-child))
+                          (return))
+                        (setf (aref heap index) (aref heap smaller-child)
+                              index smaller-child))))
+                  (setf (aref heap index) value)))
+              (build-min-heap ()
+                (do ((index (floor (- k 2) 2) (1- index)))
+                    ((minusp index))
+                  (declare (fixnum index))
+                  (heapify-down index))))
+        (build-min-heap)
+        (do ((index k (1+ index)))
+            ((>= index length))
+          (declare (fixnum index))
+          (let ((value (aref logits index)))
+            (declare (single-float value))
+            (when (> value (aref heap 0))
+             (setf (aref heap 0) value)
+             (heapify-down 0))))
+        (let ((cutoff (aref heap 0)))
+          (declare (single-float cutoff))
+          (dotimes (index length logits)
+            (declare (fixnum index))
+            (when (< (aref logits index) cutoff)
+             (setf (aref logits index) masked-logit))))))))
+
+(defun apply-top-k (logits k)
+  (declare (type (simple-array single-float (*)) logits)
+           (fixnum k)
+           (optimize (speed 3) (safety 1)))
+  (if (or (zerop k)
+          (>= k (length logits)))
+      logits
+      (apply-top-k-with-workspace logits
+                                 k
+                                 (make-array k :element-type 'single-float))))
+
+(defun apply-top-p-with-workspace (logits p temperature logit-workspace index-workspace)
+  (declare (type (simple-array single-float (*)) logits logit-workspace)
+           (type (simple-array fixnum (*)) index-workspace)
+           (single-float p temperature)
+           (optimize (speed 3) (safety 1)))
+  (when (or (<= p 0.0f0) (> p 1.0f0))
+    (error "TOP-P must satisfy 0.0 < p <= 1.0, got ~a." p))
+  (when (<= temperature 0.0f0)
+    (error "TEMPERATURE must be positive, got ~a." temperature))
+  (when (= p 1.0f0)
+    (return-from apply-top-p-with-workspace logits))
+  (let ((masked-logit -1.0f30)
+        (active-count 0))
+    (declare (single-float masked-logit)
+             (fixnum active-count))
+    (dotimes (index (length logits))
+      (declare (fixnum index))
+      (let ((value (aref logits index)))
+        (declare (single-float value))
+        (when (> value masked-logit)
+          (when (>= active-count (length logit-workspace))
+            (error "TOP-P workspace length ~d is too small for active count > ~d."
+                  (length logit-workspace)
+                  (length logit-workspace)))
+          (setf (aref logit-workspace active-count) value
+               (aref index-workspace active-count) index)
+          (incf active-count))))
+    (when (<= active-count 1)
+      (return-from apply-top-p-with-workspace logits))
+    ;; K is already small after top-k, so insertion sort is cheap and allocation-free.
+    (do ((index 1 (1+ index)))
+        ((>= index active-count))
+      (declare (fixnum index))
+      (let ((value (aref logit-workspace index))
+            (token-index (aref index-workspace index))
+            (insert-index index))
+        (declare (single-float value)
+                (fixnum token-index insert-index))
+        (loop
+          (when (zerop insert-index)
+            (return))
+          (when (>= (aref logit-workspace (1- insert-index)) value)
+            (return))
+          (setf (aref logit-workspace insert-index)
+               (aref logit-workspace (1- insert-index))
+               (aref index-workspace insert-index)
+               (aref index-workspace (1- insert-index)))
+          (decf insert-index))
+        (setf (aref logit-workspace insert-index) value
+             (aref index-workspace insert-index) token-index)))
+    (let* ((max-scaled (/ (aref logit-workspace 0) temperature))
+           (sum-exps 0.0f0))
+      (declare (single-float max-scaled sum-exps))
+      (dotimes (index active-count)
+        (declare (fixnum index))
+        (incf sum-exps
+             (coerce
+              (exp (- (/ (aref logit-workspace index) temperature)
+                      max-scaled))
+              'single-float)))
+      (let ((cumulative-probability 0.0f0)
+            (cutoff (aref logit-workspace (1- active-count))))
+        (declare (single-float cumulative-probability cutoff))
+        (dotimes (index active-count)
+          (declare (fixnum index))
+          (incf cumulative-probability
+               (coerce
+                (/ (exp (- (/ (aref logit-workspace index) temperature)
+                           max-scaled))
+                   sum-exps)
+                'single-float))
+          (when (>= cumulative-probability p)
+            (setf cutoff (aref logit-workspace index))
+            (return)))
+        (dotimes (index (length logits) logits)
+          (declare (fixnum index))
+          (when (< (aref logits index) cutoff)
+            (setf (aref logits index) masked-logit)))))))
+
+(defun apply-top-p (logits p &optional (temperature 1.0f0))
+  (declare (type (simple-array single-float (*)) logits)
+           (single-float p temperature)
+           (optimize (speed 3) (safety 1)))
+  (let ((length (length logits)))
+    (apply-top-p-with-workspace logits
+                               p
+                               temperature
+                               (make-array length :element-type 'single-float)
+                               (make-array length :element-type 'fixnum))))
+
 (defun sample-from-probabilities (probabilities
-                                  &key
-                                    random-value
-                                    (random-state *random-state*))
+                                   &key
+                                     random-value
+                                     (random-state *random-state*))
   (let ((roll (or random-value (random 1.0 random-state))))
     (unless (and (<= 0.0 roll) (< roll 1.0))
       (error "RANDOM-VALUE must satisfy 0.0 <= value < 1.0, got ~a." roll))
@@ -501,13 +718,39 @@
 
 (defun sample-token-id-from-logits (logits
                                     &key
+                                      history
+                                      (repetition-penalty 1.15f0)
+                                      (top-k 40)
+                                      (top-p 0.90f0)
                                       (temperature 1.0)
+                                      top-k-workspace
+                                      top-p-logit-workspace
+                                      top-p-index-workspace
                                       random-value
                                       (random-state *random-state*))
-  (sample-from-probabilities
-   (softmax (apply-temperature logits temperature))
-   :random-value random-value
-   :random-state random-state))
+  (declare (single-float repetition-penalty)
+           (single-float top-p)
+           (fixnum top-k))
+  (let ((effective-logits (if (typep logits '(simple-array single-float (*)))
+                              logits
+                              (ensure-single-float-array logits))))
+    (declare (type (simple-array single-float (*)) effective-logits))
+    (when history
+      (apply-repetition-penalty effective-logits history repetition-penalty))
+    (if top-k-workspace
+        (apply-top-k-with-workspace effective-logits top-k top-k-workspace)
+        (apply-top-k effective-logits top-k))
+    (if (and top-p-logit-workspace top-p-index-workspace)
+        (apply-top-p-with-workspace effective-logits
+                                    top-p
+                                    temperature
+                                    top-p-logit-workspace
+                                    top-p-index-workspace)
+        (apply-top-p effective-logits top-p temperature))
+    (sample-from-probabilities
+     (softmax (apply-temperature effective-logits temperature))
+     :random-value random-value
+     :random-state random-state)))
 
 (defun evaluate-prompt (token-ids step-function kv-cache)
   (unless token-ids
@@ -525,13 +768,27 @@
 
 (defun decode-next-token (kv-pairs logits
                            &key
+                             history
+                             (repetition-penalty 1.15f0)
+                             (top-k 40)
+                             (top-p 0.90f0)
                              (temperature 1.0)
+                             top-k-workspace
+                             top-p-logit-workspace
+                             top-p-index-workspace
                              random-value
                              (random-state *random-state*))
   (let* ((token-id (sample-token-id-from-logits logits
-                                                :temperature temperature
-                                                :random-value random-value
-                                                :random-state random-state))
+                                               :history history
+                                               :repetition-penalty repetition-penalty
+                                               :top-k top-k
+                                               :top-p top-p
+                                               :temperature temperature
+                                               :top-k-workspace top-k-workspace
+                                               :top-p-logit-workspace top-p-logit-workspace
+                                               :top-p-index-workspace top-p-index-workspace
+                                               :random-value random-value
+                                               :random-state random-state))
          (token-text (detokenize-token-id kv-pairs token-id)))
     (values token-id token-text)))
 
@@ -544,24 +801,44 @@
                                eos-token-id
                                stop-token-ids
                                (start-position 0)
-                               (temperature 1.0)
-                               (max-tokens 256)
-                               random-values
-                               (stream *standard-output*)
-                               (random-state *random-state*))
+                               (repetition-penalty 1.15f0)
+                               (top-k 40)
+                              (top-p 0.90f0)
+                              (temperature 1.0)
+                              (max-tokens 256)
+                              random-values
+                              (stream *standard-output*)
+                              (random-state *random-state*))
   (let ((current-logits initial-logits)
         (generated-token-ids '())
+        (workspace-size (max 1 (if (zerop top-k)
+                                  (length initial-logits)
+                                  top-k)))
+        (top-k-workspace nil)
+        (top-p-logit-workspace nil)
+        (top-p-index-workspace nil)
         (effective-stop-token-ids
          (remove-duplicates (remove nil (append stop-token-ids
                                                 (when eos-token-id
                                                   (list eos-token-id))))
                             :test #'=)))
+    (declare (fixnum workspace-size))
+    (setf top-k-workspace (make-array workspace-size :element-type 'single-float)
+         top-p-logit-workspace (make-array workspace-size :element-type 'single-float)
+         top-p-index-workspace (make-array workspace-size :element-type 'fixnum))
     (dotimes (decode-index max-tokens)
       (declare (fixnum decode-index))
       (multiple-value-bind (token-id token-text)
-          (decode-next-token kv-pairs
+         (decode-next-token kv-pairs
                              current-logits
+                             :history generated-token-ids
+                             :repetition-penalty repetition-penalty
+                             :top-k top-k
+                             :top-p top-p
                              :temperature temperature
+                             :top-k-workspace top-k-workspace
+                             :top-p-logit-workspace top-p-logit-workspace
+                             :top-p-index-workspace top-p-index-workspace
                              :random-value (when random-values
                                              (pop random-values))
                              :random-state random-state)
@@ -599,13 +876,16 @@
            (search "<|channel>thought" tail)
            (search "<channel|>" tail)))))
 
-(defun maybe-prepare-prompt-for-generation (kv-pairs prompt add-bos)
+(defun maybe-prepare-prompt-for-generation (kv-pairs prompt add-bos
+                                          &key
+                                            use-thought-channel)
   (let ((chat-template (gguf-kv-value-or-nil kv-pairs "tokenizer.chat_template")))
     (if (and (string= (or (tokenizer-model kv-pairs) "")
-                    "gemma4")
+                   "gemma4")
             chat-template
             (not (gemma4-chat-prompt-p prompt)))
-        (values (if (gemma4-chat-template-uses-channel-p chat-template)
+       (values (if (and use-thought-channel
+                        (gemma4-chat-template-uses-channel-p chat-template))
                    (format nil "<bos><|turn>user~%~a<turn|>~%<|turn>model~%<|channel>thought~%<channel|>"
                            prompt)
                    (format nil "<bos><|turn>user~%~a<turn|>~%<|turn>model~%"
@@ -616,14 +896,21 @@
 (defun generate-from-prompt (kv-pairs prompt step-function kv-cache
                               &key
                                 (add-bos t)
+                                use-thought-channel
                                 eos-token-id
+                                (repetition-penalty 1.15f0)
+                                (top-k 40)
+                                (top-p 0.90f0)
                                 (temperature 1.0)
                                 (max-tokens 256)
                                 random-values
                                 (stream *standard-output*)
                                 (random-state *random-state*))
   (multiple-value-bind (prepared-prompt effective-add-bos)
-      (maybe-prepare-prompt-for-generation kv-pairs prompt add-bos)
+      (maybe-prepare-prompt-for-generation kv-pairs
+                                          prompt
+                                          add-bos
+                                          :use-thought-channel use-thought-channel)
     (let* ((token-ids (tokenize-prompt kv-pairs prepared-prompt :add-bos effective-add-bos))
            (stop-token-ids (resolve-stop-token-ids kv-pairs eos-token-id))
            (prompt-logits (evaluate-prompt token-ids step-function kv-cache)))
@@ -634,6 +921,9 @@
                            :eos-token-id eos-token-id
                            :stop-token-ids stop-token-ids
                            :start-position (length token-ids)
+                           :repetition-penalty repetition-penalty
+                           :top-k top-k
+                           :top-p top-p
                            :temperature temperature
                            :max-tokens max-tokens
                            :random-values random-values
@@ -660,6 +950,10 @@
                                  step-function
                                  kv-cache
                                  eos-token-id
+                                 use-thought-channel
+                                 (repetition-penalty 1.15f0)
+                                 (top-k 40)
+                                 (top-p 0.90f0)
                                  (temperature 1.0)
                                  (max-tokens 256)
                                  random-values
@@ -708,7 +1002,11 @@
                                                  prompt
                                                  effective-step-function
                                                  effective-kv-cache
+                                                 :use-thought-channel use-thought-channel
                                                  :eos-token-id effective-eos-token-id
+                                                 :repetition-penalty repetition-penalty
+                                                 :top-k top-k
+                                                 :top-p top-p
                                                  :temperature temperature
                                                  :max-tokens max-tokens
                                                  :random-values random-values
@@ -723,7 +1021,11 @@
 
 (defun test-llm-response (kv-pairs step-function kv-cache
                            &key
+                             use-thought-channel
                              eos-token-id
+                             (repetition-penalty 1.15f0)
+                             (top-k 40)
+                             (top-p 0.90f0)
                              (temperature 1.0)
                              (max-tokens 256)
                              random-values
@@ -736,7 +1038,11 @@
                               prompt
                               step-function
                               kv-cache
+                              :use-thought-channel use-thought-channel
                               :eos-token-id eos-token-id
+                              :repetition-penalty repetition-penalty
+                              :top-k top-k
+                              :top-p top-p
                               :temperature temperature
                               :max-tokens max-tokens
                               :random-values random-values
@@ -747,6 +1053,10 @@
 
 (defun test-gemma4-e2b-it-response (&key
                                       (stream *standard-output*)
+                                      use-thought-channel
+                                      (repetition-penalty 1.15f0)
+                                      (top-k 40)
+                                      (top-p 0.90f0)
                                       (temperature 1.0)
                                       (max-tokens 256)
                                       random-values
@@ -757,10 +1067,14 @@
 Write a haiku about a hacker drinking coffee.<turn|>
 <|turn>model
 "
-   :temperature temperature
-   :max-tokens max-tokens
-   :random-values random-values
-   :stream stream
+:use-thought-channel use-thought-channel
+:repetition-penalty repetition-penalty
+:top-k top-k
+:top-p top-p
+:temperature temperature
+:max-tokens max-tokens
+:random-values random-values
+:stream stream
    :random-state random-state))
 
 (defun read-gguf-string (pointer offset)

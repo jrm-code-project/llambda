@@ -2,6 +2,9 @@
   (:use #:cl #:fiveam)
   (:import-from #:llambda #:call-with-file
                           #:call-with-mapped-file
+                          #:apply-repetition-penalty
+                          #:apply-top-k
+                          #:apply-top-p
                           #:apply-temperature
                           #:apply-rope
                           #:apply-silu
@@ -57,6 +60,9 @@
 (test windows-bindings
   (is (fboundp 'call-with-file))
   (is (fboundp 'call-with-mapped-file))
+  (is (fboundp 'apply-repetition-penalty))
+  (is (fboundp 'apply-top-k))
+  (is (fboundp 'apply-top-p))
   (is (fboundp 'apply-temperature))
   (is (fboundp 'apply-rope))
   (is (fboundp 'apply-silu))
@@ -201,6 +207,57 @@
       (is (approx= 4.0f0 (aref scaled 0)))
       (is (approx= 2.0f0 (aref scaled 1)))
       (is (approx= -4.0f0 (aref scaled 2))))
+    (let ((logits (make-array 4
+                              :element-type 'single-float
+                              :initial-contents '(2.0f0 -3.0f0 4.0f0 1.0f0))))
+      (is (eq logits (apply-repetition-penalty logits '(2 1 2 1) 1.25f0)))
+      (is (approx= 2.0f0 (aref logits 0)))
+      (is (approx= -3.75f0 (aref logits 1)))
+      (is (approx= 3.2f0 (aref logits 2)))
+      (is (approx= 1.0f0 (aref logits 3))))
+    (let ((logits (make-array 5
+                              :element-type 'single-float
+                              :initial-contents '(0.5f0 3.0f0 2.0f0 1.0f0 2.0f0))))
+      (is (eq logits (apply-top-k logits 2)))
+      (is (approx= -1.0f30 (aref logits 0)))
+      (is (approx= 3.0f0 (aref logits 1)))
+      (is (approx= 2.0f0 (aref logits 2)))
+      (is (approx= -1.0f30 (aref logits 3)))
+      (is (approx= 2.0f0 (aref logits 4))))
+    (let ((logits (make-array 4
+                              :element-type 'single-float
+                              :initial-contents '(3.0f0 2.0f0 1.0f0 -1.0f30))))
+      (is (eq logits (apply-top-p logits 0.60f0 1.0f0)))
+      (is (approx= 3.0f0 (aref logits 0)))
+      (is (approx= -1.0f30 (aref logits 1)))
+      (is (approx= -1.0f30 (aref logits 2)))
+      (is (approx= -1.0f30 (aref logits 3))))
+    (let ((logits #(2.0f0 1.95f0 0.0f0)))
+      (is (= 0 (sample-token-id-from-logits logits
+                                            :top-k 0
+                                            :top-p 1.0f0
+                                            :temperature 1.0f0
+                                            :random-value 0.45f0)))
+      (let ((penalized-logits #(2.0f0 1.95f0 0.0f0)))
+        (is (= 1 (sample-token-id-from-logits penalized-logits
+                                              :history '(0)
+                                              :repetition-penalty 1.15f0
+                                              :top-k 0
+                                              :top-p 1.0f0
+                                              :temperature 1.0f0
+                                              :random-value 0.45f0)))))
+    (let ((top-k-logits #(3.0f0 2.9f0 0.1f0)))
+      (is (= 1 (sample-token-id-from-logits top-k-logits
+                                            :top-k 2
+                                            :top-p 1.0f0
+                                            :temperature 1.0f0
+                                            :random-value 0.9f0))))
+    (let ((top-p-logits #(3.0f0 2.0f0 1.0f0)))
+      (is (= 0 (sample-token-id-from-logits top-p-logits
+                                            :top-k 0
+                                            :top-p 0.60f0
+                                            :temperature 1.0f0
+                                            :random-value 0.95f0))))
     (let ((probs (softmax #(2.0f0 1.0f0 0.0f0))))
       (is (approx= 1.0f0 (loop for p across probs sum p)))
       (is (> (aref probs 0) (aref probs 1) (aref probs 2))))
@@ -211,9 +268,11 @@
     (is (= 2 (sample-from-probabilities #(0.7f0 0.2f0 0.1f0)
                                         :random-value 0.95f0)))
     (is (= 0 (sample-token-id-from-logits #(3.0f0 1.0f0 0.0f0)
+                                          :top-p 1.0f0
                                           :temperature 1.0f0
                                           :random-value 0.1f0)))
     (is (= 1 (sample-token-id-from-logits #(3.0f0 1.0f0 0.0f0)
+                                          :top-p 1.0f0
                                           :temperature 1.0f0
                                           :random-value 0.9f0)))))
 
@@ -1229,7 +1288,24 @@ Hello<turn|>
       (is (search "<bos><|turn>user" prepared-prompt))
       (is (search "Hello<turn|>" prepared-prompt))
       (is (search "<|turn>model" prepared-prompt))
-      (is (eq t effective-add-bos)))))
+      (is (eq t effective-add-bos))))
+  (let ((kv-pairs '(("tokenizer.ggml.model" . "gemma4")
+                   ("tokenizer.chat_template" . "<|turn>system\nstuff<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"))))
+    (multiple-value-bind (prepared-prompt effective-add-bos)
+        (llambda::maybe-prepare-prompt-for-generation kv-pairs "Hello" t)
+      (is (search "<bos><|turn>user" prepared-prompt))
+      (is (search "Hello<turn|>" prepared-prompt))
+      (is (search "<|turn>model" prepared-prompt))
+      (is (null (search "<|channel>thought" prepared-prompt)))
+      (is (null effective-add-bos)))
+    (multiple-value-bind (prepared-prompt effective-add-bos)
+        (llambda::maybe-prepare-prompt-for-generation kv-pairs
+                                                     "Hello"
+                                                     t
+                                                     :use-thought-channel t)
+      (is (search "<|channel>thought" prepared-prompt))
+      (is (search "<channel|>" prepared-prompt))
+      (is (null effective-add-bos)))))
 
 (test resolve-stop-token-ids-gemma4
   (let ((kv-pairs '(("tokenizer.ggml.model" . "gemma4")

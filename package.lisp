@@ -11,6 +11,9 @@
                 #:f32.8-fmadd)
   (:export #:call-with-file
            #:call-with-mapped-file
+           #:apply-repetition-penalty
+           #:apply-top-k
+           #:apply-top-p
            #:apply-temperature
            #:apply-rope
            #:apply-silu

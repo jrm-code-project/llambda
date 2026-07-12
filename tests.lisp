@@ -13,18 +13,29 @@
                           #:detokenize-token-ids
                           #:decode-next-token
                           #:evaluate-prompt
+                          #:find-gguf-tensor-info
                           #:generate-from-prompt
                           #:generate-token-loop
                           #:hello-message
+                          #:load-gemma4-model
+                          #:load-gguf-tensor
+                          #:load-gguf-tensor-by-name
+                          #:make-gemma4-step-function
                           #:map-view-of-file
                           #:print-gguf-file
+                          #:print-gguf-floating-point-tables
+                          #:copy-tensors-to-aligned-temp-file
+                          #:map-gguf-tensors-to-aligned-arrays
+                          #:forged-dot-product
                           #:read-gguf-header
                           #:read-gguf-kv-pairs
+                          #:read-gguf-tensor-infos
                           #:rms-norm
                           #:sample-from-probabilities
                           #:sample-token-id-from-logits
                           #:silu
                           #:softmax
+                          #:test-gguf-file-response
                           #:test-llm-response
                           #:tokenize-prompt
                           #:unmap-view-of-file
@@ -57,17 +68,25 @@
   (is (fboundp 'detokenize-token-ids))
   (is (fboundp 'decode-next-token))
   (is (fboundp 'evaluate-prompt))
+  (is (fboundp 'find-gguf-tensor-info))
   (is (fboundp 'generate-from-prompt))
   (is (fboundp 'generate-token-loop))
+  (is (fboundp 'hello-message))
+  (is (fboundp 'load-gemma4-model))
+  (is (fboundp 'load-gguf-tensor))
+  (is (fboundp 'load-gguf-tensor-by-name))
+  (is (fboundp 'make-gemma4-step-function))
   (is (fboundp 'map-view-of-file))
   (is (fboundp 'print-gguf-file))
   (is (fboundp 'read-gguf-header))
   (is (fboundp 'read-gguf-kv-pairs))
+  (is (fboundp 'read-gguf-tensor-infos))
   (is (fboundp 'rms-norm))
   (is (fboundp 'sample-from-probabilities))
   (is (fboundp 'sample-token-id-from-logits))
   (is (fboundp 'silu))
   (is (fboundp 'softmax))
+  (is (fboundp 'test-gguf-file-response))
   (is (fboundp 'test-llm-response))
   (is (fboundp 'tokenize-prompt))
   (is (fboundp 'unmap-view-of-file))
@@ -77,7 +96,11 @@
 
 (test forward-primitives
   (flet ((approx= (left right &optional (epsilon 1.0e-5))
-           (< (abs (- left right)) epsilon)))
+           (< (abs (- left right)) epsilon))
+         (sfv (&rest values)
+           (make-array (length values)
+                       :element-type 'single-float
+                       :initial-contents values)))
     (let ((normed (rms-norm #(3.0f0 4.0f0)
                             #(1.0f0 2.0f0)
                             :epsilon 0.0f0)))
@@ -90,6 +113,23 @@
                                              3)))
       (is (approx= -2.0f0 (aref projected 0)))
       (is (approx= 2.5f0 (aref projected 1))))
+    (let ((dest (make-array 2 :element-type 'single-float)))
+      (is (eq dest
+              (llambda::vector-add-into dest (sfv 1.0f0 2.0f0) (sfv 3.0f0 4.0f0))))
+      (is (approx= 4.0f0 (aref dest 0)))
+      (is (approx= 6.0f0 (aref dest 1))))
+    (let ((dest (make-array 2 :element-type 'single-float)))
+      (is (eq dest
+              (llambda::rms-norm-into dest (sfv 3.0f0 4.0f0) (sfv 1.0f0 2.0f0)
+                                      :epsilon 0.0f0)))
+      (is (approx= 0.84852815f0 (aref dest 0)))
+      (is (approx= 2.2627418f0 (aref dest 1))))
+    (let ((dest (make-array 2 :element-type 'single-float)))
+      (is (eq dest
+              (llambda::vector-elementwise-multiply-into
+               dest (sfv 2.0f0 3.0f0) (sfv 4.0f0 5.0f0))))
+      (is (approx= 8.0f0 (aref dest 0)))
+      (is (approx= 15.0f0 (aref dest 1))))
     (is (approx= 1.7615942f0 (silu 2.0f0)))
     (let ((activated (apply-silu #(0.0f0 2.0f0))))
       (is (approx= 0.0f0 (aref activated 0)))
@@ -101,6 +141,58 @@
       (is (approx= (coerce (sin 1.0d0) 'single-float) (aref rotated 1)))
       (is (approx= 5.0f0 (aref rotated 2)))
       (is (approx= 6.0f0 (aref rotated 3))))))
+
+(test gemma4-shared-kv-layer-mapping
+  (let ((model (llambda::make-gguf-model
+                :layer-count 6
+                :shared-kv-layers 2
+                :sliding-pattern '(t nil t nil t nil))))
+    (is (= 4 (llambda::gguf-model-kv-layer-count model)))
+    (is (= 0 (llambda::gguf-model-layer-kv-source-index model 0)))
+    (is (= 3 (llambda::gguf-model-layer-kv-source-index model 3)))
+    (is (= 2 (llambda::gguf-model-layer-kv-source-index model 4)))
+    (is (= 3 (llambda::gguf-model-layer-kv-source-index model 5)))))
+
+(test gemma4-cache-append-copies-heads
+  (let* ((kv-cache (make-hash-table))
+         (key-storage (make-array 4
+                                  :element-type 'single-float
+                                  :initial-contents '(1.0f0 2.0f0 3.0f0 4.0f0)))
+         (value-storage (make-array 4
+                                    :element-type 'single-float
+                                    :initial-contents '(5.0f0 6.0f0 7.0f0 8.0f0)))
+         (key-heads (make-array 2 :initial-contents
+                                (list (make-array 2
+                                                  :element-type 'single-float
+                                                  :displaced-to key-storage
+                                                  :displaced-index-offset 0)
+                                      (make-array 2
+                                                  :element-type 'single-float
+                                                  :displaced-to key-storage
+                                                  :displaced-index-offset 2))))
+         (value-heads (make-array 2 :initial-contents
+                                  (list (make-array 2
+                                                    :element-type 'single-float
+                                                    :displaced-to value-storage
+                                                    :displaced-index-offset 0)
+                                        (make-array 2
+                                                    :element-type 'single-float
+                                                    :displaced-to value-storage
+                                                    :displaced-index-offset 2)))))
+    (llambda::gemma4-cache-append kv-cache 0 key-heads value-heads)
+    (setf (aref key-storage 0) 99.0f0
+          (aref key-storage 3) 88.0f0
+          (aref value-storage 1) 77.0f0
+          (aref value-storage 2) 66.0f0)
+    (let* ((layer-cache (gethash 0 kv-cache))
+           (cached-keys (getf layer-cache :keys))
+           (cached-values (getf layer-cache :values))
+           (cached-key-heads (aref cached-keys 0))
+           (cached-value-heads (aref cached-values 0)))
+      (is (= 1.0f0 (aref (aref cached-key-heads 0) 0)))
+      (is (= 4.0f0 (aref (aref cached-key-heads 1) 1)))
+      (is (= 6.0f0 (aref (aref cached-value-heads 0) 1)))
+      (is (= 7.0f0 (aref (aref cached-value-heads 1) 0))))))
 
 (test sampling-primitives
   (flet ((approx= (left right &optional (epsilon 1.0e-5))
@@ -289,9 +381,19 @@
              (write-u64-le (stream value)
                (loop for index from 0 below 8
                      do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-f32-le (stream value)
+               #+sbcl
+               (write-u32-le stream (sb-kernel::single-float-bits value))
+               #-sbcl
+               (error "TEST-GGUF-FILE-RESPONSE float fixture writer currently requires SBCL."))
              (write-string-field (stream value)
-               (write-u64-le stream (length value))
-               (map nil (lambda (ch) (write-byte (char-code ch) stream)) value)))
+               (let ((octets
+                       #+sbcl
+                       (sb-ext:string-to-octets value :external-format :utf-8)
+                       #-sbcl
+                       (map '(vector (unsigned-byte 8)) #'char-code value)))
+                 (write-u64-le stream (length octets))
+                 (write-sequence octets stream))))
       (unwind-protect
           (progn
             (with-open-file (stream temp-path
@@ -346,9 +448,19 @@
              (write-u64-le (stream value)
                (loop for index from 0 below 8
                      do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-f32-le (stream value)
+               #+sbcl
+               (write-u32-le stream (sb-kernel::single-float-bits value))
+               #-sbcl
+               (error "TEST-GGUF-FILE-RESPONSE float fixture writer currently requires SBCL."))
              (write-string-field (stream value)
-               (write-u64-le stream (length value))
-               (map nil (lambda (ch) (write-byte (char-code ch) stream)) value)))
+               (let ((octets
+                       #+sbcl
+                       (sb-ext:string-to-octets value :external-format :utf-8)
+                       #-sbcl
+                       (map '(vector (unsigned-byte 8)) #'char-code value)))
+                 (write-u64-le stream (length octets))
+                 (write-sequence octets stream))))
       (unwind-protect
           (progn
             (with-open-file (stream temp-path
@@ -388,6 +500,586 @@
         (when (probe-file temp-path)
           (delete-file temp-path))))))
 
+(test print-gguf-floating-point-tables
+  (let* ((temp-path (merge-pathnames
+                     (make-pathname :name (format nil "llambda-gguf-fp-print-test-~d"
+                                                  (get-universal-time))
+                                    :type "gguf")
+                     (uiop:temporary-directory))))
+    (labels ((write-u32-le (stream value)
+               (loop for index from 0 below 4
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-u64-le (stream value)
+               (loop for index from 0 below 8
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-string-field (stream value)
+               (let ((octets
+                       #+sbcl
+                       (sb-ext:string-to-octets value :external-format :utf-8)
+                       #-sbcl
+                       (map '(vector (unsigned-byte 8)) #'char-code value)))
+                 (write-u64-le stream (length octets))
+                 (write-sequence octets stream)))
+             (write-padding-to-alignment (stream alignment)
+               (let* ((position (file-position stream))
+                      (padding (mod (- alignment (mod position alignment))
+                                    alignment)))
+                 (loop repeat padding
+                       do (write-byte 0 stream)))))
+      (unwind-protect
+          (progn
+            (with-open-file (stream temp-path
+                                    :direction :output
+                                    :if-exists :supersede
+                                    :if-does-not-exist :create
+                                    :element-type '(unsigned-byte 8))
+              (map nil (lambda (ch) (write-byte (char-code ch) stream)) "GGUF")
+              (write-u32-le stream 3)
+              (write-u64-le stream 3) ; 3 tensors
+              (write-u64-le stream 1) ; 1 metadata KV
+
+              ;; general.alignment
+              (write-string-field stream "general.alignment")
+              (write-u32-le stream 4)
+              (write-u32-le stream 32)
+
+              ;; Tensor 1: tensor.f32 (F32 = 0)
+              (write-string-field stream "tensor.f32")
+              (write-u32-le stream 1)
+              (write-u64-le stream 4) ; 4 elements
+              (write-u32-le stream 0) ; type f32
+              (write-u64-le stream 0) ; offset 0
+
+              ;; Tensor 2: tensor.f16 (F16 = 1)
+              (write-string-field stream "tensor.f16")
+              (write-u32-le stream 1)
+              (write-u64-le stream 4) ; 4 elements
+              (write-u32-le stream 1) ; type f16
+              (write-u64-le stream 16) ; offset 16
+
+              ;; Tensor 3: tensor.q4 (Q4_K = 12) - should be ignored by the FP-only printer!
+              (write-string-field stream "tensor.q4")
+              (write-u32-le stream 1)
+              (write-u64-le stream 256) ; 256 elements
+              (write-u32-le stream 12) ; type q4_k
+              (write-u64-le stream 24) ; offset 24
+
+              (write-padding-to-alignment stream 32)
+              ;; data bytes
+              (loop repeat 256 do (write-byte 0 stream)))
+            
+            (let ((output (with-output-to-string (stream)
+                            (print-gguf-floating-point-tables temp-path stream))))
+              ;; Check that it prints details for f32 and f16 tensors
+              (is (search "tensor.f32" output))
+              (is (search "tensor.f16" output))
+              ;; Check that it prints Offset and Size in hexadecimal
+              (is (search "Offset: #x" output))
+              (is (search "Size:" output))
+              ;; Check that it also prints the q4 tensor because we expanded the printer to all tensors
+              (is (search "tensor.q4" output))))
+        (when (probe-file temp-path)
+          (delete-file temp-path))))))
+
+(test read-gguf-tensor-infos-and-load-tensors
+  (flet ((approx= (left right &optional (epsilon 1.0e-5))
+           (< (abs (- left right)) epsilon)))
+    (let* ((temp-path (merge-pathnames
+                       (make-pathname :name (format nil "llambda-gguf-tensors-test-~d"
+                                                    (get-universal-time))
+                                      :type "gguf")
+                       (uiop:temporary-directory))))
+      (labels ((write-u16-le (stream value)
+                 (loop for index from 0 below 2
+                       do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+               (write-u32-le (stream value)
+                 (loop for index from 0 below 4
+                       do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+               (write-u64-le (stream value)
+                 (loop for index from 0 below 8
+                       do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+               (write-f32-le (stream value)
+                 #+sbcl
+                 (write-u32-le stream (sb-kernel::single-float-bits value))
+                 #-sbcl
+                 (error "READ-GGUF-TENSOR-INFOS-AND-LOAD-TENSORS currently requires SBCL."))
+               (write-string-field (stream value)
+                 (let ((octets
+                         #+sbcl
+                         (sb-ext:string-to-octets value :external-format :utf-8)
+                         #-sbcl
+                         (map '(vector (unsigned-byte 8)) #'char-code value)))
+                   (write-u64-le stream (length octets))
+                   (write-sequence octets stream)))
+               (write-padding-to-alignment (stream alignment)
+                 (let* ((position (file-position stream))
+                        (padding (mod (- alignment (mod position alignment))
+                                      alignment)))
+                   (loop repeat padding
+                         do (write-byte 0 stream)))))
+        (unwind-protect
+            (progn
+              (with-open-file (stream temp-path
+                                      :direction :output
+                                      :if-exists :supersede
+                                      :if-does-not-exist :create
+                                      :element-type '(unsigned-byte 8))
+                (map nil (lambda (ch) (write-byte (char-code ch) stream)) "GGUF")
+                (write-u32-le stream 3)
+                (write-u64-le stream 2)
+                (write-u64-le stream 1)
+
+                (write-string-field stream "general.alignment")
+                (write-u32-le stream 4)
+                (write-u32-le stream 32)
+
+                (write-string-field stream "tensor.f32")
+                (write-u32-le stream 2)
+                (write-u64-le stream 2)
+                (write-u64-le stream 2)
+                (write-u32-le stream 0)
+                (write-u64-le stream 0)
+
+                (write-string-field stream "tensor.f16")
+                (write-u32-le stream 1)
+                (write-u64-le stream 2)
+                (write-u32-le stream 1)
+                (write-u64-le stream 16)
+
+                (write-padding-to-alignment stream 32)
+                (dolist (value '(1.0f0 2.0f0 3.5f0 -4.0f0))
+                  (write-f32-le stream value))
+                (write-u16-le stream #x3C00)
+                (write-u16-le stream #xC000))
+              (call-with-file temp-path
+                              (lambda (handle)
+                                (with-mapped-file (mapping handle)
+                                  (let* ((tensor-infos (read-gguf-tensor-infos mapping))
+                                         (f32-info (find-gguf-tensor-info tensor-infos "tensor.f32"))
+                                         (f16-info (find-gguf-tensor-info tensor-infos "tensor.f16")))
+                                    (is (= 2 (length tensor-infos)))
+                                    (is (equal '(2 2) (getf f32-info :dimensions)))
+                                    (is (eq :f32 (getf f32-info :type-name)))
+                                    (is (= 4 (getf f32-info :element-count)))
+                                    (is (= 16 (getf f32-info :byte-size)))
+                                    (is (zerop (mod (getf f32-info :data-offset) 32)))
+                                    (is (= 16 (- (getf f16-info :data-offset)
+                                                 (getf f32-info :data-offset))))
+                                    (multiple-value-bind (f32-tensor resolved-info)
+                                        (load-gguf-tensor-by-name mapping "tensor.f32" tensor-infos)
+                                      (is (equal f32-info resolved-info))
+                                      (is (= 4 (length f32-tensor)))
+                                      (is (approx= 1.0f0 (aref f32-tensor 0)))
+                                      (is (approx= 2.0f0 (aref f32-tensor 1)))
+                                      (is (approx= 3.5f0 (aref f32-tensor 2)))
+                                      (is (approx= -4.0f0 (aref f32-tensor 3))))
+                                    (let ((f16-tensor (load-gguf-tensor mapping f16-info)))
+                                      (is (= 2 (length f16-tensor)))
+                                      (is (approx= 1.0f0 (aref f16-tensor 0)))
+                                      (is (approx= -2.0f0 (aref f16-tensor 1)))))))
+                              :share-mode 0))
+          (when (probe-file temp-path)
+            (delete-file temp-path)))))))
+
+(test copy-tensors-to-aligned-temp-file-test
+  (let* ((temp-gguf (merge-pathnames
+                     (make-pathname :name (format nil "llambda-copy-gguf-test-~d"
+                                                  (get-universal-time))
+                                    :type "gguf")
+                     (uiop:temporary-directory)))
+         (temp-backed (merge-pathnames
+                       (make-pathname :name (format nil "llambda-copy-backed-test-~d"
+                                                    (get-universal-time))
+                                      :type "bin")
+                       (uiop:temporary-directory))))
+    (labels ((write-u32-le (stream value)
+               (loop for index from 0 below 4
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-u64-le (stream value)
+               (loop for index from 0 below 8
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-f32-le (stream value)
+               #+sbcl
+               (write-u32-le stream (sb-kernel::single-float-bits value))
+               #-sbcl
+               (error "READ-GGUF-TENSOR-INFOS-AND-LOAD-TENSORS currently requires SBCL."))
+             (write-string-field (stream value)
+               (let ((octets
+                       #+sbcl
+                       (sb-ext:string-to-octets value :external-format :utf-8)
+                       #-sbcl
+                       (map '(vector (unsigned-byte 8)) #'char-code value)))
+                 (write-u64-le stream (length octets))
+                 (write-sequence octets stream)))
+             (write-padding-to-alignment (stream alignment)
+               (let* ((position (file-position stream))
+                      (padding (mod (- alignment (mod position alignment))
+                                    alignment)))
+                 (loop repeat padding
+                       do (write-byte 0 stream)))))
+      (unwind-protect
+          (progn
+            ;; Create a mock GGUF file with 2 tensors
+            (with-open-file (stream temp-gguf
+                                    :direction :output
+                                    :if-exists :supersede
+                                    :if-does-not-exist :create
+                                    :element-type '(unsigned-byte 8))
+              (map nil (lambda (ch) (write-byte (char-code ch) stream)) "GGUF")
+              (write-u32-le stream 3)
+              (write-u64-le stream 2) ; 2 tensors
+              (write-u64-le stream 1) ; 1 metadata KV
+
+              ;; general.alignment
+              (write-string-field stream "general.alignment")
+              (write-u32-le stream 4)
+              (write-u32-le stream 32)
+
+              ;; Tensor 1: tensor.f32 (F32 = 0)
+              (write-string-field stream "tensor.f32")
+              (write-u32-le stream 1)
+              (write-u64-le stream 4) ; 4 elements
+              (write-u32-le stream 0) ; type f32
+              (write-u64-le stream 0) ; offset 0
+
+              ;; Tensor 2: tensor.f16 (F16 = 1)
+              (write-string-field stream "tensor.f16")
+              (write-u32-le stream 1)
+              (write-u64-le stream 4) ; 4 elements
+              (write-u32-le stream 1) ; type f16
+              (write-u64-le stream 16) ; offset 16
+
+              (write-padding-to-alignment stream 32)
+              ;; data bytes: 4 single-floats = 16 bytes for F32
+              (dolist (val '(1.0f0 2.0f0 3.0f0 4.0f0))
+                (write-f32-le stream val))
+              ;; 4 half-floats = 8 bytes for F16
+              (write-u32-le stream #x3C003C00)
+              (write-u32-le stream #x3C003C00))
+
+            ;; Copy tensors to the aligned temporary file
+            (let ((total-size (copy-tensors-to-aligned-temp-file temp-gguf temp-backed)))
+              ;; Verify total size is a multiple of 64KB (65536)
+              (is (plusp total-size))
+              (is (zerop (mod total-size 65536)))
+              ;; Open and map the resulting temporary file to verify contents
+              (call-with-file temp-backed
+                              (lambda (handle)
+                                (call-with-mapped-file
+                                 handle
+                                 (lambda (mapping)
+                                   ;; Tensor 1 is at offset 0 of temp-backed
+                                   ;; Header of Tensor 1 (F32 -> simple-array single-float (*)):
+                                   ;; Word 0: Widetag should be #xD1
+                                   ;; Word 1: Length (as fixnum) should be 4 * 2 = 8
+                                   (is (= #xD1 (cffi:mem-ref mapping :uint64 0)))
+                                   (is (= 8 (cffi:mem-ref mapping :uint64 8)))
+                                   ;; Copied f32 tensor starts at offset 16
+                                   (is (= #x3F800000 (cffi:mem-ref mapping :uint32 16))) ; 1.0f0
+                                   (is (= #x40000000 (cffi:mem-ref mapping :uint32 20))) ; 2.0f0
+
+                                   ;; Tensor 2 is at offset 65536 of temp-backed
+                                   (let ((tensor2-ptr (cffi:inc-pointer mapping 65536)))
+                                     ;; Header of Tensor 2 (F16 -> simple-array (unsigned-byte 8) (*)):
+                                     ;; Word 0: Widetag should be #x9D
+                                     ;; Word 1: Length (byte-size) as fixnum should be 8 * 2 = 16
+                                     (is (= #x9D (cffi:mem-ref tensor2-ptr :uint64 0)))
+                                     (is (= 16 (cffi:mem-ref tensor2-ptr :uint64 8)))
+                                     ;; Copied f16 tensor starts at offset 16
+                                     (is (= #x3C00 (cffi:mem-ref tensor2-ptr :uint16 16)))
+                                     (is (= #x3C00 (cffi:mem-ref tensor2-ptr :uint16 18))))))
+                                 :protect 4 ; PAGE_READWRITE
+                                 :desired-access 2)) ; FILE_MAP_WRITE
+              :ok))
+        (progn
+          (when (probe-file temp-gguf)
+            (delete-file temp-gguf))
+          (when (probe-file temp-backed)
+            (delete-file temp-backed)))))))
+
+(test map-gguf-tensors-to-aligned-arrays-test
+  (let* ((temp-gguf (merge-pathnames
+                     (make-pathname :name (format nil "llambda-map-gguf-test-~d"
+                                                  (get-universal-time))
+                                    :type "gguf")
+                     (uiop:temporary-directory)))
+         (temp-backed (merge-pathnames
+                       (make-pathname :name (format nil "llambda-map-backed-test-~d"
+                                                    (get-universal-time))
+                                      :type "bin")
+                       (uiop:temporary-directory))))
+    (labels ((write-u16-le (stream value)
+               (loop for index from 0 below 2
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-u32-le (stream value)
+               (loop for index from 0 below 4
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-u64-le (stream value)
+               (loop for index from 0 below 8
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-f32-le (stream value)
+               #+sbcl
+               (write-u32-le stream (sb-kernel::single-float-bits value))
+               #-sbcl
+               (error "READ-GGUF-TENSOR-INFOS-AND-LOAD-TENSORS currently requires SBCL."))
+             (write-string-field (stream value)
+               (let ((octets
+                       #+sbcl
+                       (sb-ext:string-to-octets value :external-format :utf-8)
+                       #-sbcl
+                       (map '(vector (unsigned-byte 8)) #'char-code value)))
+                 (write-u64-le stream (length octets))
+                 (write-sequence octets stream)))
+             (write-padding-to-alignment (stream alignment)
+               (let* ((position (file-position stream))
+                      (padding (mod (- alignment (mod position alignment))
+                                    alignment)))
+                 (loop repeat padding
+                       do (write-byte 0 stream)))))
+      (unwind-protect
+          (progn
+            ;; Create a mock GGUF file with 2 tensors
+            (with-open-file (stream temp-gguf
+                                    :direction :output
+                                    :if-exists :supersede
+                                    :if-does-not-exist :create
+                                    :element-type '(unsigned-byte 8))
+              (map nil (lambda (ch) (write-byte (char-code ch) stream)) "GGUF")
+              (write-u32-le stream 3)
+              (write-u64-le stream 2) ; 2 tensors
+              (write-u64-le stream 1) ; 1 metadata KV
+
+              ;; general.alignment
+              (write-string-field stream "general.alignment")
+              (write-u32-le stream 4)
+              (write-u32-le stream 32)
+
+              ;; Tensor 1: tensor.f32 (F32 = 0)
+              (write-string-field stream "tensor.f32")
+              (write-u32-le stream 1)
+              (write-u64-le stream 4) ; 4 elements
+              (write-u32-le stream 0) ; type f32
+              (write-u64-le stream 0) ; offset 0
+
+              ;; Tensor 2: tensor.f16 (F16 = 1)
+              (write-string-field stream "tensor.f16")
+              (write-u32-le stream 1)
+              (write-u64-le stream 4) ; 4 elements
+              (write-u32-le stream 1) ; type f16
+              (write-u64-le stream 16) ; offset 16
+
+              (write-padding-to-alignment stream 32)
+              ;; data bytes: 4 single-floats = 16 bytes for F32
+              (dolist (val '(1.5f0 2.5f0 3.5f0 4.5f0))
+                (write-f32-le stream val))
+              ;; 4 half-floats = 8 bytes for F16
+              (write-u16-le stream #x3C00) ; 1.0f0
+              (write-u16-le stream #xC000) ; -2.0f0
+              (write-u16-le stream #x3C00)
+              (write-u16-le stream #x3C00))
+
+            ;; Map GGUF tensors to native SBCL arrays
+            (let* ((res (map-gguf-tensors-to-aligned-arrays temp-gguf temp-backed))
+                   (arrays (getf res :arrays))
+                   (views (getf res :views))
+                   (mapping (getf res :mapping))
+                   (file (getf res :file)))
+              (is (= 2 (length arrays)))
+              
+              ;; Verify Tensor 1 (F32)
+              (let ((arr1 (first arrays)))
+                (is (typep arr1 '(vector single-float 4)))
+                (is (= 4 (length arr1)))
+                (is (= 1.5f0 (aref arr1 0)))
+                (is (= 2.5f0 (aref arr1 1)))
+                (is (= 3.5f0 (aref arr1 2)))
+                (is (= 4.5f0 (aref arr1 3)))
+                ;; Verify that forged-dot-product works flawlessly on the forged arrays
+                (is (= 41.0f0 (forged-dot-product arr1 arr1))))
+
+              ;; Verify Tensor 2 (F16 -> byte vector)
+              (let ((arr2 (second arrays)))
+                (is (typep arr2 '(vector (unsigned-byte 8) 8)))
+                (is (= 8 (length arr2)))
+                ;; #x3C00 is little endian: low byte = #x00, high byte = #x3C
+                (is (= #x00 (aref arr2 0)))
+                (is (= #x3C (aref arr2 1)))
+                ;; #xC000 is little endian: low byte = #x00, high byte = #xC0
+                (is (= #x00 (aref arr2 2)))
+                (is (= #xC0 (aref arr2 3))))
+
+              ;; Clean up mappings and close handles
+              (dolist (v views)
+                (unmap-view-of-file v))
+              (close-handle mapping)
+              (close-handle file))
+            :ok)
+        (progn
+          (when (probe-file temp-gguf)
+            (delete-file temp-gguf))
+          (when (probe-file temp-backed)
+            (delete-file temp-backed)))))))
+
+(test dot-product-with-f16-tensor-row
+  (flet ((approx= (left right &optional (epsilon 1.0e-5))
+          (< (abs (- left right)) epsilon))
+         (sfv (&rest values)
+          (make-array (length values)
+                      :element-type 'single-float
+                      :initial-contents values)))
+    (let ((tensor-info '(:name "tensor.f16.matrix"
+                        :dimensions (3 2)
+                        :type-tag 1
+                        :data-offset 0)))
+      (cffi:with-foreign-object (matrix-bytes :unsigned-char 12)
+        (dolist (byte/index '((#x00 0) (#x3C 1)
+                             (#x00 2) (#x40 3)
+                             (#x00 4) (#x42 5)
+                             (#x00 6) (#xC0 7)
+                             (#x00 8) (#x44 9)
+                             (#x00 10) (#x45 11)))
+          (setf (cffi:mem-aref matrix-bytes :unsigned-char (second byte/index))
+               (first byte/index)))
+        (is (approx= 14.0f0
+                    (llambda::dot-product-with-tensor-row matrix-bytes
+                                                          tensor-info
+                                                          0
+                                                          (sfv 1.0f0 2.0f0 3.0f0))))
+        (is (approx= 14.0f0
+                    (llambda::dot-product-with-tensor-row matrix-bytes
+                                                          tensor-info
+                                                          1
+                                                          (sfv -1.0f0 0.5f0 2.0f0))))))))
+
+(test dot-product-with-q4-k-tensor-row
+  (flet ((approx= (left right &optional (epsilon 1.0e-4))
+           (< (abs (- left right)) epsilon)))
+    (let ((tensor-info '(:name "tensor.q4-k.matrix"
+                        :dimensions (256 1)
+                        :type-tag 12
+                        :data-offset 0))
+          (vector (make-array 256
+                              :element-type 'single-float
+                              :initial-contents
+                              (loop for index below 256
+                                    collect (coerce (/ (- (mod index 11) 5) 3.0)
+                                                    'single-float)))))
+      (cffi:with-foreign-object (block :unsigned-char 144)
+        (dotimes (index 144)
+          (setf (cffi:mem-aref block :unsigned-char index) 0))
+        (setf (cffi:mem-aref block :unsigned-char 0) #x00
+              (cffi:mem-aref block :unsigned-char 1) #x3C
+              (cffi:mem-aref block :unsigned-char 2) #x00
+              (cffi:mem-aref block :unsigned-char 3) #x3C)
+        (dotimes (index 4)
+          (setf (cffi:mem-aref block :unsigned-char (+ 4 index)) 2
+                (cffi:mem-aref block :unsigned-char (+ 8 index)) 1
+                (cffi:mem-aref block :unsigned-char (+ 12 index)) #x12))
+        (dotimes (index 128)
+          (setf (cffi:mem-aref block :unsigned-char (+ 16 index)) #x76))
+        (let ((expected (llambda::dot-product (dequantize-q4-k-m block 256) vector)))
+          (is (approx= expected
+                       (llambda::dot-product-with-tensor-row block
+                                                             tensor-info
+                                                             0
+                                                             vector))))))))
+
+(test dot-product-with-q6-k-tensor-row
+  (flet ((approx= (left right &optional (epsilon 1.0e-4))
+           (< (abs (- left right)) epsilon)))
+    (let ((tensor-info '(:name "tensor.q6-k.matrix"
+                        :dimensions (256 1)
+                        :type-tag 14
+                        :data-offset 0))
+          (vector (make-array 256
+                              :element-type 'single-float
+                              :initial-contents
+                              (loop for index below 256
+                                    collect (coerce (/ (- (mod index 13) 6) 4.0)
+                                                    'single-float)))))
+      (cffi:with-foreign-object (block :unsigned-char 210)
+        (dotimes (index 210)
+          (setf (cffi:mem-aref block :unsigned-char index) 0))
+        (dotimes (index 32)
+          (setf (cffi:mem-aref block :unsigned-char index) #x31
+                (cffi:mem-aref block :unsigned-char (+ 32 index)) #x42
+                (cffi:mem-aref block :unsigned-char (+ 64 index)) #x31
+                (cffi:mem-aref block :unsigned-char (+ 96 index)) #x42))
+        (dotimes (index 64)
+          (setf (cffi:mem-aref block :unsigned-char (+ 128 index)) #xAA))
+        (dotimes (index 16)
+          (setf (cffi:mem-aref block :unsigned-char (+ 192 index)) 2))
+        (setf (cffi:mem-aref block :unsigned-char 208) #x00
+              (cffi:mem-aref block :unsigned-char 209) #x3C)
+        (let ((expected (llambda::dot-product (dequantize-q6-k block 256) vector)))
+          (is (approx= expected
+                       (llambda::dot-product-with-tensor-row block
+                                                             tensor-info
+                                                             0
+                                                             vector))))))))
+
+(test load-gguf-tensor-quantized
+  (cffi:with-foreign-object (q4-block :unsigned-char 144)
+    (dotimes (index 144)
+      (setf (cffi:mem-aref q4-block :unsigned-char index) 0))
+    (setf (cffi:mem-aref q4-block :unsigned-char 0) #x00
+          (cffi:mem-aref q4-block :unsigned-char 1) #x3C
+          (cffi:mem-aref q4-block :unsigned-char 2) #x00
+          (cffi:mem-aref q4-block :unsigned-char 3) #x3C)
+    (dotimes (index 4)
+      (setf (cffi:mem-aref q4-block :unsigned-char (+ 4 index)) 2
+            (cffi:mem-aref q4-block :unsigned-char (+ 8 index)) 1
+            (cffi:mem-aref q4-block :unsigned-char (+ 12 index)) #x12))
+    (dotimes (index 128)
+      (setf (cffi:mem-aref q4-block :unsigned-char (+ 16 index)) #x76))
+    (let ((result (load-gguf-tensor q4-block
+                                    '(:name "tensor.q4"
+                                      :type-tag 12
+                                      :element-count 256
+                                      :data-offset 0))))
+      (is (= 256 (length result)))
+      (is (= 11.0f0 (aref result 0)))
+      (is (= 13.0f0 (aref result 32)))))
+  (cffi:with-foreign-object (q6-block :unsigned-char 210)
+    (dotimes (index 210)
+      (setf (cffi:mem-aref q6-block :unsigned-char index) 0))
+    (dotimes (index 32)
+      (setf (cffi:mem-aref q6-block :unsigned-char index) #x31
+            (cffi:mem-aref q6-block :unsigned-char (+ 32 index)) #x42
+            (cffi:mem-aref q6-block :unsigned-char (+ 64 index)) #x31
+            (cffi:mem-aref q6-block :unsigned-char (+ 96 index)) #x42))
+    (dotimes (index 64)
+      (setf (cffi:mem-aref q6-block :unsigned-char (+ 128 index)) #xAA))
+    (dotimes (index 16)
+      (setf (cffi:mem-aref q6-block :unsigned-char (+ 192 index)) 2))
+    (setf (cffi:mem-aref q6-block :unsigned-char 208) #x00
+          (cffi:mem-aref q6-block :unsigned-char 209) #x3C)
+    (let ((result (load-gguf-tensor q6-block
+                                    '(:name "tensor.q6"
+                                      :type-tag 14
+                                      :element-count 256
+                                      :data-offset 0))))
+      (is (= 256 (length result)))
+      (is (= 2.0f0 (aref result 0)))
+      (is (= 8.0f0 (aref result 96))))))
+
+(test load-gguf-tensor-bf16
+  (flet ((approx= (left right &optional (epsilon 1.0e-5))
+           (< (abs (- left right)) epsilon)))
+    (cffi:with-foreign-object (bf16-block :unsigned-char 4)
+      (setf (cffi:mem-aref bf16-block :unsigned-char 0) #x80
+            (cffi:mem-aref bf16-block :unsigned-char 1) #x3F
+            (cffi:mem-aref bf16-block :unsigned-char 2) #x00
+            (cffi:mem-aref bf16-block :unsigned-char 3) #xC0)
+      (let ((result (load-gguf-tensor bf16-block
+                                      '(:name "tensor.bf16"
+                                        :type-tag 30
+                                        :element-count 2
+                                        :data-offset 0))))
+        (is (= 2 (length result)))
+        (is (approx= 1.0f0 (aref result 0)))
+        (is (approx= -2.0f0 (aref result 1)))))))
+
 (test dequantize-q4-k-m
   (cffi:with-foreign-object (block :unsigned-char 144)
     (dotimes (index 144)
@@ -424,21 +1116,21 @@
   (cffi:with-foreign-object (block :unsigned-char 210)
     (dotimes (index 210)
       (setf (cffi:mem-aref block :unsigned-char index) 0))
-    ;; d = 1.0 in fp16 little-endian.
-    (setf (cffi:mem-aref block :unsigned-char 0) #x00
-          (cffi:mem-aref block :unsigned-char 1) #x3C)
     ;; ql (128 bytes): low/high nibbles for q1=33, q2=34, q3=35, q4=36.
     (dotimes (index 32)
-      (setf (cffi:mem-aref block :unsigned-char (+ 2 index)) #x31
-            (cffi:mem-aref block :unsigned-char (+ 34 index)) #x42
-            (cffi:mem-aref block :unsigned-char (+ 66 index)) #x31
-            (cffi:mem-aref block :unsigned-char (+ 98 index)) #x42))
+      (setf (cffi:mem-aref block :unsigned-char index) #x31
+            (cffi:mem-aref block :unsigned-char (+ 32 index)) #x42
+            (cffi:mem-aref block :unsigned-char (+ 64 index)) #x31
+            (cffi:mem-aref block :unsigned-char (+ 96 index)) #x42))
     ;; qh (64 bytes): upper 2 bits for each q packed into one byte.
     (dotimes (index 64)
-      (setf (cffi:mem-aref block :unsigned-char (+ 130 index)) #xAA))
+      (setf (cffi:mem-aref block :unsigned-char (+ 128 index)) #xAA))
     ;; 16 signed scales, all equal to 2.
     (dotimes (index 16)
-      (setf (cffi:mem-aref block :unsigned-char (+ 194 index)) 2))
+      (setf (cffi:mem-aref block :unsigned-char (+ 192 index)) 2))
+    ;; d = 1.0 in fp16 little-endian at end of block.
+    (setf (cffi:mem-aref block :unsigned-char 208) #x00
+          (cffi:mem-aref block :unsigned-char 209) #x3C)
     (let ((result (dequantize-q6-k block 256)))
       (is (= 256 (length result)))
       (is (every (lambda (value) (= 2.0f0 value))
@@ -480,6 +1172,72 @@
                (tokenize-prompt kv-pairs "Hey V")))
     (is (equal '(6 7)
                (tokenize-prompt kv-pairs "Hey V" :add-bos nil)))))
+
+(test tokenize-prompt-gemma4-bpe
+  (let ((kv-pairs `(("tokenizer.ggml.model" . "gemma4")
+                    ("tokenizer.ggml.tokens"
+                     . ("<unk>"
+                        ,(string (code-char #x2581))
+                        "H" "e" "l" "o"
+                        "He" "Hel" "Hell" "Hello"
+                        ,(format nil "~cHello" (code-char #x2581))
+                        "<0xF0>" "<0x9F>" "<0x98>" "<0x80>" "<|turn>"
+                        ,(format nil "~c" #\Newline)
+                        ,(format nil "~c~c" #\Newline #\Newline)))
+                    ("tokenizer.ggml.token_type"
+                     . (1 1 1 1 1 1
+                        1 1 1 1 1
+                        1 1 1 1 3
+                        1 1))
+                    ("tokenizer.ggml.merges"
+                     . ("H e"
+                        "He l"
+                        "Hel l"
+                        "Hell o"
+                        "▁ Hello"))
+                    ("tokenizer.ggml.bos_token_id" . 99)
+                    ("tokenizer.ggml.add_bos_token" . nil))))
+    (is (equal '(99 10)
+               (tokenize-prompt kv-pairs " Hello" :add-bos t)))
+    (is (equal '(10)
+               (tokenize-prompt kv-pairs " Hello" :add-bos nil)))
+    (is (equal '(15)
+               (tokenize-prompt kv-pairs "<|turn>" :add-bos nil)))
+    (is (equal '(17)
+               (tokenize-prompt kv-pairs (format nil "~c~c" #\Newline #\Newline)
+                                :add-bos nil)))
+    (is (equal '(11 12 13 14)
+               (tokenize-prompt kv-pairs "😀" :add-bos nil)))))
+
+(test maybe-prepare-prompt-for-generation-gemma4
+  (let ((kv-pairs '(("tokenizer.ggml.model" . "gemma4")
+                    ("tokenizer.chat_template" . "dummy"))))
+    (multiple-value-bind (prepared-prompt effective-add-bos)
+        (llambda::maybe-prepare-prompt-for-generation kv-pairs "Hello" t)
+      (is (search "<bos><|turn>user" prepared-prompt))
+      (is (search "Hello<turn|>" prepared-prompt))
+      (is (search "<|turn>model" prepared-prompt))
+      (is (null effective-add-bos)))
+    (multiple-value-bind (prepared-prompt effective-add-bos)
+        (llambda::maybe-prepare-prompt-for-generation
+         kv-pairs
+         "<bos><|turn>user
+Hello<turn|>
+<|turn>model
+"
+         t)
+      (is (search "<bos><|turn>user" prepared-prompt))
+      (is (search "Hello<turn|>" prepared-prompt))
+      (is (search "<|turn>model" prepared-prompt))
+      (is (eq t effective-add-bos)))))
+
+(test resolve-stop-token-ids-gemma4
+  (let ((kv-pairs '(("tokenizer.ggml.model" . "gemma4")
+                    ("tokenizer.chat_template" . "dummy")
+                    ("tokenizer.ggml.tokens" . ("<eos>" "<turn|>" "Hello"))
+                    ("tokenizer.ggml.token_type" . (3 3 1)))))
+    (is (equal '(0 1)
+               (llambda::resolve-stop-token-ids kv-pairs 0)))))
 
 (test generation-pipeline
   (let* ((kv-pairs `(("tokenizer.ggml.tokens"
@@ -583,6 +1341,167 @@
                       (is (= -10.0f0 (aref logits 16)))))))
       (is (search "Prompt: Hello, how are you?" output))
       (is (search "Response:  world" output)))))
+
+(test test-gguf-file-response
+  (let* ((temp-path (merge-pathnames
+                     (make-pathname :name (format nil "llambda-gguf-response-test-~d"
+                                                  (get-universal-time))
+                                    :type "gguf")
+                     (uiop:temporary-directory))))
+    (labels ((write-u32-le (stream value)
+               (loop for index from 0 below 4
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-u64-le (stream value)
+               (loop for index from 0 below 8
+                     do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+             (write-f32-le (stream value)
+               #+sbcl
+               (write-u32-le stream (sb-kernel::single-float-bits value))
+               #-sbcl
+               (error "TEST-GGUF-FILE-RESPONSE float fixture writer currently requires SBCL."))
+             (write-string-field (stream value)
+               (let ((octets
+                       #+sbcl
+                       (sb-ext:string-to-octets value :external-format :utf-8)
+                       #-sbcl
+                       (map '(vector (unsigned-byte 8)) #'char-code value)))
+                 (write-u64-le stream (length octets))
+                 (write-sequence octets stream))))
+      (unwind-protect
+          (progn
+            (with-open-file (stream temp-path
+                                    :direction :output
+                                    :if-exists :supersede
+                                    :if-does-not-exist :create
+                                    :element-type '(unsigned-byte 8))
+              (map nil (lambda (ch) (write-byte (char-code ch) stream)) "GGUF")
+              (write-u32-le stream 3)
+              (write-u64-le stream 17)
+              (write-u64-le stream 6)
+
+              (write-string-field stream "general.architecture")
+              (write-u32-le stream 8)
+              (write-string-field stream "llama")
+
+              (write-string-field stream "tokenizer.ggml.tokens")
+              (write-u32-le stream 9)
+              (write-u32-le stream 8)
+              (write-u64-le stream 17)
+              (dolist (token (list "H" "e" "l" "o" "," (string (code-char #x2581))
+                                   "h" "w" "a" "r" "y" "u" "?"
+                                   "Hello" " world" "!" "<eos>"))
+                (write-string-field stream token))
+
+              (write-string-field stream "tokenizer.ggml.scores")
+              (write-u32-le stream 9)
+              (write-u32-le stream 6)
+              (write-u64-le stream 17)
+              (dolist (score '(-10.0f0 -10.0f0 -10.0f0 -10.0f0 -10.0f0 -10.0f0
+                               -10.0f0 -10.0f0 -10.0f0 -10.0f0 -10.0f0 -10.0f0 -10.0f0
+                               0.9f0 0.8f0 0.7f0 -1.0f0))
+                (write-f32-le stream score))
+
+              (write-string-field stream "tokenizer.ggml.bos_token_id")
+              (write-u32-le stream 4)
+              (write-u32-le stream 42)
+
+              (write-string-field stream "tokenizer.ggml.eos_token_id")
+              (write-u32-le stream 4)
+              (write-u32-le stream 16)
+
+              (write-string-field stream "tokenizer.ggml.add_bos_token")
+              (write-u32-le stream 7)
+              (write-byte 1 stream))
+            (let ((step-function (lambda (token-id position kv-cache)
+                                   (declare (ignore token-id position kv-cache))
+                                   #(0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0
+                                     0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0
+                                     0.0f0 10.0f0 0.0f0 -10.0f0))))
+              (let ((output (with-output-to-string (response-stream)
+                              (multiple-value-bind (header kv-pairs ids text logits)
+                                  (test-gguf-file-response temp-path
+                                                           :step-function step-function
+                                                           :kv-cache (make-hash-table)
+                                                           :max-tokens 1
+                                                           :random-values '(0.1f0)
+                                                           :stream response-stream)
+                                (is (equal "GGUF" (getf header :magic)))
+                                (is (equal "llama"
+                                           (cdr (assoc "general.architecture"
+                                                       kv-pairs
+                                                       :test #'string=))))
+                                (is (equal '(14) ids))
+                                (is (string= " world" text))
+                                (is (= -10.0f0 (aref logits 16)))))))
+                (is (search "Model:" output))
+                (is (search "Architecture: llama" output))
+                (is (search "Prompt: Hello, How are you?" output))
+                (is (search "Response:  world" output))))
+            (signals error
+              (test-gguf-file-response temp-path
+                                       :stream (make-broadcast-stream))))
+        (when (probe-file temp-path)
+          (delete-file temp-path))))))
+
+(defparameter *gemma4-e2e-model-path*
+  "D:/Models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf")
+
+(defun normalized-e2e-output (text)
+  (string-trim '(#\Space #\Tab #\Newline #\Return) text))
+
+(defun plausible-e2e-output-p (text)
+  (let ((trimmed (normalized-e2e-output text)))
+    (and (plusp (length trimmed))
+         (not (search "<|" trimmed))
+         (not (search "<turn|>" trimmed)))))
+
+(defun run-gemma4-e2e-inference (prompt &key (max-tokens 12))
+  (unless (probe-file *gemma4-e2e-model-path*)
+    (error "Expected Gemma4 test model missing: ~a" *gemma4-e2e-model-path*))
+  (nth-value 3
+             (test-gguf-file-response *gemma4-e2e-model-path*
+                                      :prompt prompt
+                                      :max-tokens max-tokens
+                                      :temperature 0.2f0
+                                      :stream (make-broadcast-stream))))
+
+(test gemma4-e2e-colors-plausible
+  (let ((text (run-gemma4-e2e-inference "List three colors, comma-separated.")))
+    (is (plausible-e2e-output-p text))
+    (is (>= (count #\, text) 2))
+    (is (or (search "Red" text)
+            (search "Blue" text)
+            (search "Green" text)))))
+
+(test gemma4-e2e-weekdays-plausible
+  (let ((text (run-gemma4-e2e-inference "List two weekdays, comma-separated.")))
+    (is (plausible-e2e-output-p text))
+    (is (>= (count #\, text) 1))
+    (is (search "day" text))))
+
+(test gemma4-e2e-two-plus-two-plausible
+  (let ((text (normalized-e2e-output
+               (run-gemma4-e2e-inference "Answer with one word: What is 2 + 2?"
+                                         :max-tokens 4))))
+    (is (plausible-e2e-output-p text))
+    (is (or (string-equal text "Four")
+            (string= text "4")))))
+
+(test gemma4-e2e-opposite-cold-plausible
+  (let ((text (normalized-e2e-output
+               (run-gemma4-e2e-inference "Answer with one word: opposite of cold?"
+                                         :max-tokens 4))))
+    (is (plausible-e2e-output-p text))
+    (is (or (string-equal text "Hot")
+            (string-equal text "Warm")))))
+
+(test gemma4-e2e-sky-color-plausible
+  (let ((text (normalized-e2e-output
+               (run-gemma4-e2e-inference "Answer with one word: sky color on clear day?"
+                                         :max-tokens 4))))
+    (is (plausible-e2e-output-p text))
+    (is (or (string-equal text "Blue")
+            (string-equal text "Azure")))))
 
 (defun run-tests ()
   (let ((result (run 'llambda-suite)))

@@ -16,16 +16,27 @@
            #:generate-from-prompt
            #:generate-token-loop
            #:hello-message
+           #:find-gguf-tensor-info
+           #:load-gemma4-model
+           #:load-gguf-tensor
+           #:load-gguf-tensor-by-name
+           #:make-gemma4-step-function
            #:map-view-of-file
            #:main
            #:print-gguf-file
+           #:print-gguf-floating-point-tables
+           #:copy-tensors-to-aligned-temp-file
+           #:map-gguf-tensors-to-aligned-arrays
+           #:forged-dot-product
            #:read-gguf-header
            #:read-gguf-kv-pairs
+           #:read-gguf-tensor-infos
            #:rms-norm
            #:sample-from-probabilities
            #:sample-token-id-from-logits
            #:silu
            #:softmax
+           #:test-gguf-file-response
            #:test-llm-response
            #:tokenize-prompt
            #:unmap-view-of-file

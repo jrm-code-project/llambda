@@ -3,7 +3,7 @@
   :version "0.1.0"
   :license "MIT"
   :serial t
-  :depends-on (#:cffi)
+  :depends-on (#:cffi #:sb-simd #:lparallel)
   :in-order-to ((test-op (test-op "llambda/tests")))
   :components ((:file "package")
                (:file "llambda")))

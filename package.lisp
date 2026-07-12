@@ -1,5 +1,14 @@
 (defpackage #:llambda
   (:use #:cl)
+  (:import-from #:sb-simd-avx2
+                #:f32.8
+                #:f32.8*
+                #:f32.8-
+                #:f32.8-aref
+                #:f32.8-horizontal+
+                #:make-f32.8)
+  (:import-from #:sb-simd-fma
+                #:f32.8-fmadd)
   (:export #:call-with-file
            #:call-with-mapped-file
            #:apply-temperature

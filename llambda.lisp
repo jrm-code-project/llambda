@@ -24,6 +24,9 @@
 (defconstant +ggml-type-q6-k+ 14)
 
 (defparameter *compute-gguf-logits* t)
+(defparameter *gemv-worker-count* 24)
+(defparameter *gemv-min-parallel-rows* 96)
+(defparameter *gemv-kernel* nil)
 
 (cffi:defcfun ("CreateFileW" create-file) handle
   (file-name :pointer)
@@ -191,10 +194,18 @@
                                (- exponent 15)))
                'single-float)))))
 
-(declaim (ftype (function (t fixnum) single-float) read-fp16-le)
+(declaim (ftype (function (t fixnum) fixnum) read-u8)
+         (ftype (function (t fixnum) single-float) read-fp16-le)
          (ftype (function (t fixnum) single-float) read-bf16-le)
          (ftype (function (t fixnum) fixnum) read-s8)
-         (inline read-fp16-le read-bf16-le read-s8))
+         (ftype (function (fixnum) single-float) fixnum-single-float)
+         (inline read-u8 read-fp16-le read-bf16-le read-s8 fixnum-single-float))
+
+(defun read-u8 (pointer offset)
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
+           (fixnum offset))
+  (the fixnum
+       (cffi:mem-aref pointer :unsigned-char offset)))
 
 (defun read-fp16-le (pointer offset)
   (the single-float
@@ -204,12 +215,49 @@
   (the fixnum
        (unsigned-to-signed (cffi:mem-aref pointer :unsigned-char offset) 8)))
 
+(defun fixnum-single-float (value)
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
+           (fixnum value))
+  (the single-float
+       (float value 1.0f0)))
+
 (defun ensure-single-float-array (vector)
   (if (typep vector '(simple-array single-float (*)))
       vector
       (make-array (length vector)
                   :element-type 'single-float
                   :initial-contents vector)))
+
+(declaim (ftype (function () t) ensure-gemv-kernel)
+         (ftype (function (fixnum) boolean) parallel-gemv-row-count-p)
+         (ftype (function (fixnum) fixnum) parallel-gemv-part-count)
+         (inline parallel-gemv-row-count-p parallel-gemv-part-count))
+
+(defun ensure-gemv-kernel ()
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+  (unless (and *gemv-kernel*
+               (let ((lparallel:*kernel* *gemv-kernel*))
+                 (= (the fixnum (lparallel:kernel-worker-count))
+                    (the fixnum *gemv-worker-count*))))
+    (when *gemv-kernel*
+      (let ((lparallel:*kernel* *gemv-kernel*))
+        (lparallel:end-kernel :wait t)))
+    (setf *gemv-kernel*
+          (lparallel:make-kernel *gemv-worker-count* :name "llambda-gemv")))
+  *gemv-kernel*)
+
+(defun parallel-gemv-row-count-p (row-count)
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
+           (fixnum row-count))
+  (the boolean
+       (>= row-count (the fixnum *gemv-min-parallel-rows*))))
+
+(defun parallel-gemv-part-count (row-count)
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
+           (fixnum row-count))
+  (the fixnum
+       (min row-count
+            (the fixnum *gemv-worker-count*))))
 
 (defun sum-square-elements (vector)
   (declare (optimize (speed 3) (safety 2))
@@ -1332,79 +1380,248 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (incf sum (* (aref vector index)
                    (cffi:mem-aref pointer :float (+ row-float-offset index)))))))
 
+(defmacro q4-low-quant (packed)
+  `(the fixnum (logand ,packed #x0F)))
+
+(defmacro q4-high-quant (packed)
+  `(the fixnum (ash ,packed -4)))
+
+(defmacro q6-quant-1 (packed-low packed-top)
+  `(the fixnum
+        (- (logior (logand ,packed-low #x0F)
+                   (ash (logand ,packed-top #x03) 4))
+           32)))
+
+(defmacro q6-quant-2 (packed-high packed-top)
+  `(the fixnum
+        (- (logior (logand ,packed-high #x0F)
+                   (ash (logand (ash ,packed-top -2) #x03) 4))
+           32)))
+
+(defmacro q6-quant-3 (packed-low packed-top)
+  `(the fixnum
+        (- (logior (ash ,packed-low -4)
+                   (ash (logand (ash ,packed-top -4) #x03) 4))
+           32)))
+
+(defmacro q6-quant-4 (packed-high packed-top)
+  `(the fixnum
+        (- (logior (ash ,packed-high -4)
+                   (ash (logand (ash ,packed-top -6) #x03) 4))
+           32)))
+
+(defmacro zero-f32.8 ()
+  `(make-f32.8 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0))
+
+(defmacro broadcast-f32.8 (value)
+  `(make-f32.8 ,value ,value ,value ,value ,value ,value ,value ,value))
+
+(defmacro expand-q4-k-body (pointer qs-base vector vector-base delta0 offset0 delta1 offset1 sum)
+  (let ((forms '()))
+    (dotimes (group 4
+                   `(let ((delta0-vector (broadcast-f32.8 ,delta0))
+                          (offset0-vector (broadcast-f32.8 ,offset0))
+                          (delta1-vector (broadcast-f32.8 ,delta1))
+                          (offset1-vector (broadcast-f32.8 ,offset1)))
+                      (declare (type f32.8 delta0-vector offset0-vector
+                                     delta1-vector offset1-vector))
+                      ,@(nreverse forms)))
+      (let ((lane-base (* group 8)))
+        (push
+         `(let* ((packed0 (read-u8 ,pointer (+ ,qs-base ,lane-base 0)))
+                (packed1 (read-u8 ,pointer (+ ,qs-base ,lane-base 1)))
+                (packed2 (read-u8 ,pointer (+ ,qs-base ,lane-base 2)))
+                (packed3 (read-u8 ,pointer (+ ,qs-base ,lane-base 3)))
+                (packed4 (read-u8 ,pointer (+ ,qs-base ,lane-base 4)))
+                (packed5 (read-u8 ,pointer (+ ,qs-base ,lane-base 5)))
+                (packed6 (read-u8 ,pointer (+ ,qs-base ,lane-base 6)))
+                (packed7 (read-u8 ,pointer (+ ,qs-base ,lane-base 7)))
+                (low-weights
+                  (f32.8-
+                   (f32.8*
+                    (make-f32.8
+                     (fixnum-single-float (q4-low-quant packed0))
+                     (fixnum-single-float (q4-low-quant packed1))
+                     (fixnum-single-float (q4-low-quant packed2))
+                     (fixnum-single-float (q4-low-quant packed3))
+                     (fixnum-single-float (q4-low-quant packed4))
+                     (fixnum-single-float (q4-low-quant packed5))
+                     (fixnum-single-float (q4-low-quant packed6))
+                     (fixnum-single-float (q4-low-quant packed7)))
+                    delta0-vector)
+                   offset0-vector))
+                (high-weights
+                  (f32.8-
+                   (f32.8*
+                    (make-f32.8
+                     (fixnum-single-float (q4-high-quant packed0))
+                     (fixnum-single-float (q4-high-quant packed1))
+                     (fixnum-single-float (q4-high-quant packed2))
+                     (fixnum-single-float (q4-high-quant packed3))
+                     (fixnum-single-float (q4-high-quant packed4))
+                     (fixnum-single-float (q4-high-quant packed5))
+                     (fixnum-single-float (q4-high-quant packed6))
+                     (fixnum-single-float (q4-high-quant packed7)))
+                    delta1-vector)
+                   offset1-vector))
+                (activations-low (f32.8-aref ,vector (+ ,vector-base ,lane-base)))
+                (activations-high (f32.8-aref ,vector (+ ,vector-base 32 ,lane-base))))
+            (declare (fixnum packed0 packed1 packed2 packed3 packed4 packed5 packed6 packed7)
+                    (type f32.8 low-weights high-weights activations-low activations-high))
+            (setf ,sum
+                 (f32.8-fmadd high-weights
+                              activations-high
+                              (f32.8-fmadd low-weights activations-low ,sum))))
+         forms)))))
+
+(defmacro expand-q6-k-group (pointer ql-base qh-base vector-base start-lane
+                             delta1 delta2 delta3 delta4 vector sum)
+  (let ((forms '()))
+    (dotimes (group 2
+                   `(let ((delta1-vector (broadcast-f32.8 ,delta1))
+                          (delta2-vector (broadcast-f32.8 ,delta2))
+                          (delta3-vector (broadcast-f32.8 ,delta3))
+                          (delta4-vector (broadcast-f32.8 ,delta4)))
+                      (declare (type f32.8 delta1-vector delta2-vector
+                                     delta3-vector delta4-vector))
+                      ,@(nreverse forms)))
+      (let ((lane-base (+ start-lane (* group 8))))
+        (push
+         `(let* ((packed-low0 (read-u8 ,pointer (+ ,ql-base ,lane-base 0)))
+                (packed-low1 (read-u8 ,pointer (+ ,ql-base ,lane-base 1)))
+                (packed-low2 (read-u8 ,pointer (+ ,ql-base ,lane-base 2)))
+                (packed-low3 (read-u8 ,pointer (+ ,ql-base ,lane-base 3)))
+                (packed-low4 (read-u8 ,pointer (+ ,ql-base ,lane-base 4)))
+                (packed-low5 (read-u8 ,pointer (+ ,ql-base ,lane-base 5)))
+                (packed-low6 (read-u8 ,pointer (+ ,ql-base ,lane-base 6)))
+                (packed-low7 (read-u8 ,pointer (+ ,ql-base ,lane-base 7)))
+                (packed-high0 (read-u8 ,pointer (+ ,ql-base 32 ,lane-base 0)))
+                (packed-high1 (read-u8 ,pointer (+ ,ql-base 32 ,lane-base 1)))
+                (packed-high2 (read-u8 ,pointer (+ ,ql-base 32 ,lane-base 2)))
+                (packed-high3 (read-u8 ,pointer (+ ,ql-base 32 ,lane-base 3)))
+                (packed-high4 (read-u8 ,pointer (+ ,ql-base 32 ,lane-base 4)))
+                (packed-high5 (read-u8 ,pointer (+ ,ql-base 32 ,lane-base 5)))
+                (packed-high6 (read-u8 ,pointer (+ ,ql-base 32 ,lane-base 6)))
+                (packed-high7 (read-u8 ,pointer (+ ,ql-base 32 ,lane-base 7)))
+                (packed-top0 (read-u8 ,pointer (+ ,qh-base ,lane-base 0)))
+                (packed-top1 (read-u8 ,pointer (+ ,qh-base ,lane-base 1)))
+                (packed-top2 (read-u8 ,pointer (+ ,qh-base ,lane-base 2)))
+                (packed-top3 (read-u8 ,pointer (+ ,qh-base ,lane-base 3)))
+                (packed-top4 (read-u8 ,pointer (+ ,qh-base ,lane-base 4)))
+                (packed-top5 (read-u8 ,pointer (+ ,qh-base ,lane-base 5)))
+                (packed-top6 (read-u8 ,pointer (+ ,qh-base ,lane-base 6)))
+                (packed-top7 (read-u8 ,pointer (+ ,qh-base ,lane-base 7)))
+                (weights1
+                  (f32.8*
+                   (make-f32.8
+                    (fixnum-single-float (q6-quant-1 packed-low0 packed-top0))
+                    (fixnum-single-float (q6-quant-1 packed-low1 packed-top1))
+                    (fixnum-single-float (q6-quant-1 packed-low2 packed-top2))
+                    (fixnum-single-float (q6-quant-1 packed-low3 packed-top3))
+                    (fixnum-single-float (q6-quant-1 packed-low4 packed-top4))
+                    (fixnum-single-float (q6-quant-1 packed-low5 packed-top5))
+                    (fixnum-single-float (q6-quant-1 packed-low6 packed-top6))
+                    (fixnum-single-float (q6-quant-1 packed-low7 packed-top7)))
+                   delta1-vector))
+                (weights2
+                  (f32.8*
+                   (make-f32.8
+                    (fixnum-single-float (q6-quant-2 packed-high0 packed-top0))
+                    (fixnum-single-float (q6-quant-2 packed-high1 packed-top1))
+                    (fixnum-single-float (q6-quant-2 packed-high2 packed-top2))
+                    (fixnum-single-float (q6-quant-2 packed-high3 packed-top3))
+                    (fixnum-single-float (q6-quant-2 packed-high4 packed-top4))
+                    (fixnum-single-float (q6-quant-2 packed-high5 packed-top5))
+                    (fixnum-single-float (q6-quant-2 packed-high6 packed-top6))
+                    (fixnum-single-float (q6-quant-2 packed-high7 packed-top7)))
+                   delta2-vector))
+                (weights3
+                  (f32.8*
+                   (make-f32.8
+                    (fixnum-single-float (q6-quant-3 packed-low0 packed-top0))
+                    (fixnum-single-float (q6-quant-3 packed-low1 packed-top1))
+                    (fixnum-single-float (q6-quant-3 packed-low2 packed-top2))
+                    (fixnum-single-float (q6-quant-3 packed-low3 packed-top3))
+                    (fixnum-single-float (q6-quant-3 packed-low4 packed-top4))
+                    (fixnum-single-float (q6-quant-3 packed-low5 packed-top5))
+                    (fixnum-single-float (q6-quant-3 packed-low6 packed-top6))
+                    (fixnum-single-float (q6-quant-3 packed-low7 packed-top7)))
+                   delta3-vector))
+                (weights4
+                  (f32.8*
+                   (make-f32.8
+                    (fixnum-single-float (q6-quant-4 packed-high0 packed-top0))
+                    (fixnum-single-float (q6-quant-4 packed-high1 packed-top1))
+                    (fixnum-single-float (q6-quant-4 packed-high2 packed-top2))
+                    (fixnum-single-float (q6-quant-4 packed-high3 packed-top3))
+                    (fixnum-single-float (q6-quant-4 packed-high4 packed-top4))
+                    (fixnum-single-float (q6-quant-4 packed-high5 packed-top5))
+                    (fixnum-single-float (q6-quant-4 packed-high6 packed-top6))
+                    (fixnum-single-float (q6-quant-4 packed-high7 packed-top7)))
+                   delta4-vector))
+                (activations1 (f32.8-aref ,vector (+ ,vector-base ,lane-base)))
+                (activations2 (f32.8-aref ,vector (+ ,vector-base 32 ,lane-base)))
+                (activations3 (f32.8-aref ,vector (+ ,vector-base 64 ,lane-base)))
+                (activations4 (f32.8-aref ,vector (+ ,vector-base 96 ,lane-base))))
+            (declare (fixnum packed-low0 packed-low1 packed-low2 packed-low3
+                            packed-low4 packed-low5 packed-low6 packed-low7
+                            packed-high0 packed-high1 packed-high2 packed-high3
+                            packed-high4 packed-high5 packed-high6 packed-high7
+                            packed-top0 packed-top1 packed-top2 packed-top3
+                            packed-top4 packed-top5 packed-top6 packed-top7)
+                    (type f32.8 weights1 weights2 weights3 weights4
+                                  activations1 activations2 activations3 activations4))
+            (setf ,sum
+                 (f32.8-fmadd weights4
+                              activations4
+                              (f32.8-fmadd weights3
+                                           activations3
+                                           (f32.8-fmadd weights2
+                                                        activations2
+                                                        (f32.8-fmadd weights1
+                                                                     activations1
+                                                                     ,sum))))))
+         forms)))))
+
 (declaim (ftype (function (t fixnum fixnum) (values fixnum fixnum &optional))
-                get-scale-min-k4-at)
-         (ftype (function (t fixnum (simple-array single-float (*)) fixnum
-                            single-float single-float single-float single-float)
-                          single-float)
-                dot-product-with-k-m-tensor-body)
-         (inline get-scale-min-k4-at dot-product-with-k-m-tensor-body))
+              get-scale-min-k4-at)
+         (inline get-scale-min-k4-at))
 
 (defun get-scale-min-k4-at (pointer scale-base index)
-  (declare (optimize (speed 3) (safety 0))
-          (fixnum scale-base index))
-  (let ((byte0 (cffi:mem-aref pointer :unsigned-char (+ scale-base index)))
-        (byte4 (cffi:mem-aref pointer :unsigned-char (+ scale-base 4 index))))
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
+           (fixnum scale-base index))
+  (let ((byte0 (read-u8 pointer (+ scale-base index)))
+        (byte4 (read-u8 pointer (+ scale-base 4 index))))
     (declare (fixnum byte0 byte4))
     (if (< index 4)
         (values (logand byte0 63)
                (logand byte4 63))
         (values (logior (logand byte4 #x0F)
-                       (ash (ash (logand (cffi:mem-aref pointer
-                                                        :unsigned-char
-                                                        (+ scale-base (- index 4)))
+                       (ash (ash (logand (read-u8 pointer
+                                                  (+ scale-base (- index 4)))
                                          #xC0)
                                  -6)
                             4))
                (logior (ash byte4 -4)
-                       (ash (ash (logand (cffi:mem-aref pointer
-                                                        :unsigned-char
-                                                        (+ scale-base index))
+                       (ash (ash (logand (read-u8 pointer
+                                                  (+ scale-base index))
                                          #xC0)
                                  -6)
                             4))))))
 
-(defun dot-product-with-k-m-tensor-body (pointer qs-base vector vector-base
-                                        delta0 offset0 delta1 offset1)
-  (declare (optimize (speed 3) (safety 0))
-          (type (simple-array single-float (*)) vector)
-          (fixnum qs-base vector-base)
-          (single-float delta0 offset0 delta1 offset1))
-  (let ((sum 0.0f0)
-        (qs-index qs-base)
-        (low-index vector-base)
-        (high-index (+ vector-base 32))
-        (remaining 32))
-    (declare (single-float sum)
-            (fixnum qs-index low-index high-index remaining))
-    (do ()
-        ((zerop remaining) (the single-float sum))
-      (let* ((packed (cffi:mem-aref pointer :unsigned-char qs-index))
-            (low-quant (logand packed #x0F))
-            (high-quant (ash packed -4)))
-        (declare (fixnum packed low-quant high-quant))
-        (incf sum (* (aref vector low-index)
-                    (- (* delta0 low-quant) offset0)))
-        (incf sum (* (aref vector high-index)
-                    (- (* delta1 high-quant) offset1))))
-      (incf qs-index)
-      (incf low-index)
-      (incf high-index)
-      (decf remaining))))
-
 (defun dot-product-with-q4-k-m-tensor-data (pointer row-offset vector element-count)
-  (declare (optimize (speed 3) (safety 0))
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
           (type (simple-array single-float (*)) vector)
           (fixnum row-offset element-count))
   (unless (zerop (mod element-count +qk-k+))
     (error "Q4_K_M dot product requires ELEMENT-COUNT to be a multiple of ~d."
           +qk-k+))
-  (let ((sum 0.0f0)
-       (block-size (+ 4 +k-scale-size+ (/ +qk-k+ 2)))
-       (block-count (/ element-count +qk-k+)))
-    (declare (single-float sum)
+  (let ((sum (zero-f32.8))
+        (block-size (+ 4 +k-scale-size+ (/ +qk-k+ 2)))
+        (block-count (/ element-count +qk-k+)))
+    (declare (type f32.8 sum)
             (fixnum block-size block-count))
-    (dotimes (block-index block-count (the single-float sum))
+    (dotimes (block-index block-count (the single-float (f32.8-horizontal+ sum)))
       (declare (fixnum block-index))
       (let* ((block-offset (+ row-offset (* block-index block-size)))
             (d (read-fp16-le pointer block-offset))
@@ -1412,97 +1629,48 @@ It extracts the underlying simple arrays once before entering the loop to elimin
             (scale-base (+ block-offset 4))
             (qs-base (+ block-offset 4 +k-scale-size+))
             (vector-base (* block-index +qk-k+)))
-       (declare (single-float d dmin)
+        (declare (single-float d dmin)
                 (fixnum scale-base qs-base vector-base))
-       (multiple-value-bind (scale0 min0)
-           (get-scale-min-k4-at pointer scale-base 0)
-         (multiple-value-bind (scale1 min1)
-             (get-scale-min-k4-at pointer scale-base 1)
-           (let ((delta0 (* d scale0))
-                 (offset0 (* dmin min0))
-                 (delta1 (* d scale1))
-                 (offset1 (* dmin min1)))
-             (declare (single-float delta0 offset0 delta1 offset1))
-             (incf sum
-                   (dot-product-with-k-m-tensor-body pointer
-                                                     qs-base
-                                                     vector
-                                                     vector-base
-                                                     delta0
-                                                     offset0
-                                                     delta1
-                                                     offset1)))))
-       (multiple-value-bind (scale0 min0)
-           (get-scale-min-k4-at pointer scale-base 2)
-         (multiple-value-bind (scale1 min1)
-             (get-scale-min-k4-at pointer scale-base 3)
-           (let ((delta0 (* d scale0))
-                 (offset0 (* dmin min0))
-                 (delta1 (* d scale1))
-                 (offset1 (* dmin min1)))
-             (declare (single-float delta0 offset0 delta1 offset1))
-             (incf sum
-                   (dot-product-with-k-m-tensor-body pointer
-                                                     (+ qs-base 32)
-                                                     vector
-                                                     (+ vector-base 64)
-                                                     delta0
-                                                     offset0
-                                                     delta1
-                                                     offset1)))))
-       (multiple-value-bind (scale0 min0)
-           (get-scale-min-k4-at pointer scale-base 4)
-         (multiple-value-bind (scale1 min1)
-             (get-scale-min-k4-at pointer scale-base 5)
-           (let ((delta0 (* d scale0))
-                 (offset0 (* dmin min0))
-                 (delta1 (* d scale1))
-                 (offset1 (* dmin min1)))
-             (declare (single-float delta0 offset0 delta1 offset1))
-             (incf sum
-                   (dot-product-with-k-m-tensor-body pointer
-                                                     (+ qs-base 64)
-                                                     vector
-                                                     (+ vector-base 128)
-                                                     delta0
-                                                     offset0
-                                                     delta1
-                                                     offset1)))))
-       (multiple-value-bind (scale0 min0)
-           (get-scale-min-k4-at pointer scale-base 6)
-         (multiple-value-bind (scale1 min1)
-             (get-scale-min-k4-at pointer scale-base 7)
-           (let ((delta0 (* d scale0))
-                 (offset0 (* dmin min0))
-                 (delta1 (* d scale1))
-                 (offset1 (* dmin min1)))
-             (declare (single-float delta0 offset0 delta1 offset1))
-             (incf sum
-                   (dot-product-with-k-m-tensor-body pointer
-                                                     (+ qs-base 96)
-                                                     vector
-                                                     (+ vector-base 192)
-                                                     delta0
-                                                     offset0
-                                                     delta1
-                                                     offset1)))))))))
+        (macrolet ((accumulate-body (scale-index0 scale-index1 qs-offset vector-offset)
+                    `(multiple-value-bind (scale0 min0)
+                         (get-scale-min-k4-at pointer scale-base ,scale-index0)
+                       (multiple-value-bind (scale1 min1)
+                           (get-scale-min-k4-at pointer scale-base ,scale-index1)
+                         (let ((delta0 (* d (fixnum-single-float scale0)))
+                               (offset0 (* dmin (fixnum-single-float min0)))
+                               (delta1 (* d (fixnum-single-float scale1)))
+                               (offset1 (* dmin (fixnum-single-float min1))))
+                           (declare (single-float delta0 offset0 delta1 offset1))
+                           (expand-q4-k-body pointer
+                                             (+ qs-base ,qs-offset)
+                                             vector
+                                             (+ vector-base ,vector-offset)
+                                             delta0
+                                             offset0
+                                             delta1
+                                             offset1
+                                             sum))))))
+          (accumulate-body 0 1 0 0)
+          (accumulate-body 2 3 32 64)
+          (accumulate-body 4 5 64 128)
+          (accumulate-body 6 7 96 192))))))
 
 (defun dot-product-with-q4-k-m-tensor-row (row-pointer vector element-count)
   (dot-product-with-q4-k-m-tensor-data row-pointer 0 vector element-count))
 
 (defun dot-product-with-q6-k-tensor-data (pointer row-offset vector element-count)
-  (declare (optimize (speed 3) (safety 0))
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
            (type (simple-array single-float (*)) vector)
            (fixnum row-offset element-count))
   (unless (zerop (mod element-count +qk-k+))
     (error "Q6_K dot product requires ELEMENT-COUNT to be a multiple of ~d."
            +qk-k+))
-  (let ((sum 0.0f0)
+  (let ((sum (zero-f32.8))
         (block-size (+ 2 +q6-k-scale-count+ (* 3 (/ +qk-k+ 4))))
         (block-count (/ element-count +qk-k+)))
-    (declare (single-float sum)
+    (declare (type f32.8 sum)
              (fixnum block-size block-count))
-    (dotimes (block-index block-count (the single-float sum))
+    (dotimes (block-index block-count (the single-float (f32.8-horizontal+ sum)))
       (declare (fixnum block-index))
       (let* ((block-offset (+ row-offset (* block-index block-size)))
              (d (read-fp16-le pointer (+ block-offset (- block-size 2))))
@@ -1518,72 +1686,39 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                  (chunk-qh-base (+ qh-base (* chunk-index 32)))
                  (chunk-scale-base (+ scale-base (* chunk-index 8)))
                  (chunk-vector-base (+ vector-base (* chunk-index 128)))
-          (delta1 (* d (read-s8 pointer (+ chunk-scale-base 0))))
-          (delta2 (* d (read-s8 pointer (+ chunk-scale-base 2))))
-          (delta3 (* d (read-s8 pointer (+ chunk-scale-base 4))))
-          (delta4 (* d (read-s8 pointer (+ chunk-scale-base 6)))))
+                 (delta1 (* d (fixnum-single-float (read-s8 pointer (+ chunk-scale-base 0)))))
+                 (delta2 (* d (fixnum-single-float (read-s8 pointer (+ chunk-scale-base 2)))))
+                 (delta3 (* d (fixnum-single-float (read-s8 pointer (+ chunk-scale-base 4)))))
+                 (delta4 (* d (fixnum-single-float (read-s8 pointer (+ chunk-scale-base 6))))))
             (declare (fixnum chunk-ql-base chunk-qh-base chunk-scale-base chunk-vector-base)
-                     (single-float delta1 delta2 delta3 delta4))
-            (dotimes (lane 16)
-              (declare (fixnum lane))
-              (let* ((packed-low (cffi:mem-aref pointer :unsigned-char (+ chunk-ql-base lane)))
-              (packed-high (cffi:mem-aref pointer :unsigned-char (+ chunk-ql-base 32 lane)))
-              (packed-top (cffi:mem-aref pointer :unsigned-char (+ chunk-qh-base lane)))
-                     (q1 (- (logior (logand packed-low #x0F)
-                                    (ash (logand packed-top #x03) 4))
-                            32))
-                     (q2 (- (logior (logand packed-high #x0F)
-                                    (ash (logand (ash packed-top -2) #x03) 4))
-                            32))
-                     (q3 (- (logior (ash packed-low -4)
-                                    (ash (logand (ash packed-top -4) #x03) 4))
-                            32))
-                     (q4 (- (logior (ash packed-high -4)
-                                    (ash (logand (ash packed-top -6) #x03) 4))
-                            32))
-                     (index1 (+ chunk-vector-base lane))
-                     (index2 (+ index1 32))
-                     (index3 (+ index1 64))
-                     (index4 (+ index1 96)))
-                (declare (fixnum packed-low packed-high packed-top)
-                         (fixnum q1 q2 q3 q4 index1 index2 index3 index4))
-                (incf sum (* (aref vector index1) (* delta1 q1)))
-                (incf sum (* (aref vector index2) (* delta2 q2)))
-                (incf sum (* (aref vector index3) (* delta3 q3)))
-                (incf sum (* (aref vector index4) (* delta4 q4)))))
-            (let ((delta1 (* d (read-s8 pointer (+ chunk-scale-base 1))))
-                  (delta2 (* d (read-s8 pointer (+ chunk-scale-base 3))))
-                  (delta3 (* d (read-s8 pointer (+ chunk-scale-base 5))))
-                  (delta4 (* d (read-s8 pointer (+ chunk-scale-base 7)))))
+              (single-float delta1 delta2 delta3 delta4))
+            (expand-q6-k-group pointer
+                        chunk-ql-base
+                        chunk-qh-base
+                        chunk-vector-base
+                        0
+                        delta1
+                        delta2
+                        delta3
+                        delta4
+                        vector
+                        sum)
+            (let ((delta1 (* d (fixnum-single-float (read-s8 pointer (+ chunk-scale-base 1)))))
+                  (delta2 (* d (fixnum-single-float (read-s8 pointer (+ chunk-scale-base 3)))))
+                  (delta3 (* d (fixnum-single-float (read-s8 pointer (+ chunk-scale-base 5)))))
+                  (delta4 (* d (fixnum-single-float (read-s8 pointer (+ chunk-scale-base 7))))))
               (declare (single-float delta1 delta2 delta3 delta4))
-              (dotimes (lane-offset 16)
-                (declare (fixnum lane-offset))
-                (let* ((lane (+ 16 lane-offset))
-                       (packed-low (cffi:mem-aref pointer :unsigned-char (+ chunk-ql-base lane)))
-                       (packed-high (cffi:mem-aref pointer :unsigned-char (+ chunk-ql-base 32 lane)))
-                       (packed-top (cffi:mem-aref pointer :unsigned-char (+ chunk-qh-base lane)))
-                       (q1 (- (logior (logand packed-low #x0F)
-                                      (ash (logand packed-top #x03) 4))
-                              32))
-                       (q2 (- (logior (logand packed-high #x0F)
-                                      (ash (logand (ash packed-top -2) #x03) 4))
-                              32))
-                       (q3 (- (logior (ash packed-low -4)
-                                      (ash (logand (ash packed-top -4) #x03) 4))
-                              32))
-                       (q4 (- (logior (ash packed-high -4)
-                                      (ash (logand (ash packed-top -6) #x03) 4))
-                              32))
-                       (index1 (+ chunk-vector-base lane))
-                       (index2 (+ index1 32))
-                       (index3 (+ index1 64))
-                       (index4 (+ index1 96)))
-                  (declare (fixnum lane packed-low packed-high packed-top)
-                           (fixnum q1 q2 q3 q4 index1 index2 index3 index4))
-                  (incf sum (* (aref vector index1) (* delta1 q1)))
-                  (incf sum (* (aref vector index2) (* delta2 q2)))
-                  (incf sum (* (aref vector index3) (* delta3 q3)))
-                  (incf sum (* (aref vector index4) (* delta4 q4))))))))))))
+              (expand-q6-k-group pointer
+                          chunk-ql-base
+                          chunk-qh-base
+                          chunk-vector-base
+                          16
+                          delta1
+                          delta2
+                          delta3
+                          delta4
+                          vector
+                          sum))))))))
 
 (defun dot-product-with-q6-k-tensor-row (row-pointer vector element-count)
   (dot-product-with-q6-k-tensor-data row-pointer 0 vector element-count))
@@ -1658,17 +1793,41 @@ It extracts the underlying simple arrays once before entering the loop to elimin
               (dot-product-with-bf16-tensor-data mapping row-offset vector column-count))
         (incf row-offset row-byte-size)))
       (#.+ggml-type-q4-k+
-       (dotimes (row-index row-count dest)
-        (declare (fixnum row-index))
-        (setf (aref dest row-index)
-              (dot-product-with-q4-k-m-tensor-data mapping row-offset vector column-count))
-        (incf row-offset row-byte-size)))
+       (if (parallel-gemv-row-count-p row-count)
+          (let ((parts (parallel-gemv-part-count row-count))
+                (lparallel:*kernel* (ensure-gemv-kernel)))
+            (declare (fixnum parts))
+            (lparallel:pdotimes (row-index row-count dest parts)
+              (declare (fixnum row-index))
+              (setf (aref dest row-index)
+                    (dot-product-with-q4-k-m-tensor-data
+                     mapping
+                     (+ row-offset (* row-index row-byte-size))
+                     vector
+                     column-count))))
+          (dotimes (row-index row-count dest)
+            (declare (fixnum row-index))
+            (setf (aref dest row-index)
+                  (dot-product-with-q4-k-m-tensor-data mapping row-offset vector column-count))
+            (incf row-offset row-byte-size))))
       (#.+ggml-type-q6-k+
-       (dotimes (row-index row-count dest)
-        (declare (fixnum row-index))
-        (setf (aref dest row-index)
-              (dot-product-with-q6-k-tensor-data mapping row-offset vector column-count))
-        (incf row-offset row-byte-size)))
+       (if (parallel-gemv-row-count-p row-count)
+          (let ((parts (parallel-gemv-part-count row-count))
+                (lparallel:*kernel* (ensure-gemv-kernel)))
+            (declare (fixnum parts))
+            (lparallel:pdotimes (row-index row-count dest parts)
+              (declare (fixnum row-index))
+              (setf (aref dest row-index)
+                    (dot-product-with-q6-k-tensor-data
+                     mapping
+                     (+ row-offset (* row-index row-byte-size))
+                     vector
+                     column-count))))
+          (dotimes (row-index row-count dest)
+            (declare (fixnum row-index))
+            (setf (aref dest row-index)
+                  (dot-product-with-q6-k-tensor-data mapping row-offset vector column-count))
+            (incf row-offset row-byte-size))))
       (otherwise
        (dotimes (row-index row-count dest)
         (declare (fixnum row-index))

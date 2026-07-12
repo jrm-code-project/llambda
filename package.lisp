@@ -45,6 +45,7 @@
            #:sample-token-id-from-logits
            #:silu
            #:softmax
+           #:test-gemma4-e2b-it-response
            #:test-gguf-file-response
            #:test-llm-response
            #:tokenize-prompt

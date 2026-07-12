@@ -21,12 +21,14 @@
 (defconstant +ggml-type-f16+ 1)
 (defconstant +ggml-type-bf16+ 30)
 (defconstant +ggml-type-q4-k+ 12)
+(defconstant +ggml-type-q5-k+ 13)
 (defconstant +ggml-type-q6-k+ 14)
 
 (defparameter *compute-gguf-logits* t)
 (defparameter *gemv-worker-count* 24)
 (defparameter *gemv-min-parallel-rows* 96)
 (defparameter *gemv-kernel* nil)
+(defparameter *gpt2-unicode-byte-table* nil)
 
 (cffi:defcfun ("CreateFileW" create-file) handle
   (file-name :pointer)
@@ -369,8 +371,35 @@
 (defun silu (value)
   (coerce (/ value (+ 1.0d0 (exp (- value)))) 'single-float))
 
+(defun sigmoid (value)
+  (coerce (/ 1.0d0 (+ 1.0d0 (exp (- value)))) 'single-float))
+
 (defun apply-silu (vector)
   (map 'vector #'silu vector))
+
+(defun apply-silu-into (dest vector)
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array single-float (*)) dest vector))
+  (unless (= (length dest) (length vector))
+    (error "APPLY-SILU destination length ~d does not match vector length ~d."
+           (length dest)
+           (length vector)))
+  (dotimes (index (length vector) dest)
+    (declare (fixnum index))
+    (setf (aref dest index)
+          (silu (aref vector index)))))
+
+(defun apply-sigmoid-into (dest vector)
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array single-float (*)) dest vector))
+  (unless (= (length dest) (length vector))
+    (error "APPLY-SIGMOID destination length ~d does not match vector length ~d."
+           (length dest)
+           (length vector)))
+  (dotimes (index (length vector) dest)
+    (declare (fixnum index))
+    (setf (aref dest index)
+          (sigmoid (aref vector index)))))
 
 (defun apply-rope (vector position &key (rope-dimension (length vector)) (theta-base 10000.0d0))
   (unless (evenp rope-dimension)
@@ -482,6 +511,10 @@
          (token-text (detokenize-token-id kv-pairs token-id)))
     (values token-id token-text)))
 
+(defun gpt2-tokenizer-p (kv-pairs)
+  (string= (or (tokenizer-model kv-pairs) "")
+          "gpt2"))
+
 (defun generate-token-loop (kv-pairs initial-logits step-function kv-cache
                              &key
                                eos-token-id
@@ -494,7 +527,6 @@
                                (random-state *random-state*))
   (let ((current-logits initial-logits)
         (generated-token-ids '())
-        (generated-text "")
         (effective-stop-token-ids
          (remove-duplicates (remove nil (append stop-token-ids
                                                 (when eos-token-id
@@ -511,29 +543,51 @@
                              :random-state random-state)
         (when (member token-id effective-stop-token-ids :test #'=)
           (return))
-        (write-string token-text stream)
         (push token-id generated-token-ids)
-        (setf generated-text (concatenate 'string generated-text token-text))
+        (unless (gpt2-tokenizer-p kv-pairs)
+          (write-string token-text stream))
         (setf current-logits
               (funcall step-function
                        token-id
                        (+ start-position decode-index)
                        kv-cache))))
-    (values (nreverse generated-token-ids) generated-text current-logits)))
+    (let* ((ordered-token-ids (nreverse generated-token-ids))
+           (generated-text
+            (if (gpt2-tokenizer-p kv-pairs)
+                (detokenize-token-ids kv-pairs ordered-token-ids stream)
+                (detokenize-token-ids kv-pairs ordered-token-ids (make-broadcast-stream)))))
+      (values ordered-token-ids generated-text current-logits))))
 
 (defun gemma4-chat-prompt-p (prompt)
   (or (search "<|turn>" prompt)
       (search "<turn|>" prompt)
       (search "<bos>" prompt)))
 
+(defun gemma4-chat-template-uses-channel-p (chat-template)
+  (when chat-template
+    (let* ((model-turn-index (search "<|turn>model" chat-template :from-end t))
+           (tail (and model-turn-index
+                      (subseq chat-template
+                              model-turn-index
+                              (min (length chat-template)
+                                   (+ model-turn-index 256))))))
+      (and tail
+           (search "<|channel>thought" tail)
+           (search "<channel|>" tail)))))
+
 (defun maybe-prepare-prompt-for-generation (kv-pairs prompt add-bos)
-  (if (and (string= (or (tokenizer-model kv-pairs) "")
-                   "gemma4")
-          (gguf-kv-value-or-nil kv-pairs "tokenizer.chat_template")
-          (not (gemma4-chat-prompt-p prompt)))
-      (values (format nil "<bos><|turn>user~%~a<turn|>~%<|turn>model~%" prompt)
-             nil)
-      (values prompt add-bos)))
+  (let ((chat-template (gguf-kv-value-or-nil kv-pairs "tokenizer.chat_template")))
+    (if (and (string= (or (tokenizer-model kv-pairs) "")
+                    "gemma4")
+            chat-template
+            (not (gemma4-chat-prompt-p prompt)))
+        (values (if (gemma4-chat-template-uses-channel-p chat-template)
+                   (format nil "<bos><|turn>user~%~a<turn|>~%<|turn>model~%<|channel>thought~%<channel|>"
+                           prompt)
+                   (format nil "<bos><|turn>user~%~a<turn|>~%<|turn>model~%"
+                           prompt))
+               nil)
+        (values prompt add-bos))))
 
 (defun generate-from-prompt (kv-pairs prompt step-function kv-cache
                               &key
@@ -597,12 +651,19 @@
                               (or (gguf-kv-value-or-nil kv-pairs "general.architecture")
                                   "unknown"))
                              (model (and (null step-function)
-                                        (string= architecture "gemma4")
-                                        (load-gemma4-model mapping kv-pairs tensor-infos)))
+                                         (cond
+                                           ((string= architecture "gemma4")
+                                            (load-gemma4-model mapping kv-pairs tensor-infos))
+                                           ((string= architecture "qwen3next")
+                                            (load-qwen3next-model mapping kv-pairs tensor-infos))
+                                           (t nil))))
                              (effective-step-function (or step-function
-                                                         (and model
-                                                              (make-gemma4-step-function
-                                                               model))))
+                                                          (and model
+                                                               (case (intern (string-upcase architecture)
+                                                                             :keyword)
+                                                                 (:GEMMA4 (make-gemma4-step-function model))
+                                                                 (:QWEN3NEXT (make-qwen3next-step-function model))
+                                                                 (otherwise nil)))))
                              (effective-kv-cache (or kv-cache (make-hash-table)))
                              (effective-eos-token-id
                               (or eos-token-id (resolve-eos-token-id kv-pairs))))
@@ -656,6 +717,24 @@
                               :random-state random-state)
       (terpri stream)
       (values generated-ids generated-text last-logits))))
+
+(defun test-gemma4-e2b-it-response (&key
+                                      (stream *standard-output*)
+                                      (temperature 1.0)
+                                      (max-tokens 256)
+                                      random-values
+                                      (random-state *random-state*))
+  (test-gguf-file-response
+   #P"D:/Models/lmstudio-community/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf"
+   :prompt "<bos><|turn>user
+Write a haiku about a hacker drinking coffee.<turn|>
+<|turn>model
+"
+   :temperature temperature
+   :max-tokens max-tokens
+   :random-values random-values
+   :stream stream
+   :random-state random-state))
 
 (defun read-gguf-string (pointer offset)
   (let* ((length (read-u64-le pointer offset))
@@ -745,6 +824,7 @@
                 +ggml-type-f16+
                 +ggml-type-bf16+
                 +ggml-type-q4-k+
+                +ggml-type-q5-k+
                 +ggml-type-q6-k+)))
 
 (defun ggml-type-name (type-tag)
@@ -753,6 +833,7 @@
     (#.+ggml-type-f16+ :f16)
     (#.+ggml-type-bf16+ :bf16)
     (#.+ggml-type-q4-k+ :q4-k)
+    (#.+ggml-type-q5-k+ :q5-k)
     (#.+ggml-type-q6-k+ :q6-k)
     (otherwise (intern (format nil "TYPE-~D" type-tag) :keyword))))
 
@@ -760,6 +841,7 @@
   (case type-tag
     ((#.+ggml-type-f32+ #.+ggml-type-f16+ #.+ggml-type-bf16+) 1)
     (#.+ggml-type-q4-k+ +qk-k+)
+    (#.+ggml-type-q5-k+ +qk-k+)
     (#.+ggml-type-q6-k+ +qk-k+)
     (otherwise (error "Unsupported GGML tensor type tag ~a." type-tag))))
 
@@ -769,6 +851,7 @@
     (#.+ggml-type-f16+ 2)
     (#.+ggml-type-bf16+ 2)
     (#.+ggml-type-q4-k+ (+ 4 +k-scale-size+ (/ +qk-k+ 2)))
+    (#.+ggml-type-q5-k+ (+ 4 +k-scale-size+ (/ +qk-k+ 8) (/ +qk-k+ 2)))
     (#.+ggml-type-q6-k+ (+ 2 +q6-k-scale-count+ (* 3 (/ +qk-k+ 4))))
     (otherwise (error "Unsupported GGML tensor type tag ~a." type-tag))))
 
@@ -915,6 +998,7 @@
       (#.+ggml-type-f16+ (load-f16-tensor tensor-pointer element-count))
       (#.+ggml-type-bf16+ (load-bf16-tensor tensor-pointer element-count))
       (#.+ggml-type-q4-k+ (dequantize-q4-k-m tensor-pointer element-count))
+      (#.+ggml-type-q5-k+ (dequantize-q5-k tensor-pointer element-count))
       (#.+ggml-type-q6-k+ (dequantize-q6-k tensor-pointer element-count))
       (otherwise
        (error "Tensor ~s has unsupported GGML type tag ~a."
@@ -1040,6 +1124,20 @@
      (make-array (length left) :element-type 'single-float)
      left
      right)))
+
+(defun vector-add-scaled-in-place (dest source scale)
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array single-float (*)) dest source))
+  (unless (= (length dest) (length source))
+    (error "VECTOR-ADD-SCALED-IN-PLACE destination length ~d does not match source length ~d."
+           (length dest)
+           (length source)))
+  (let ((scale (coerce scale 'single-float)))
+    (declare (single-float scale))
+    (dotimes (index (length dest) dest)
+      (declare (fixnum index))
+      (incf (aref dest index)
+            (* scale (aref source index))))))
 
 (defun dot-product (left right)
   (declare (type (vector single-float) left right))
@@ -1203,6 +1301,73 @@ It extracts the underlying simple arrays once before entering the loop to elimin
      weight
      :epsilon epsilon)))
 
+(defun l2-normalize-vector-chunks-into (dest vector chunk-count &key (epsilon 1.0e-6))
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array single-float (*)) dest vector)
+           (fixnum chunk-count))
+  (unless (plusp chunk-count)
+    (error "CHUNK-COUNT must be positive, got ~a." chunk-count))
+  (unless (= (length dest) (length vector))
+    (error "L2-NORMALIZE-VECTOR-CHUNKS destination length ~d does not match vector length ~d."
+           (length dest)
+           (length vector)))
+  (unless (zerop (mod (length vector) chunk-count))
+    (error "Vector length ~d is not divisible by chunk count ~d."
+           (length vector)
+           chunk-count))
+  (let ((chunk-size (/ (length vector) chunk-count))
+        (epsilon (coerce epsilon 'single-float)))
+    (declare (fixnum chunk-size)
+             (single-float epsilon))
+    (dotimes (chunk-index chunk-count dest)
+      (declare (fixnum chunk-index))
+      (let* ((start (* chunk-index chunk-size))
+             (sum-square (sum-square-elements-range vector start chunk-size))
+             (scale (/ (sqrt (+ sum-square epsilon)))))
+        (declare (fixnum start)
+                 (single-float sum-square scale))
+        (dotimes (index chunk-size)
+          (declare (fixnum index))
+          (setf (aref dest (+ start index))
+                (* (aref vector (+ start index))
+                   scale)))))))
+
+(defun gated-normalize-vector-chunks-into (dest vector gate chunk-count weight &key (epsilon 1.0e-6))
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array single-float (*)) dest vector gate weight)
+           (fixnum chunk-count))
+  (unless (= (length dest) (length vector) (length gate))
+    (error "GATED-NORMALIZE-VECTOR-CHUNKS requires destination, vector, and gate lengths to match."))
+  (unless (plusp chunk-count)
+    (error "CHUNK-COUNT must be positive, got ~a." chunk-count))
+  (unless (zerop (mod (length vector) chunk-count))
+    (error "Vector length ~d is not divisible by chunk count ~d."
+           (length vector)
+           chunk-count))
+  (let ((chunk-size (/ (length vector) chunk-count))
+        (epsilon (coerce epsilon 'single-float)))
+    (declare (fixnum chunk-size)
+             (single-float epsilon))
+    (unless (= (length weight) chunk-size)
+      (error "Weight length ~d does not match chunk size ~d."
+             (length weight)
+             chunk-size))
+    (dotimes (chunk-index chunk-count dest)
+      (declare (fixnum chunk-index))
+      (let* ((start (* chunk-index chunk-size))
+             (mean-square (/ (sum-square-elements-range vector start chunk-size)
+                             chunk-size))
+             (scale (/ (sqrt (+ mean-square epsilon)))))
+        (declare (fixnum start)
+                 (single-float mean-square scale))
+        (dotimes (index chunk-size)
+          (declare (fixnum index))
+          (setf (aref dest (+ start index))
+                (* (aref vector (+ start index))
+                   (aref weight index)
+                   (silu (aref gate (+ start index)))
+                   scale)))))))
+
 (defun apply-rope-head (head position rope-dimension theta-base &optional freq-factors)
   (let ((result (copy-seq head)))
     (apply-rope-head-in-place result
@@ -1254,9 +1419,25 @@ It extracts the underlying simple arrays once before entering the loop to elimin
 (defun make-optional-layer-tensor-name (layer-index suffix)
   (format nil "blk.~d.~a.weight" layer-index suffix))
 
+(defun make-layer-tensor-path (layer-index suffix)
+  (format nil "blk.~d.~a" layer-index suffix))
+
 (defun gguf-model-layer-uses-swa-p (model layer-index)
   (let ((pattern (gguf-model-sliding-pattern model)))
     (and pattern (nth layer-index pattern))))
+
+(defun gguf-model-layer-kv-head-count (model layer-index)
+  (let ((kv-head-count (gguf-model-kv-head-count model)))
+    (typecase kv-head-count
+      (list
+       (or (nth layer-index kv-head-count)
+           (error "Model is missing KV head count for layer ~d." layer-index)))
+      (fixnum kv-head-count)
+      (integer kv-head-count)
+      (t
+       (error "Unsupported KV head count metadata ~s for layer ~d."
+              kv-head-count
+              layer-index)))))
 
 (defun gguf-model-kv-layer-count (model)
   (let ((shared-kv-layers (or (gguf-model-shared-kv-layers model) 0)))
@@ -1287,10 +1468,15 @@ It extracts the underlying simple arrays once before entering the loop to elimin
         value))
 
 (defun gguf-model-load-vector-tensor (model tensor-name)
+  (let* ((tensor (gguf-model-load-tensor model tensor-name))
+         (tensor-info (gguf-model-tensor-info model tensor-name t)))
+    (unless (= 1 (length (getf tensor-info :dimensions)))
+      (error "Tensor ~s is not a vector tensor." tensor-name))
+    tensor))
+
+(defun gguf-model-load-tensor (model tensor-name)
   (or (gguf-model-cached-tensor model tensor-name)
       (let ((tensor-info (gguf-model-tensor-info model tensor-name t)))
-        (unless (= 1 (length (getf tensor-info :dimensions)))
-          (error "Tensor ~s is not a vector tensor." tensor-name))
         (setf (gguf-model-cached-tensor model tensor-name)
               (load-gguf-tensor (gguf-model-mapping model) tensor-info)))))
 
@@ -1299,6 +1485,15 @@ It extracts the underlying simple arrays once before entering the loop to elimin
     (unless (= 1 (length tensor))
       (error "Tensor ~s is not a scalar tensor." tensor-name))
     (aref tensor 0)))
+
+(defun tensor-depth-count (tensor-info)
+  (the fixnum
+       (or (third (getf tensor-info :dimensions)) 1)))
+
+(defun tensor-flat-row-count (tensor-info)
+  (the fixnum
+       (* (tensor-row-count tensor-info)
+          (tensor-depth-count tensor-info))))
 
 (defun tensor-row-pointer (mapping tensor-info row-index)
   (let ((row-count (tensor-row-count tensor-info)))
@@ -1319,6 +1514,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (#.+ggml-type-f16+ (load-f16-tensor row-pointer column-count))
       (#.+ggml-type-bf16+ (load-bf16-tensor row-pointer column-count))
       (#.+ggml-type-q4-k+ (dequantize-q4-k-m row-pointer column-count))
+      (#.+ggml-type-q5-k+ (dequantize-q5-k row-pointer column-count))
       (#.+ggml-type-q6-k+ (dequantize-q6-k row-pointer column-count))
       (otherwise
        (error "Tensor ~s has unsupported row-loading type tag ~a."
@@ -1337,6 +1533,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (#.+ggml-type-f32+ (load-f32-tensor-into dest row-pointer column-count))
       (#.+ggml-type-f16+ (load-f16-tensor-into dest row-pointer column-count))
       (#.+ggml-type-bf16+ (load-bf16-tensor-into dest row-pointer column-count))
+      (#.+ggml-type-q5-k+ (replace dest (dequantize-q5-k row-pointer column-count)))
       (otherwise
        (replace dest (load-gguf-tensor-row mapping tensor-info row-index))))
     dest))
@@ -1658,6 +1855,65 @@ It extracts the underlying simple arrays once before entering the loop to elimin
 (defun dot-product-with-q4-k-m-tensor-row (row-pointer vector element-count)
   (dot-product-with-q4-k-m-tensor-data row-pointer 0 vector element-count))
 
+(defun dot-product-with-q5-k-tensor-data (pointer row-offset vector element-count)
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
+           (type (simple-array single-float (*)) vector)
+           (fixnum row-offset element-count))
+  (unless (zerop (mod element-count +qk-k+))
+    (error "Q5_K dot product requires ELEMENT-COUNT to be a multiple of ~d."
+           +qk-k+))
+  (let ((sum 0.0f0)
+        (block-size (+ 4 +k-scale-size+ (/ +qk-k+ 8) (/ +qk-k+ 2)))
+        (block-count (/ element-count +qk-k+)))
+    (declare (single-float sum)
+             (fixnum block-size block-count))
+    (dotimes (block-index block-count (the single-float sum))
+      (declare (fixnum block-index))
+      (let* ((block-offset (+ row-offset (* block-index block-size)))
+             (d (read-fp16-le pointer block-offset))
+             (dmin (read-fp16-le pointer (+ block-offset 2)))
+             (scale-base (+ block-offset 4))
+             (qh-base (+ scale-base +k-scale-size+))
+             (qs-base (+ qh-base (/ +qk-k+ 8)))
+             (vector-base (* block-index +qk-k+))
+             (u1 1)
+             (u2 2)
+             (is 0))
+        (declare (single-float d dmin)
+                 (fixnum scale-base qh-base qs-base vector-base u1 u2 is))
+        (dotimes (group-index 4)
+          (declare (fixnum group-index))
+          (multiple-value-bind (sc0 m0)
+              (get-scale-min-k4-at pointer scale-base is)
+            (multiple-value-bind (sc1 m1)
+                (get-scale-min-k4-at pointer scale-base (1+ is))
+              (let ((delta0 (* d (fixnum-single-float sc0)))
+                    (offset0 (* dmin (fixnum-single-float m0)))
+                    (delta1 (* d (fixnum-single-float sc1)))
+                    (offset1 (* dmin (fixnum-single-float m1))))
+                (declare (single-float delta0 offset0 delta1 offset1))
+                (dotimes (lane 32)
+                  (declare (fixnum lane))
+                  (let* ((packed (cffi:mem-aref pointer :unsigned-char (+ qs-base lane)))
+                         (high-bits (cffi:mem-aref pointer :unsigned-char (+ qh-base lane)))
+                         (q0 (+ (logand packed #x0F)
+                                (if (logtest u1 high-bits) 16 0)))
+                         (q1 (+ (ash packed -4)
+                                (if (logtest u2 high-bits) 16 0))))
+                    (declare (fixnum packed high-bits q0 q1))
+                    (incf sum (* (aref vector (+ vector-base lane))
+                                 (- (* delta0 q0) offset0)))
+                    (incf sum (* (aref vector (+ vector-base lane 32))
+                                 (- (* delta1 q1) offset1)))))
+                (incf qs-base 32)
+                (incf vector-base 64)
+                (incf is 2)
+                (setf u1 (ash u1 2)
+                      u2 (ash u2 2))))))))))
+
+(defun dot-product-with-q5-k-tensor-row (row-pointer vector element-count)
+  (dot-product-with-q5-k-tensor-data row-pointer 0 vector element-count))
+
 (defun dot-product-with-q6-k-tensor-data (pointer row-offset vector element-count)
   (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
            (type (simple-array single-float (*)) vector)
@@ -1746,33 +2002,41 @@ It extracts the underlying simple arrays once before entering the loop to elimin
        (dot-product-with-bf16-tensor-data mapping row-offset vector column-count))
       (#.+ggml-type-q4-k+
        (dot-product-with-q4-k-m-tensor-data mapping row-offset vector column-count))
+      (#.+ggml-type-q5-k+
+       (dot-product-with-q5-k-tensor-data mapping row-offset vector column-count))
       (#.+ggml-type-q6-k+
        (dot-product-with-q6-k-tensor-data mapping row-offset vector column-count))
       (otherwise
        (dot-product vector
                     (load-gguf-tensor-row mapping tensor-info row-index))))))
 
-(defun gguf-model-matrix-vector-multiply-into (dest model tensor-name vector)
+(defun %gguf-model-matrix-vector-multiply-into (dest mapping tensor-info vector start-row row-count)
   (declare (optimize (speed 3) (safety 0))
-          (type (simple-array single-float (*)) dest vector))
-  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
-        (mapping (gguf-model-mapping model))
-        (row-count (tensor-row-count tensor-info))
+          (type (simple-array single-float (*)) dest vector)
+          (fixnum start-row row-count))
+  (let* ((flat-row-count (tensor-flat-row-count tensor-info))
         (column-count (tensor-column-count tensor-info))
         (type-tag (getf tensor-info :type-tag))
         (row-byte-size (tensor-row-byte-size tensor-info))
-        (row-offset (getf tensor-info :data-offset)))
-    (declare (fixnum row-count column-count type-tag row-byte-size row-offset))
+        (row-offset (+ (getf tensor-info :data-offset)
+                       (* start-row row-byte-size))))
+    (declare (fixnum flat-row-count column-count type-tag row-byte-size row-offset))
     (unless (= (length dest) row-count)
       (error "Destination length ~d does not match row count ~d for tensor ~s."
             (length dest)
             row-count
-            tensor-name))
+           (getf tensor-info :name)))
     (unless (= (length vector) column-count)
       (error "Vector length ~d does not match tensor row width ~d for tensor ~s."
             (length vector)
             column-count
-            tensor-name))
+            (getf tensor-info :name)))
+    (unless (<= (+ start-row row-count) flat-row-count)
+      (error "Requested row range [~d, ~d) exceeds flattened row count ~d for tensor ~s."
+            start-row
+            (+ start-row row-count)
+            flat-row-count
+            (getf tensor-info :name)))
     (case type-tag
       (#.+ggml-type-f32+
        (dotimes (row-index row-count dest)
@@ -1781,7 +2045,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
               (dot-product-with-f32-tensor-data mapping row-offset vector column-count))
         (incf row-offset row-byte-size)))
       (#.+ggml-type-f16+
-       (dotimes (row-index row-count dest)
+      (dotimes (row-index row-count dest)
         (declare (fixnum row-index))
         (setf (aref dest row-index)
               (dot-product-with-f16-tensor-data mapping row-offset vector column-count))
@@ -1810,6 +2074,24 @@ It extracts the underlying simple arrays once before entering the loop to elimin
             (setf (aref dest row-index)
                   (dot-product-with-q4-k-m-tensor-data mapping row-offset vector column-count))
             (incf row-offset row-byte-size))))
+      (#.+ggml-type-q5-k+
+       (if (parallel-gemv-row-count-p row-count)
+          (let ((parts (parallel-gemv-part-count row-count))
+                (lparallel:*kernel* (ensure-gemv-kernel)))
+            (declare (fixnum parts))
+            (lparallel:pdotimes (row-index row-count dest parts)
+              (declare (fixnum row-index))
+              (setf (aref dest row-index)
+                    (dot-product-with-q5-k-tensor-data
+                     mapping
+                     (+ row-offset (* row-index row-byte-size))
+                     vector
+                     column-count))))
+          (dotimes (row-index row-count dest)
+            (declare (fixnum row-index))
+            (setf (aref dest row-index)
+                  (dot-product-with-q5-k-tensor-data mapping row-offset vector column-count))
+            (incf row-offset row-byte-size))))
       (#.+ggml-type-q6-k+
        (if (parallel-gemv-row-count-p row-count)
           (let ((parts (parallel-gemv-part-count row-count))
@@ -1832,7 +2114,19 @@ It extracts the underlying simple arrays once before entering the loop to elimin
        (dotimes (row-index row-count dest)
         (declare (fixnum row-index))
         (setf (aref dest row-index)
-              (dot-product-with-tensor-row mapping tensor-info row-index vector)))))))
+              (dot-product-with-tensor-row mapping tensor-info (+ start-row row-index) vector)))))))
+
+(defun gguf-model-matrix-vector-multiply-into (dest model tensor-name vector)
+  (declare (optimize (speed 3) (safety 0))
+          (type (simple-array single-float (*)) dest vector))
+  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
+        (row-count (tensor-row-count tensor-info)))
+    (%gguf-model-matrix-vector-multiply-into dest
+                                            (gguf-model-mapping model)
+                                            tensor-info
+                                            vector
+                                            0
+                                            row-count)))
 
 (defun gguf-model-matrix-vector-multiply (model tensor-name vector)
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
@@ -1842,6 +2136,28 @@ It extracts the underlying simple arrays once before entering the loop to elimin
      model
      tensor-name
      vector)))
+
+(defun gguf-model-expert-matrix-vector-multiply-into (dest model tensor-name expert-index vector)
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array single-float (*)) dest vector)
+           (fixnum expert-index))
+  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
+         (rows-per-expert (tensor-row-count tensor-info))
+         (expert-count (tensor-depth-count tensor-info)))
+    (declare (fixnum rows-per-expert expert-count))
+    (unless (= 3 (length (getf tensor-info :dimensions)))
+      (error "Tensor ~s is not an expert tensor." tensor-name))
+    (unless (and (<= 0 expert-index) (< expert-index expert-count))
+      (error "Expert index ~d is out of range for tensor ~s with ~d experts."
+             expert-index
+             tensor-name
+             expert-count))
+    (%gguf-model-matrix-vector-multiply-into dest
+                                             (gguf-model-mapping model)
+                                             tensor-info
+                                             vector
+                                             (* expert-index rows-per-expert)
+                                             rows-per-expert)))
 
 (defun gguf-model-token-row (model tensor-name token-id)
   (let ((tensor-info (gguf-model-tensor-info model tensor-name t)))
@@ -1879,6 +2195,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
 
 (defstruct compute-buffer
   (vectors (make-hash-table :test #'eq))
+  (fixnum-vectors (make-hash-table :test #'eq))
   (chunk-views (make-hash-table :test #'eq)))
 
 (defun compute-buffer-vector (buffer key length)
@@ -1886,6 +2203,13 @@ It extracts the underlying simple arrays once before entering the loop to elimin
     (unless (and vector (= (length vector) length))
       (setf vector (make-array length :element-type 'single-float)
             (gethash key (compute-buffer-vectors buffer)) vector))
+    vector))
+
+(defun compute-buffer-fixnum-vector (buffer key length)
+  (let ((vector (gethash key (compute-buffer-fixnum-vectors buffer))))
+    (unless (and vector (= (length vector) length))
+      (setf vector (make-array length :element-type 'fixnum)
+            (gethash key (compute-buffer-fixnum-vectors buffer)) vector))
     vector))
 
 (defun compute-buffer-chunks (buffer key backing-vector chunk-count)
@@ -2054,6 +2378,560 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                            (gguf-model-load-scalar-tensor model tensor-name))
         vector)))
 
+(defun qwen3next-full-attention-layer-p (model layer-index)
+  (not (null (gguf-model-tensor-info model
+                                     (make-layer-tensor-name layer-index "attn_q")
+                                     nil))))
+
+(defun qwen3next-recurrent-layer-p (model layer-index)
+  (not (null (gguf-model-tensor-info model
+                                     (make-layer-tensor-name layer-index "attn_qkv")
+                                     nil))))
+
+(defun ensure-qwen3next-recurrent-layer-cache (kv-cache layer-index channel-count kernel-size
+                                                        head-count state-size)
+  (let ((entry (gethash layer-index kv-cache))
+        (conv-state-length (* channel-count kernel-size))
+        (state-length (* head-count state-size state-size)))
+    (declare (fixnum channel-count kernel-size head-count state-size
+                     conv-state-length state-length))
+    (unless (and entry
+                 (= (length (getf entry :conv-state)) conv-state-length)
+                 (= (length (getf entry :state)) state-length))
+      (setf entry (list :conv-state (make-array conv-state-length
+                                                :element-type 'single-float
+                                                :initial-element 0.0f0)
+                        :state (make-array state-length
+                                           :element-type 'single-float
+                                           :initial-element 0.0f0))
+            (gethash layer-index kv-cache) entry))
+    entry))
+
+(defun qwen3next-causal-conv1d-step-into (dest current-input conv-state conv-weight kernel-size)
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array single-float (*)) dest current-input conv-state conv-weight)
+           (fixnum kernel-size))
+  (unless (= (length dest) (length current-input))
+    (error "QWEN3NEXT-CAUSAL-CONV1D-STEP destination length ~d does not match input length ~d."
+           (length dest)
+           (length current-input)))
+  (let* ((channel-count (length current-input))
+         (expected-state-length (* channel-count kernel-size)))
+    (declare (fixnum channel-count expected-state-length))
+    (unless (= (length conv-state) expected-state-length)
+      (error "Convolution state length ~d does not match expected length ~d."
+             (length conv-state)
+             expected-state-length))
+    (unless (= (length conv-weight) expected-state-length)
+      (error "Convolution weight length ~d does not match expected length ~d."
+             (length conv-weight)
+             expected-state-length))
+    (dotimes (channel-index channel-count dest)
+      (declare (fixnum channel-index))
+      (let* ((base (* channel-index kernel-size))
+             (new-value (aref current-input channel-index))
+             (sum 0.0f0))
+        (declare (fixnum base)
+                 (single-float new-value sum))
+        (dotimes (tap-index (1- kernel-size))
+          (declare (fixnum tap-index))
+          (setf (aref conv-state (+ base tap-index))
+                (aref conv-state (+ base tap-index 1))))
+        (setf (aref conv-state (+ base (1- kernel-size))) new-value)
+        (dotimes (tap-index kernel-size)
+          (declare (fixnum tap-index))
+          (incf sum
+                (* (aref conv-state (+ base tap-index))
+                   (aref conv-weight (+ base tap-index)))))
+        (setf (aref dest channel-index)
+              (silu sum))))))
+
+(defun select-top-k-logits-into (top-indices top-logits logits count)
+  (declare (optimize (speed 3) (safety 2))
+           (type (simple-array fixnum (*)) top-indices)
+           (type (simple-array single-float (*)) top-logits logits)
+           (fixnum count))
+  (unless (= (length top-indices) count (length top-logits))
+    (error "SELECT-TOP-K-LOGITS-INTO requires buffers of length ~d." count))
+  (dotimes (index count)
+    (declare (fixnum index))
+    (setf (aref top-indices index) -1
+          (aref top-logits index) most-negative-single-float))
+  (dotimes (logit-index (length logits))
+    (declare (fixnum logit-index))
+    (let ((value (aref logits logit-index)))
+      (declare (single-float value))
+      (when (> value (aref top-logits (1- count)))
+        (let ((insert-index (1- count)))
+          (declare (fixnum insert-index))
+          (loop while (and (> insert-index 0)
+                           (> value (aref top-logits (1- insert-index))))
+                do (setf (aref top-logits insert-index)
+                         (aref top-logits (1- insert-index))
+                         (aref top-indices insert-index)
+                         (aref top-indices (1- insert-index)))
+                   (decf insert-index))
+          (setf (aref top-logits insert-index) value
+                (aref top-indices insert-index) logit-index)))))
+  top-indices)
+
+(defun qwen3next-dense-ffn-into (dest model layer-index input compute-buffer)
+  (declare (type (simple-array single-float (*)) dest input))
+  (let* ((gate-length (tensor-row-count
+                       (gguf-model-tensor-info model
+                                               (make-layer-tensor-name layer-index "ffn_gate")
+                                               t)))
+         (up-length (tensor-row-count
+                     (gguf-model-tensor-info model
+                                             (make-layer-tensor-name layer-index "ffn_up")
+                                             t)))
+         (gate (compute-buffer-vector compute-buffer :qwen-dense-gate gate-length))
+         (up (compute-buffer-vector compute-buffer :qwen-dense-up up-length)))
+    (gguf-model-matrix-vector-multiply-into gate
+                                            model
+                                            (make-layer-tensor-name layer-index "ffn_gate")
+                                            input)
+    (gguf-model-matrix-vector-multiply-into up
+                                            model
+                                            (make-layer-tensor-name layer-index "ffn_up")
+                                            input)
+    (apply-silu-into gate gate)
+    (vector-elementwise-multiply-into gate gate up)
+    (gguf-model-matrix-vector-multiply-into dest
+                                            model
+                                            (make-layer-tensor-name layer-index "ffn_down")
+                                            gate)))
+
+(defun qwen3next-moe-into (dest model layer-index input compute-buffer)
+  (declare (type (simple-array single-float (*)) dest input))
+  (let ((router-info (gguf-model-tensor-info model
+                                             (make-layer-tensor-name layer-index "ffn_gate_inp")
+                                             nil)))
+    (if (null router-info)
+        (qwen3next-dense-ffn-into dest model layer-index input compute-buffer)
+        (let* ((expert-count (tensor-row-count router-info))
+               (top-k (min expert-count
+                           (or (gguf-kv-value-or-nil (gguf-model-kv-pairs model)
+                                                     "qwen3next.expert_used_count")
+                               10)))
+               (expert-hidden-size
+                (tensor-row-count
+                 (gguf-model-tensor-info model
+                                         (make-layer-tensor-name layer-index "ffn_gate_exps")
+                                         t)))
+               (shared-hidden-size
+                (tensor-row-count
+                 (gguf-model-tensor-info model
+                                         (make-layer-tensor-name layer-index "ffn_gate_shexp")
+                                         t)))
+               (router-logits (compute-buffer-vector compute-buffer :qwen-router-logits expert-count))
+               (top-indices (compute-buffer-fixnum-vector compute-buffer :qwen-top-indices top-k))
+               (top-logits (compute-buffer-vector compute-buffer :qwen-top-logits top-k))
+               (top-probabilities (compute-buffer-vector compute-buffer :qwen-top-probabilities top-k))
+               (expert-gate (compute-buffer-vector compute-buffer :qwen-expert-gate expert-hidden-size))
+               (expert-up (compute-buffer-vector compute-buffer :qwen-expert-up expert-hidden-size))
+               (expert-down (compute-buffer-vector compute-buffer :qwen-expert-down (length dest)))
+               (shared-gate (compute-buffer-vector compute-buffer :qwen-shared-gate shared-hidden-size))
+               (shared-up (compute-buffer-vector compute-buffer :qwen-shared-up shared-hidden-size))
+               (shared-down (compute-buffer-vector compute-buffer :qwen-shared-down (length dest)))
+               (shared-gate-weight
+                (gguf-model-load-vector-tensor model
+                                               (make-layer-tensor-name
+                                                layer-index
+                                                "ffn_gate_inp_shexp"))))
+          (declare (fixnum expert-count top-k expert-hidden-size shared-hidden-size))
+          (fill dest 0.0f0)
+          (gguf-model-matrix-vector-multiply-into router-logits
+                                                  model
+                                                  (make-layer-tensor-name layer-index "ffn_gate_inp")
+                                                  input)
+          (select-top-k-logits-into top-indices top-logits router-logits top-k)
+          (let ((weight-sum 0.0f0))
+            (declare (single-float weight-sum))
+            (dotimes (selected-index top-k)
+              (declare (fixnum selected-index))
+              (let ((weight (sigmoid (aref top-logits selected-index))))
+                (declare (single-float weight))
+                (setf (aref top-probabilities selected-index) weight)
+                (incf weight-sum weight)))
+            (unless (plusp weight-sum)
+              (error "Qwen3Next layer ~d router produced non-positive top-k weight sum."
+                     layer-index))
+            (dotimes (selected-index top-k)
+              (declare (fixnum selected-index))
+              (setf (aref top-probabilities selected-index)
+                    (/ (aref top-probabilities selected-index) weight-sum))))
+          (dotimes (selected-index top-k)
+            (declare (fixnum selected-index))
+            (let ((expert-index (aref top-indices selected-index))
+                  (expert-weight (aref top-probabilities selected-index)))
+              (declare (fixnum expert-index)
+                       (single-float expert-weight))
+              (gguf-model-expert-matrix-vector-multiply-into expert-gate
+                                                             model
+                                                             (make-layer-tensor-name
+                                                              layer-index
+                                                              "ffn_gate_exps")
+                                                             expert-index
+                                                             input)
+              (gguf-model-expert-matrix-vector-multiply-into expert-up
+                                                             model
+                                                             (make-layer-tensor-name
+                                                              layer-index
+                                                              "ffn_up_exps")
+                                                             expert-index
+                                                             input)
+              (apply-silu-into expert-gate expert-gate)
+              (vector-elementwise-multiply-into expert-gate expert-gate expert-up)
+              (gguf-model-expert-matrix-vector-multiply-into expert-down
+                                                             model
+                                                             (make-layer-tensor-name
+                                                              layer-index
+                                                              "ffn_down_exps")
+                                                             expert-index
+                                                             expert-gate)
+              (vector-add-scaled-in-place dest expert-down expert-weight)))
+          (let ((shared-weight (sigmoid (dot-product shared-gate-weight input))))
+            (declare (single-float shared-weight))
+            (gguf-model-matrix-vector-multiply-into shared-gate
+                                                    model
+                                                    (make-layer-tensor-name layer-index "ffn_gate_shexp")
+                                                    input)
+            (gguf-model-matrix-vector-multiply-into shared-up
+                                                    model
+                                                    (make-layer-tensor-name layer-index "ffn_up_shexp")
+                                                    input)
+            (apply-silu-into shared-gate shared-gate)
+            (vector-elementwise-multiply-into shared-gate shared-gate shared-up)
+            (gguf-model-matrix-vector-multiply-into shared-down
+                                                    model
+                                                    (make-layer-tensor-name layer-index "ffn_down_shexp")
+                                                    shared-gate)
+            (vector-add-scaled-in-place dest shared-down shared-weight))))))
+
+(defun load-qwen3next-model (mapping kv-pairs tensor-infos)
+  (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
+    (unless (string= architecture "qwen3next")
+      (error "LOAD-QWEN3NEXT-MODEL only supports general.architecture = \"qwen3next\", got ~s."
+             architecture))
+    (let ((tensor-info-table (make-tensor-info-table tensor-infos)))
+      (make-gguf-model
+       :mapping mapping
+       :kv-pairs kv-pairs
+       :tensor-infos tensor-infos
+       :tensor-info-table tensor-info-table
+       :tensor-cache (make-hash-table :test #'equal)
+       :architecture architecture
+       :hidden-size (gguf-kv-value kv-pairs "qwen3next.embedding_length")
+       :layer-count (gguf-kv-value kv-pairs "qwen3next.block_count")
+       :head-count (gguf-kv-value kv-pairs "qwen3next.attention.head_count")
+       :kv-head-count (gguf-kv-value kv-pairs "qwen3next.attention.head_count_kv")
+       :ffn-size (gguf-kv-value-or-nil kv-pairs "qwen3next.feed_forward_length")
+       :norm-epsilon (gguf-kv-value kv-pairs "qwen3next.attention.layer_norm_rms_epsilon")
+       :rope-base (gguf-kv-value kv-pairs "qwen3next.rope.freq_base")
+       :rope-dimension (gguf-kv-value kv-pairs "qwen3next.rope.dimension_count")
+       :output-tensor-name (if (gethash "output.weight" tensor-info-table)
+                               "output.weight"
+                               "token_embd.weight")))))
+
+(defun make-qwen3next-step-function (model)
+  (let ((head-count (gguf-model-head-count model))
+        (kv-head-count (gguf-model-kv-head-count model))
+        (hidden-size (gguf-model-hidden-size model))
+        (norm-epsilon (gguf-model-norm-epsilon model))
+        (rope-dimension (gguf-model-rope-dimension model))
+        (rope-base (gguf-model-rope-base model))
+        (compute-buffer (make-compute-buffer)))
+    (lambda (token-id position kv-cache)
+      (let* ((input-embedding (compute-buffer-vector compute-buffer :qwen-input-embedding hidden-size))
+             (x (compute-buffer-vector compute-buffer :qwen-x hidden-size))
+             (attn-norm (compute-buffer-vector compute-buffer :qwen-attn-norm hidden-size))
+             (ffn-input (compute-buffer-vector compute-buffer :qwen-ffn-input hidden-size))
+             (mixer-output (compute-buffer-vector compute-buffer :qwen-mixer-output hidden-size))
+             (ffn-output (compute-buffer-vector compute-buffer :qwen-ffn-output hidden-size)))
+        (gguf-model-token-row-into input-embedding model "token_embd.weight" token-id)
+        (replace x input-embedding)
+        (dotimes (layer-index (gguf-model-layer-count model))
+          (declare (fixnum layer-index))
+          (rms-norm-into attn-norm
+                         x
+                         (gguf-model-load-vector-tensor
+                          model
+                          (make-layer-tensor-name layer-index "attn_norm"))
+                         :epsilon norm-epsilon)
+          (cond
+            ((qwen3next-full-attention-layer-p model layer-index)
+             (let* ((q-and-gate-length
+                     (tensor-row-count
+                      (gguf-model-tensor-info model
+                                              (make-layer-tensor-name layer-index "attn_q")
+                                              t)))
+                    (k-length
+                     (tensor-row-count
+                      (gguf-model-tensor-info model
+                                              (make-layer-tensor-name layer-index "attn_k")
+                                              t)))
+                    (v-length
+                     (tensor-row-count
+                      (gguf-model-tensor-info model
+                                              (make-layer-tensor-name layer-index "attn_v")
+                                              t)))
+                    (q-length (/ q-and-gate-length 2))
+                    (q-and-gate (compute-buffer-vector compute-buffer
+                                                       :qwen-full-q-and-gate
+                                                       q-and-gate-length))
+                    (q (compute-buffer-vector compute-buffer :qwen-full-q q-length))
+                    (gate (compute-buffer-vector compute-buffer :qwen-full-gate q-length))
+                    (k (compute-buffer-vector compute-buffer :qwen-full-k k-length))
+                    (v (compute-buffer-vector compute-buffer :qwen-full-v v-length))
+                    (context (compute-buffer-vector compute-buffer :qwen-full-context q-length))
+                    (q-heads nil)
+                    (k-heads nil)
+                    (v-heads nil))
+               (declare (fixnum q-and-gate-length k-length v-length q-length))
+               (gguf-model-matrix-vector-multiply-into q-and-gate
+                                                       model
+                                                       (make-layer-tensor-name layer-index "attn_q")
+                                                       attn-norm)
+               (replace q q-and-gate :start2 0 :end2 q-length)
+               (replace gate q-and-gate :start2 q-length)
+               (gguf-model-matrix-vector-multiply-into k
+                                                       model
+                                                       (make-layer-tensor-name layer-index "attn_k")
+                                                       attn-norm)
+               (gguf-model-matrix-vector-multiply-into v
+                                                       model
+                                                       (make-layer-tensor-name layer-index "attn_v")
+                                                       attn-norm)
+               (normalize-vector-chunks-into q
+                                             q
+                                             head-count
+                                             (gguf-model-load-vector-tensor
+                                              model
+                                              (make-layer-tensor-name layer-index "attn_q_norm"))
+                                             :epsilon norm-epsilon)
+               (normalize-vector-chunks-into k
+                                             k
+                                             kv-head-count
+                                             (gguf-model-load-vector-tensor
+                                              model
+                                              (make-layer-tensor-name layer-index "attn_k_norm"))
+                                             :epsilon norm-epsilon)
+               (setf q-heads (compute-buffer-chunks compute-buffer :qwen-full-q-heads q head-count)
+                     k-heads (compute-buffer-chunks compute-buffer :qwen-full-k-heads k kv-head-count)
+                     v-heads (compute-buffer-chunks compute-buffer :qwen-full-v-heads v kv-head-count))
+               (dotimes (head-index head-count)
+                 (declare (fixnum head-index))
+                 (apply-rope-head-in-place (aref q-heads head-index)
+                                           position
+                                           rope-dimension
+                                           rope-base))
+               (dotimes (head-index kv-head-count)
+                 (declare (fixnum head-index))
+                 (apply-rope-head-in-place (aref k-heads head-index)
+                                           position
+                                           rope-dimension
+                                           rope-base))
+               (vector-scale-into q q (/ (sqrt (/ q-length head-count))))
+               (compute-gemma4-attention-into context
+                                              compute-buffer
+                                              model
+                                              layer-index
+                                              layer-index
+                                              position
+                                              q-heads
+                                              k-heads
+                                              v-heads
+                                              kv-cache)
+               (apply-sigmoid-into gate gate)
+               (vector-elementwise-multiply-into context context gate)
+               (gguf-model-matrix-vector-multiply-into mixer-output
+                                                       model
+                                                       (make-layer-tensor-name layer-index "attn_output")
+                                                       context)))
+            ((qwen3next-recurrent-layer-p model layer-index)
+             (let* ((mixed-qkv-length
+                     (tensor-row-count
+                      (gguf-model-tensor-info model
+                                              (make-layer-tensor-name layer-index "attn_qkv")
+                                              t)))
+                    (gate-length
+                     (tensor-row-count
+                      (gguf-model-tensor-info model
+                                              (make-layer-tensor-name layer-index "attn_gate")
+                                              t)))
+                    (ba-length
+                     (tensor-row-count
+                      (gguf-model-tensor-info model
+                                              (make-layer-tensor-name layer-index "ssm_ba")
+                                              t)))
+                    (mixed-qkv (compute-buffer-vector compute-buffer
+                                                      :qwen-recurrent-mixed-qkv
+                                                      mixed-qkv-length))
+                    (conv-qkv (compute-buffer-vector compute-buffer
+                                                     :qwen-recurrent-conv-qkv
+                                                     mixed-qkv-length))
+                    (gate (compute-buffer-vector compute-buffer :qwen-recurrent-gate gate-length))
+                    (ba (compute-buffer-vector compute-buffer :qwen-recurrent-ba ba-length))
+                    (q-length (/ mixed-qkv-length 4))
+                    (k-length q-length)
+                    (v-length (* 2 q-length))
+                    (q (compute-buffer-vector compute-buffer :qwen-recurrent-q q-length))
+                    (k (compute-buffer-vector compute-buffer :qwen-recurrent-k k-length))
+                    (v (compute-buffer-vector compute-buffer :qwen-recurrent-v v-length))
+                    (ssm-a (gguf-model-load-vector-tensor model (make-layer-tensor-path layer-index "ssm_a")))
+                    (ssm-dt-bias
+                     (gguf-model-load-vector-tensor model
+                                                    (make-layer-tensor-path layer-index "ssm_dt.bias")))
+                    (ssm-norm
+                     (gguf-model-load-vector-tensor model
+                                                    (make-layer-tensor-name layer-index "ssm_norm")))
+                    (conv-weight
+                     (gguf-model-load-tensor model
+                                             (make-layer-tensor-name layer-index "ssm_conv1d")))
+                    (kernel-size (tensor-column-count
+                                  (gguf-model-tensor-info model
+                                                          (make-layer-tensor-name
+                                                           layer-index
+                                                           "ssm_conv1d")
+                                                          t)))
+                    (recurrent-head-count (length ssm-a))
+                    (state-size (length ssm-norm))
+                    (q-head-count (/ q-length state-size))
+                    (cache (ensure-qwen3next-recurrent-layer-cache kv-cache
+                                                                  layer-index
+                                                                  mixed-qkv-length
+                                                                  kernel-size
+                                                                  recurrent-head-count
+                                                                  state-size))
+                    (conv-state (getf cache :conv-state))
+                    (recurrent-state (getf cache :state))
+                    (kv-mem (compute-buffer-vector compute-buffer :qwen-recurrent-kv-mem state-size))
+                    (delta (compute-buffer-vector compute-buffer :qwen-recurrent-delta state-size))
+                    (gated-output (compute-buffer-vector compute-buffer
+                                                         :qwen-recurrent-gated-output
+                                                         gate-length))
+                    (query-scale (/ (sqrt state-size))))
+               (declare (fixnum mixed-qkv-length gate-length ba-length q-length k-length v-length
+                                kernel-size recurrent-head-count state-size q-head-count)
+                        (single-float query-scale))
+               (unless (zerop (mod recurrent-head-count q-head-count))
+                 (error "Qwen3Next recurrent head count ~d is not divisible by q/k head count ~d."
+                        recurrent-head-count
+                        q-head-count))
+               (gguf-model-matrix-vector-multiply-into mixed-qkv
+                                                       model
+                                                       (make-layer-tensor-name layer-index "attn_qkv")
+                                                       attn-norm)
+               (gguf-model-matrix-vector-multiply-into gate
+                                                       model
+                                                       (make-layer-tensor-name layer-index "attn_gate")
+                                                       attn-norm)
+               (gguf-model-matrix-vector-multiply-into ba
+                                                       model
+                                                       (make-layer-tensor-name layer-index "ssm_ba")
+                                                       attn-norm)
+               (qwen3next-causal-conv1d-step-into conv-qkv
+                                                  mixed-qkv
+                                                  conv-state
+                                                  conv-weight
+                                                  kernel-size)
+               (replace q conv-qkv :start2 0 :end2 q-length)
+               (replace k conv-qkv :start2 q-length :end2 (+ q-length k-length))
+               (replace v conv-qkv :start2 (+ q-length k-length) :end2 mixed-qkv-length)
+               (l2-normalize-vector-chunks-into q q q-head-count :epsilon norm-epsilon)
+               (l2-normalize-vector-chunks-into k k q-head-count :epsilon norm-epsilon)
+               (fill gated-output 0.0f0)
+               (dotimes (head-index recurrent-head-count)
+                 (declare (fixnum head-index))
+                 (let* ((q-head-index (mod head-index q-head-count))
+                        (q-start (* q-head-index state-size))
+                        (k-start q-start)
+                        (v-start (* head-index state-size))
+                        (state-offset (* head-index state-size state-size))
+                        (beta (sigmoid (aref ba head-index)))
+                        (decay
+                         (coerce
+                          (exp (* (aref ssm-a head-index)
+                                  (log (+ 1.0d0
+                                          (exp (+ (aref ba (+ recurrent-head-count head-index))
+                                                  (aref ssm-dt-bias head-index)))))))
+                          'single-float)))
+                   (declare (fixnum q-head-index q-start k-start v-start state-offset)
+                            (single-float beta decay))
+                   (fill kv-mem 0.0f0)
+                   (dotimes (state-row state-size)
+                     (declare (fixnum state-row))
+                     (let* ((state-row-offset (+ state-offset (* state-row state-size)))
+                            (k-value (aref k (+ k-start state-row))))
+                       (declare (fixnum state-row-offset)
+                                (single-float k-value))
+                       (dotimes (state-column state-size)
+                         (declare (fixnum state-column))
+                         (let* ((state-index (+ state-row-offset state-column))
+                                (decayed-value (* (aref recurrent-state state-index) decay)))
+                           (declare (fixnum state-index)
+                                    (single-float decayed-value))
+                           (setf (aref recurrent-state state-index) decayed-value)
+                           (incf (aref kv-mem state-column)
+                                 (* decayed-value k-value))))))
+                   (dotimes (state-column state-size)
+                     (declare (fixnum state-column))
+                     (setf (aref delta state-column)
+                           (* beta
+                              (- (aref v (+ v-start state-column))
+                                 (aref kv-mem state-column)))))
+                   (dotimes (state-column state-size)
+                     (declare (fixnum state-column))
+                     (setf (aref gated-output (+ v-start state-column)) 0.0f0))
+                   (dotimes (state-row state-size)
+                     (declare (fixnum state-row))
+                     (let* ((state-row-offset (+ state-offset (* state-row state-size)))
+                            (k-value (aref k (+ k-start state-row)))
+                            (q-value (* (aref q (+ q-start state-row)) query-scale)))
+                       (declare (fixnum state-row-offset)
+                                (single-float k-value q-value))
+                       (dotimes (state-column state-size)
+                         (declare (fixnum state-column))
+                         (let* ((state-index (+ state-row-offset state-column))
+                                (updated-value (+ (aref recurrent-state state-index)
+                                                  (* k-value (aref delta state-column)))))
+                           (declare (fixnum state-index)
+                                    (single-float updated-value))
+                           (setf (aref recurrent-state state-index) updated-value)
+                           (incf (aref gated-output (+ v-start state-column))
+                                 (* updated-value q-value)))))))
+               (gated-normalize-vector-chunks-into gated-output
+                                                   gated-output
+                                                   gate
+                                                   recurrent-head-count
+                                                   ssm-norm
+                                                   :epsilon norm-epsilon)
+               (gguf-model-matrix-vector-multiply-into mixer-output
+                                                       model
+                                                       (make-layer-tensor-name layer-index "ssm_out")
+                                                       gated-output))))
+            (t
+             (error "Qwen3Next layer ~d has neither full-attention nor recurrent tensors."
+                    layer-index)))
+          (vector-add-into x x mixer-output)
+          (rms-norm-into ffn-input
+                         x
+                         (gguf-model-load-vector-tensor
+                          model
+                          (make-layer-tensor-name layer-index "post_attention_norm"))
+                         :epsilon norm-epsilon)
+          (qwen3next-moe-into ffn-output model layer-index ffn-input compute-buffer)
+          (vector-add-into x x ffn-output))
+        (when *compute-gguf-logits*
+          (gguf-model-matrix-vector-multiply
+           model
+           (gguf-model-output-tensor-name model)
+           (rms-norm-into (compute-buffer-vector compute-buffer :qwen-output-norm hidden-size)
+                          x
+                          (gguf-model-load-vector-tensor model "output_norm.weight")
+                          :epsilon norm-epsilon)))))))
+
 (defun load-gemma4-model (mapping kv-pairs tensor-infos)
   (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
     (unless (string= architecture "gemma4")
@@ -2126,7 +3004,6 @@ It extracts the underlying simple arrays once before entering the loop to elimin
 (defun make-gemma4-step-function (model)
   (let ((rope-factors (gguf-model-load-vector-tensor model "rope_freqs.weight"))
         (head-count (gguf-model-head-count model))
-        (kv-head-count (gguf-model-kv-head-count model))
         (norm-epsilon (gguf-model-norm-epsilon model))
         (compute-buffer (make-compute-buffer)))
     (lambda (token-id position kv-cache)
@@ -2155,6 +3032,8 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                  (cache-layer-index
                   (gguf-model-layer-kv-source-index model layer-index))
                  (uses-own-kv-p (= cache-layer-index layer-index))
+                 (kv-head-count
+                  (gguf-model-layer-kv-head-count model layer-index))
                  (k-length
                   (when uses-own-kv-p
                     (tensor-row-count
@@ -2163,10 +3042,13 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                                              t))))
                  (v-length
                   (when uses-own-kv-p
-                    (tensor-row-count
-                     (gguf-model-tensor-info model
-                                             (make-layer-tensor-name layer-index "attn_v")
-                                            t))))
+                    (let ((v-tensor-info
+                            (gguf-model-tensor-info model
+                                                    (make-layer-tensor-name layer-index "attn_v")
+                                                    nil)))
+                      (if v-tensor-info
+                          (tensor-row-count v-tensor-info)
+                          k-length))))
                  (q (compute-buffer-vector compute-buffer :q q-length))
                  (k (and uses-own-kv-p
                          (compute-buffer-vector compute-buffer :k k-length)))
@@ -2222,10 +3104,13 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                                                       model
                                                       (make-layer-tensor-name layer-index "attn_k")
                                                       attn-norm)
-              (gguf-model-matrix-vector-multiply-into v
-                                                      model
-                                                      (make-layer-tensor-name layer-index "attn_v")
-                                                      attn-norm))
+              (let ((v-tensor-name (make-layer-tensor-name layer-index "attn_v")))
+                (if (gguf-model-tensor-info model v-tensor-name nil)
+                    (gguf-model-matrix-vector-multiply-into v
+                                                            model
+                                                            v-tensor-name
+                                                            attn-norm)
+                    (replace v k))))
             (normalize-vector-chunks-into q
                                           q
                                           head-count
@@ -2444,6 +3329,64 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                                     'single-float)))))
                 (incf scale-index 2)))))))))
 
+(defun dequantize-q5-k (quantized-pointer element-count)
+  "Dequantize GGML q5_K blocks into a simple array of single floats."
+  (unless (zerop (mod element-count +qk-k+))
+    (error "Q5_K dequantization requires ELEMENT-COUNT to be a multiple of ~d."
+           +qk-k+))
+  (let* ((block-size (+ 4 +k-scale-size+ (/ +qk-k+ 8) (/ +qk-k+ 2)))
+         (block-count (/ element-count +qk-k+))
+         (result (make-array element-count :element-type 'single-float)))
+    (dotimes (block-index block-count result)
+      (declare (fixnum block-index))
+      (let* ((block-offset (* block-index block-size))
+             (d (read-fp16-le quantized-pointer block-offset))
+             (dmin (read-fp16-le quantized-pointer (+ block-offset 2)))
+             (scales-pointer (cffi:inc-pointer quantized-pointer (+ block-offset 4)))
+             (qh-pointer (cffi:inc-pointer quantized-pointer (+ block-offset 4 +k-scale-size+)))
+             (qs-pointer (cffi:inc-pointer quantized-pointer
+                                           (+ block-offset 4 +k-scale-size+ (/ +qk-k+ 8))))
+             (result-base (* block-index +qk-k+))
+             (u1 1)
+             (u2 2)
+             (scale-index 0))
+        (declare (single-float d dmin)
+                 (fixnum result-base u1 u2 scale-index))
+        (dotimes (chunk-index (/ +qk-k+ 64))
+          (declare (fixnum chunk-index))
+          (let ((chunk-base (* chunk-index 64))
+                (q-base (* chunk-index 32)))
+            (declare (fixnum chunk-base q-base))
+            (multiple-value-bind (scale0 min0)
+                (get-scale-min-k4 scale-index scales-pointer)
+              (multiple-value-bind (scale1 min1)
+                  (get-scale-min-k4 (1+ scale-index) scales-pointer)
+                (let ((delta0 (* d scale0))
+                      (offset0 (* dmin min0))
+                      (delta1 (* d scale1))
+                      (offset1 (* dmin min1)))
+                  (declare (single-float delta0 offset0 delta1 offset1))
+                  (dotimes (lane 32)
+                    (declare (fixnum lane))
+                    (let ((packed (cffi:mem-aref qs-pointer :unsigned-char (+ q-base lane)))
+                          (high-bits (cffi:mem-aref qh-pointer :unsigned-char (+ q-base lane))))
+                      (declare (fixnum packed high-bits))
+                      (setf (aref result (+ result-base chunk-base lane))
+                            (coerce (- (* delta0
+                                           (+ (logand packed #x0F)
+                                              (if (logtest u1 high-bits) 16 0)))
+                                        offset0)
+                                    'single-float))
+                      (setf (aref result (+ result-base chunk-base 32 lane))
+                            (coerce (- (* delta1
+                                           (+ (ash packed -4)
+                                              (if (logtest u2 high-bits) 16 0)))
+                                        offset1)
+                                    'single-float))))
+                  (incf scale-index 2)
+                  (setf u1 (ash u1 2)
+                        u2 (ash u2 2)))))))))))
+
 (defun dequantize-q6-k (quantized-pointer element-count)
   "Dequantize GGML q6_K blocks into a simple array of single floats."
   (unless (zerop (mod element-count +qk-k+))
@@ -2505,10 +3448,15 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                 (setf (aref result (+ result-base chunk-base 96 lane))
                       (coerce (* d scale4 q4) 'single-float))))))))))
 
-(defun normalize-sentencepiece-token (token)
-  (substitute #\Space (code-char #x2581) token))
+(defun normalize-token-text (kv-pairs token)
+  (let ((tokenizer-model (or (tokenizer-model kv-pairs) "")))
+    (cond
+      ((string= tokenizer-model "gpt2")
+       (substitute #\Space (code-char #x0120) token))
+      (t
+       (substitute #\Space (code-char #x2581) token)))))
 
-(defun detokenize-token-id (kv-pairs token-id)
+(defun raw-token-text (kv-pairs token-id)
   (let* ((tokens (gguf-kv-value kv-pairs "tokenizer.ggml.tokens"))
          (token-count (length tokens)))
     (unless (and (integerp token-id)
@@ -2517,22 +3465,75 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (error "Token id ~a is out of range for tokenizer with ~d tokens."
              token-id
              token-count))
-    (normalize-sentencepiece-token (nth token-id tokens))))
+    (nth token-id tokens)))
+
+(defun make-gpt2-unicode-byte-table ()
+  (let ((table (make-hash-table :test #'eql))
+        (extra-code-point 256))
+    (flet ((register-byte (byte code-point)
+             (setf (gethash (code-char code-point) table) byte)))
+      (mapc (lambda (byte)
+              (register-byte byte byte))
+            (append (loop for value from 33 to 126 collect value)
+                    (loop for value from 161 to 172 collect value)
+                    (loop for value from 174 to 255 collect value)))
+      (dotimes (byte 256 table)
+        (unless (or (<= 33 byte 126)
+                    (<= 161 byte 172)
+                    (<= 174 byte 255))
+          (register-byte byte extra-code-point)
+          (incf extra-code-point))))))
+
+(defun gpt2-unicode-byte-table ()
+  (or *gpt2-unicode-byte-table*
+      (setf *gpt2-unicode-byte-table*
+            (make-gpt2-unicode-byte-table))))
+
+(defun gpt2-token-string-to-octets (token-string)
+  (let ((table (gpt2-unicode-byte-table))
+        (octets (make-array (length token-string) :element-type '(unsigned-byte 8))))
+    (dotimes (index (length token-string) octets)
+      (declare (fixnum index))
+      (let* ((character (char token-string index))
+             (octet (gethash character table)))
+        (unless octet
+          (error "No GPT2 byte mapping found for character ~s in token ~s."
+                 character
+                 token-string))
+        (setf (aref octets index) octet)))))
+
+(defun detokenize-token-id (kv-pairs token-id)
+  (normalize-token-text kv-pairs (raw-token-text kv-pairs token-id)))
 
 (defun detokenize-token-ids (kv-pairs token-ids &optional (stream *standard-output*))
-  (let ((text (with-output-to-string (buffer)
-                (dolist (token-id token-ids)
-                  (write-string (detokenize-token-id kv-pairs token-id) buffer)))))
+  (let ((text (if (gpt2-tokenizer-p kv-pairs)
+                  (let ((octet-list '()))
+                    (dolist (token-id token-ids)
+                      (let ((token-octets (gpt2-token-string-to-octets
+                                           (raw-token-text kv-pairs token-id))))
+                        (map nil (lambda (octet)
+                                   (push octet octet-list))
+                             token-octets)))
+                    (octets-to-utf8-string
+                     (coerce (nreverse octet-list) '(simple-array (unsigned-byte 8) (*)))))
+                  (with-output-to-string (buffer)
+                    (dolist (token-id token-ids)
+                      (write-string (detokenize-token-id kv-pairs token-id) buffer))))))
     (write-string text stream)
     text))
 
-(defun normalize-prompt-for-tokenization (prompt)
+(defun normalize-prompt-for-tokenization (prompt &optional kv-pairs)
+  (let ((space-replacement
+         (if (string= (or (and kv-pairs (tokenizer-model kv-pairs)) "")
+                     "gpt2")
+            (code-char #x0120)
+            (code-char #x2581))))
   (map 'string
        (lambda (character)
          (if (char= character #\Space)
-             (code-char #x2581)
+             space-replacement
              character))
-       prompt))
+       prompt)))
 
 (defun tokenizer-model (kv-pairs)
   (gguf-kv-value-or-nil kv-pairs "tokenizer.ggml.model"))
@@ -2578,7 +3579,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
              merges)))
     table))
 
-(defun make-base-token-pieces (prompt token-table)
+(defun make-base-token-pieces (kv-pairs prompt token-table)
   (map 'list
        (lambda (character)
          (let* ((token (string character))
@@ -2586,7 +3587,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
            (unless entry
              (error "No base token found for character ~s." token))
            (cons (car entry) token)))
-       (normalize-prompt-for-tokenization prompt)))
+       (normalize-prompt-for-tokenization prompt kv-pairs)))
 
 (defun split-gemma4-bpe-segments (prompt)
   (let ((segments '())
@@ -2710,7 +3711,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
   (let* ((token-id-table (tokenizer-token-id-table kv-pairs))
         (bpe-rank-table (tokenizer-merge-rank-table kv-pairs))
         (special-tokens (tokenizer-special-tokens kv-pairs))
-        (normalized-prompt (normalize-prompt-for-tokenization prompt))
+        (normalized-prompt (normalize-prompt-for-tokenization prompt kv-pairs))
         (token-ids '()))
     (let ((length (length normalized-prompt))
          (cursor 0)
@@ -2745,7 +3746,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
 
 (defun tokenize-greedy-token-prompt (kv-pairs prompt)
   (let* ((token-table (tokenizer-entry-table kv-pairs))
-        (pieces (make-base-token-pieces prompt token-table)))
+        (pieces (make-base-token-pieces kv-pairs prompt token-table)))
     (do ()
        (nil)
       (multiple-value-bind (merge-index merged-id merged-token)

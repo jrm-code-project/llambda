@@ -22,10 +22,12 @@
                           #:hello-message
                           #:load-gemma4-model
                           #:load-llama-model
+                          #:load-qwen2-model
                           #:load-gguf-tensor
                           #:load-gguf-tensor-by-name
                           #:make-gemma4-step-function
                           #:make-llama-step-function
+                          #:make-qwen2-step-function
                           #:map-view-of-file
                           #:print-gguf-file
                           #:print-gguf-floating-point-tables
@@ -82,10 +84,12 @@
   (is (fboundp 'hello-message))
   (is (fboundp 'load-gemma4-model))
   (is (fboundp 'load-llama-model))
+  (is (fboundp 'load-qwen2-model))
   (is (fboundp 'load-gguf-tensor))
   (is (fboundp 'load-gguf-tensor-by-name))
   (is (fboundp 'make-gemma4-step-function))
   (is (fboundp 'make-llama-step-function))
+  (is (fboundp 'make-qwen2-step-function))
   (is (fboundp 'map-view-of-file))
   (is (fboundp 'print-gguf-file))
   (is (fboundp 'read-gguf-header))
@@ -236,6 +240,25 @@
                      ("llama.rope.dimension_count" . 4)))
          (model (load-llama-model nil kv-pairs '((:name "token_embd.weight")))))
     (is (string= "token_embd.weight"
+                 (llambda::gguf-model-output-tensor-name model)))))
+
+(test qwen2-model-loader
+  (let* ((kv-pairs '(("general.architecture" . "qwen2")
+                     ("qwen2.embedding_length" . 16)
+                     ("qwen2.block_count" . 2)
+                     ("qwen2.attention.head_count" . 4)
+                     ("qwen2.attention.head_count_kv" . 2)
+                     ("qwen2.feed_forward_length" . 32)
+                     ("qwen2.attention.layer_norm_rms_epsilon" . 1.0e-5)
+                     ("qwen2.rope.freq_base" . 1000000.0)))
+         (model (load-qwen2-model
+                 nil
+                 kv-pairs
+                 '((:name "token_embd.weight") (:name "output.weight")))))
+    (is (string= "qwen2" (llambda::gguf-model-architecture model)))
+    (is (= 16 (llambda::gguf-model-hidden-size model)))
+    (is (= 4 (llambda::gguf-model-rope-dimension model)))
+    (is (string= "output.weight"
                  (llambda::gguf-model-output-tensor-name model)))))
 
 (test sampling-primitives
@@ -1345,6 +1368,18 @@
     (is (equal '(6 9)
                (tokenize-prompt kv-pairs "12345" :add-bos nil)))))
 
+(test tokenize-prompt-qwen2-number-boundaries
+  (let ((kv-pairs
+          '(("tokenizer.ggml.model" . "gpt2")
+            ("tokenizer.ggml.pre" . "qwen2")
+            ("tokenizer.ggml.tokens"
+             . ("1" "2" "3" "4" "5" "12" "123" "1234" "12345"))
+            ("tokenizer.ggml.token_type" . (1 1 1 1 1 1 1 1 1))
+            ("tokenizer.ggml.merges"
+             . ("1 2" "12 3" "123 4" "1234 5")))))
+    (is (equal '(0 1 2 3 4)
+               (tokenize-prompt kv-pairs "12345" :add-bos nil)))))
+
 (test maybe-prepare-prompt-for-generation-llama
   (let ((kv-pairs '(("tokenizer.ggml.model" . "gpt2")
                    ("tokenizer.ggml.pre" . "llama-bpe")
@@ -1356,6 +1391,27 @@
       (is (search "Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
                  prepared-prompt))
       (is (null effective-add-bos)))))
+
+(test maybe-prepare-prompt-for-generation-qwen2
+  (let ((kv-pairs '(("tokenizer.ggml.model" . "gpt2")
+                    ("tokenizer.ggml.pre" . "qwen2")
+                    ("tokenizer.chat_template" . "dummy"))))
+    (multiple-value-bind (prepared-prompt effective-add-bos)
+        (llambda::maybe-prepare-prompt-for-generation kv-pairs "Hello" t)
+      (is (search "<|im_start|>system" prepared-prompt))
+      (is (search (format nil "<|im_start|>user~%Hello<|im_end|>")
+                  prepared-prompt))
+      (is (search "<|im_start|>assistant" prepared-prompt))
+      (is (null effective-add-bos)))))
+
+(test resolve-stop-token-ids-qwen2
+  (let ((kv-pairs '(("tokenizer.ggml.model" . "gpt2")
+                    ("tokenizer.ggml.pre" . "qwen2")
+                    ("tokenizer.ggml.tokens"
+                     . ("text" "<|endoftext|>" "<|im_start|>" "<|im_end|>"))
+                    ("tokenizer.ggml.token_type" . (1 3 3 3)))))
+    (is (equal '(1 2 3)
+               (llambda::resolve-stop-token-ids kv-pairs)))))
 
 (test maybe-prepare-prompt-for-generation-gemma4
   (let ((kv-pairs '(("tokenizer.ggml.model" . "gemma4")

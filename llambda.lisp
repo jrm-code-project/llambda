@@ -870,9 +870,17 @@
        (string= (or (gguf-kv-value-or-nil kv-pairs "tokenizer.ggml.pre") "")
                 "llama-bpe")))
 
+(defun qwen2-tokenizer-p (kv-pairs)
+  (and (string= (or (tokenizer-model kv-pairs) "") "gpt2")
+       (string= (or (gguf-kv-value-or-nil kv-pairs "tokenizer.ggml.pre") "")
+                "qwen2")))
+
 (defun llama3-chat-prompt-p (prompt)
   (or (search "<|begin_of_text|>" prompt)
       (search "<|start_header_id|>" prompt)))
+
+(defun qwen2-chat-prompt-p (prompt)
+  (search "<|im_start|>" prompt))
 
 (defun gemma4-chat-template-uses-channel-p (chat-template)
   (when chat-template
@@ -910,6 +918,15 @@
               nil))
       ((and (llama3-tokenizer-p kv-pairs)
             (search "<|begin_of_text|>" prompt))
+       (values prompt nil))
+      ((and (qwen2-tokenizer-p kv-pairs)
+            chat-template
+            (not (qwen2-chat-prompt-p prompt)))
+       (values (format nil
+                       "<|im_start|>system~%You are a helpful assistant.<|im_end|>~%<|im_start|>user~%~a<|im_end|>~%<|im_start|>assistant~%"
+                       prompt)
+               nil))
+      ((qwen2-tokenizer-p kv-pairs)
        (values prompt nil))
       (t
        (values prompt add-bos)))))
@@ -970,6 +987,15 @@
               (gethash token token-id-table)
             (when presentp
               (push token-id stop-token-ids))))))
+    (when (qwen2-tokenizer-p kv-pairs)
+      (let ((token-types (gguf-kv-value-or-nil kv-pairs "tokenizer.ggml.token_type"))
+            (token-id 0))
+        (when token-types
+          (dolist (token-type token-types)
+            (when (and (integerp token-type)
+                       (<= 3 token-type))
+              (push token-id stop-token-ids))
+            (incf token-id)))))
     (nreverse (remove-duplicates stop-token-ids :test #'=))))
 
 (defun test-gguf-file-response (pathname
@@ -1006,6 +1032,8 @@
                                             (load-qwen3next-model mapping kv-pairs tensor-infos))
                                            ((string= architecture "llama")
                                             (load-llama-model mapping kv-pairs tensor-infos))
+                                           ((string= architecture "qwen2")
+                                            (load-qwen2-model mapping kv-pairs tensor-infos))
                                            (t nil))))
                              (effective-step-function (or step-function
                                                           (and model
@@ -1015,6 +1043,7 @@
                                                                  (:NEMOTRON_H_MOE (make-nemotron-h-moe-step-function model))
                                                                  (:QWEN3NEXT (make-qwen3next-step-function model))
                                                                  (:LLAMA (make-llama-step-function model))
+                                                                 (:QWEN2 (make-qwen2-step-function model))
                                                                  (otherwise nil)))))
                              (effective-kv-cache (or kv-cache (make-hash-table)))
                              (effective-eos-token-id
@@ -3972,6 +4001,34 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                           (gguf-model-load-vector-tensor model "output_norm.weight")
                           :epsilon norm-epsilon)))))))
 
+(defun load-qwen2-model (mapping kv-pairs tensor-infos)
+  (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
+    (unless (string= architecture "qwen2")
+      (error "LOAD-QWEN2-MODEL only supports general.architecture = \"qwen2\", got ~s."
+             architecture))
+    (let* ((tensor-info-table (make-tensor-info-table tensor-infos))
+           (hidden-size (gguf-kv-value kv-pairs "qwen2.embedding_length"))
+           (head-count (gguf-kv-value kv-pairs "qwen2.attention.head_count")))
+      (make-gguf-model
+       :mapping mapping
+       :kv-pairs kv-pairs
+       :tensor-infos tensor-infos
+       :tensor-info-table tensor-info-table
+       :tensor-cache (make-hash-table :test #'equal)
+       :architecture architecture
+       :hidden-size hidden-size
+       :layer-count (gguf-kv-value kv-pairs "qwen2.block_count")
+       :head-count head-count
+       :kv-head-count (gguf-kv-value kv-pairs "qwen2.attention.head_count_kv")
+       :ffn-size (gguf-kv-value kv-pairs "qwen2.feed_forward_length")
+       :norm-epsilon (gguf-kv-value kv-pairs "qwen2.attention.layer_norm_rms_epsilon")
+       :rope-base (gguf-kv-value kv-pairs "qwen2.rope.freq_base")
+       :rope-dimension (or (gguf-kv-value-or-nil kv-pairs "qwen2.rope.dimension_count")
+                           (/ hidden-size head-count))
+       :output-tensor-name (if (gethash "output.weight" tensor-info-table)
+                               "output.weight"
+                               "token_embd.weight")))))
+
 (defun load-llama-model (mapping kv-pairs tensor-infos)
   (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
     (unless (string= architecture "llama")
@@ -3997,7 +4054,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                               "output.weight"
                               "token_embd.weight")))))
 
-(defun make-llama-step-function (model)
+(defun make-llama-step-function (model &key qkv-bias-p)
   (let* ((head-count (gguf-model-head-count model))
          (kv-head-count (gguf-model-kv-head-count model))
          (hidden-size (gguf-model-hidden-size model))
@@ -4080,6 +4137,22 @@ It extracts the underlying simple arrays once before entering the loop to elimin
              k model (make-layer-tensor-name layer-index "attn_k") attn-input)
             (gguf-model-matrix-vector-multiply-into
              v model (make-layer-tensor-name layer-index "attn_v") attn-input)
+            (when qkv-bias-p
+              (vector-add-into
+               q q
+               (gguf-model-load-vector-tensor
+                model
+                (make-layer-tensor-path layer-index "attn_q.bias")))
+              (vector-add-into
+               k k
+               (gguf-model-load-vector-tensor
+                model
+                (make-layer-tensor-path layer-index "attn_k.bias")))
+              (vector-add-into
+               v v
+               (gguf-model-load-vector-tensor
+                model
+                (make-layer-tensor-path layer-index "attn_v.bias"))))
             (dotimes (head-index head-count)
               (apply-rope-head-in-place (aref q-heads head-index)
                                        position
@@ -4134,6 +4207,12 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                           x
                           (gguf-model-load-vector-tensor model "output_norm.weight")
                           :epsilon norm-epsilon)))))))
+
+(defun make-qwen2-step-function (model)
+  (unless (string= (gguf-model-architecture model) "qwen2")
+    (error "MAKE-QWEN2-STEP-FUNCTION requires a qwen2 model, got ~s."
+           (gguf-model-architecture model)))
+  (make-llama-step-function model :qkv-bias-p t))
 
 (defun load-gemma4-model (mapping kv-pairs tensor-infos)
   (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
@@ -4956,7 +5035,8 @@ It extracts the underlying simple arrays once before entering the loop to elimin
         (append-fragment-token-ids fragment-start length)))
     (nreverse token-ids)))
 
-(defun tokenize-gpt2-text-fragment (fragment token-id-table bpe-rank-table)
+(defun tokenize-gpt2-text-fragment (fragment token-id-table bpe-rank-table
+                                    pre-tokenizer)
   (labels ((letter-p (character)
              (alpha-char-p character))
            (number-p (character)
@@ -5003,11 +5083,10 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                                     (letter-p (char fragment (1+ cursor))))
                                (emit (consume-while (1+ cursor) #'letter-p)))
                               ((number-p character)
-                               (emit (min fragment-length
-                                          (+ cursor
-                                             (min 3
-                                                  (- (consume-while cursor #'number-p)
-                                                     cursor))))))
+                               (let ((number-end (consume-while cursor #'number-p)))
+                                 (emit (if (string= pre-tokenizer "qwen2")
+                                           (1+ cursor)
+                                           (min number-end (+ cursor 3))))))
                               ((or (symbol-p character)
                                    (and (char= character #\Space)
                                         (< (1+ cursor) fragment-length)
@@ -5081,7 +5160,9 @@ It extracts the underlying simple arrays once before entering the loop to elimin
         (token-ids '())
         (cursor 0)
         (fragment-start 0)
-        (prompt-length (length prompt)))
+        (prompt-length (length prompt))
+        (pre-tokenizer (or (gguf-kv-value-or-nil kv-pairs "tokenizer.ggml.pre")
+                           "")))
     (labels ((append-fragment (start end)
                (when (< start end)
                  (setf token-ids
@@ -5089,7 +5170,8 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                               (tokenize-gpt2-text-fragment
                                (subseq prompt start end)
                                token-id-table
-                               bpe-rank-table))))))
+                               bpe-rank-table
+                               pre-tokenizer))))))
       (loop while (< cursor prompt-length)
             for special-token = (find-matching-special-token prompt cursor special-tokens)
             do (if special-token

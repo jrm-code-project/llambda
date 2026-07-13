@@ -27,8 +27,18 @@ Lisp.
 *   **Multi-Threaded Execution:** The outer loop of the GEMV processing is fully parallelized via `lparallel`, saturating modern multi-core memory buses (e.g., 24-core Ryzen processors) with isolated, lock-free writes.
 *   **Zero-Drift KV Cache:** Safe, shared-KV reuse and perfectly aligned RoPE scaling. Exact-logit replay tests against fresh un-cached generations yield a `max_diff` of `0.0`.
 *   **Advanced Sampling:** Built-in Top-K, Top-P (Nucleus), and repetition penalties executing in-place with zero heap allocation in the hot path.
-*   **Gemma4 Support:** Full support for Gemma4 architectures, including BPE tokenization, proper instruction-tuning chat templates (`<bos><|turn>user...`), and explicit tool-calling channel overrides. 
-*   **Llama 3.1 Support:** Native grouped-query attention, scaled RoPE, byte-level BPE, and instruct chat-template handling for Llama 3.1 GGUF models.
+
+### Supported architectures
+
+Architecture selection uses the GGUF `general.architecture` metadata value.
+
+| GGUF architecture | Supported model family and execution path |
+| --- | --- |
+| `gemma4` | Gemma 4 base/instruct models with sliding/global attention, shared KV layers, Gemma BPE, and chat formatting |
+| `llama` | Llama 3.1 layouts with grouped-query attention, scaled RoPE, SwiGLU, byte-level BPE, and instruct formatting |
+| `qwen2` | Dense Qwen2 models with grouped-query attention, Q/K/V biases, SwiGLU, Qwen2 byte-level BPE, and ChatML formatting |
+| `qwen3next` | Qwen3Next hybrid attention/recurrent models with dense or routed MoE feed-forward layers |
+| `nemotron_h_moe` | Nemotron-H MoE hybrid attention/recurrent models with routed and shared experts |
 
   ## Requirements
 
@@ -64,7 +74,7 @@ vectors on the heap, performance will catastrophically collapse.
 *   [x] Gemma4 Base & Instruct (Verified)
 *   [x] Top-K / Top-P / Rep-Pen Sampler
 *   [x] AVX2/FMA `Q4_K_M` and `Q6_K` paths
-*   [x] Qwen3Next and Nemotron-H MoE inference
+*   [x] Qwen2, Qwen3Next, and Nemotron-H MoE inference
 *   [x] Llama 3.1 architecture and instruct tokenization
 
   ## Author **Joe Marshall**

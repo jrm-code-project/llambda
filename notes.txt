@@ -25,6 +25,32 @@ Q6_K.  Q4_K, Q5_K, and Q6_K matrix-vector operations use specialized kernels;
 the Q4_K and Q6_K hot loops use SBCL AVX2/FMA SIMD.  Large row sets run through
 a persistent lparallel kernel (24 workers by default, enabled at 96 rows).
 
+Performance limitations
+-----------------------
+
+Token generation is primarily limited by memory bandwidth rather than floating
+point throughput.  Each autoregressive step streams most of the model weights
+from memory, while performing comparatively little arithmetic per weight.  Once
+the worker threads saturate the memory bus, adding cores or arithmetic
+instructions cannot materially improve throughput.  In particular,
+parallelizing dot-product rows does not produce a linear speedup: additional
+workers initially improve throughput, but the gains taper off once they
+collectively exhaust available memory bandwidth.
+
+The quantized kernels therefore consume packed weights directly from the mapped
+GGUF file and unpack each block as part of the dot product.  Unpacking 4-, 5-,
+or 6-bit values in registers is cheaper than first expanding the model to
+32-bit floats and then fetching those floats from memory.  Pre-dequantization
+would increase the weight traffic by several times, require a much larger
+working set, and reduce effective cache capacity.  The saved memory bandwidth
+more than compensates for the integer bit extraction, scale reconstruction,
+and float conversion performed by the fused kernels.
+
+This tradeoff applies to large matrix weights that are streamed for every
+token.  Small vectors such as normalization weights are still converted to
+single-float arrays and cached because they are repeatedly reused and readily
+fit in cache.
+
 Inference architecture
 ----------------------
 
@@ -38,6 +64,8 @@ The current architecture loaders and forward passes are:
     per-layer embeddings, Gemma BPE, and Gemma chat formatting.
   * Llama 3.1, including grouped-query attention, scaled RoPE, SwiGLU, the
     llama-bpe pre-tokenizer, GPT-2 byte-level BPE, and instruct chat formatting.
+  * Qwen2, including grouped-query attention with Q/K/V biases, SwiGLU, the
+    Qwen2 byte-level BPE pre-tokenizer, and ChatML-style prompt formatting.
   * Qwen3Next, including its hybrid attention/recurrent layers and MoE path.
   * Nemotron-H MoE, including attention, recurrent SSM, and routed FFN layers.
 

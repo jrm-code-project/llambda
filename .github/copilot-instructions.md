@@ -27,9 +27,9 @@ runtime. It runs quantized models directly in SBCL rather than wrapping
   - GGUF parsing, metadata decoding, tensor discovery, and tensor dequantization/loading
   - AVX2/FMA and `lparallel` numeric kernels for quantized matrix-vector operations
   - Tokenization, prompt evaluation, sampling, and decode loops
-  - Architecture-specific Gemma 4, Llama 3.1, Qwen3Next, and Nemotron-H MoE loaders and step functions
+  - Architecture-specific Gemma 4, Llama 3.1, Qwen2, Qwen3Next, and Nemotron-H MoE loaders and step functions
 - Main runtime flow is: open a GGUF with `call-with-file`/`with-file-handle` -> map it with `call-with-mapped-file`/`with-mapped-file` -> parse header, metadata, and tensor infos -> construct a `gguf-model` for a supported architecture -> evaluate prompt tokens and decode against its step function.
-- `test-gguf-file-response` is the end-to-end dispatcher. It selects the Gemma 4, Llama, Qwen3Next, or Nemotron-H MoE loader from `general.architecture`, then creates the matching step function.
+- `test-gguf-file-response` is the end-to-end dispatcher. It selects the Gemma 4, Llama, Qwen2, Qwen3Next, or Nemotron-H MoE loader from `general.architecture`, then creates the matching step function.
 - Generic GGUF storage is shared through `gguf-model`: tensor metadata is indexed by name and loaded vectors are cached. Architecture loaders interpret their own metadata and tensor names; their step functions implement attention, recurrent/SSM, dense FFN, or MoE layers as required.
 - Generation state is separated from model construction: `evaluate-prompt` advances prompt tokens, `generate-token-loop` samples and decodes continuation tokens, the caller-supplied `kv-cache` stores attention and recurrent state, and a step function closes over a reusable `compute-buffer`.
 - `tests.lisp` is not only smoke tests. It exercises Windows file/mmap helpers, numeric kernels, GGUF parsing, tensor loading, tokenization, and end-to-end generation behavior through FiveAM.

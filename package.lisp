@@ -31,10 +31,12 @@
            #:find-gguf-tensor-info
            #:load-gemma4-model
            #:load-llama-model
+           #:load-qwen2-model
            #:load-gguf-tensor
            #:load-gguf-tensor-by-name
            #:make-gemma4-step-function
            #:make-llama-step-function
+           #:make-qwen2-step-function
            #:map-view-of-file
            #:main
            #:print-gguf-file

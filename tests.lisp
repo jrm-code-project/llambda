@@ -15,19 +15,31 @@
                           #:detokenize-token-id
                           #:detokenize-token-ids
                           #:decode-next-token
+                          #:default-npu-cache-directory
+                          #:enable-model-npu-projections
+                          #:enable-model-npu-layer-projections
+                          #:ensure-model-npu-projection
                           #:evaluate-prompt
+                          #:export-model-npu-projection
                           #:find-gguf-tensor-info
                           #:generate-from-prompt
                           #:generate-token-loop
                           #:hello-message
                           #:load-gemma4-model
                           #:load-llama-model
+                          #:load-npu-backend
                           #:load-qwen2-model
                           #:load-gguf-tensor
                           #:load-gguf-tensor-by-name
                           #:make-gemma4-step-function
                           #:make-llama-step-function
                           #:make-qwen2-step-function
+                          #:model-npu-layer-projection-names
+                          #:npu-backend-available-p
+                          #:npu-backend-runtime-version
+                          #:register-model-npu-projection
+                          #:clear-model-npu-projections
+                          #:unregister-model-npu-projection
                           #:map-view-of-file
                           #:print-gguf-file
                           #:print-gguf-floating-point-tables
@@ -77,19 +89,31 @@
   (is (fboundp 'detokenize-token-id))
   (is (fboundp 'detokenize-token-ids))
   (is (fboundp 'decode-next-token))
+  (is (fboundp 'default-npu-cache-directory))
+  (is (fboundp 'enable-model-npu-projections))
+  (is (fboundp 'enable-model-npu-layer-projections))
+  (is (fboundp 'ensure-model-npu-projection))
   (is (fboundp 'evaluate-prompt))
+  (is (fboundp 'export-model-npu-projection))
   (is (fboundp 'find-gguf-tensor-info))
   (is (fboundp 'generate-from-prompt))
   (is (fboundp 'generate-token-loop))
   (is (fboundp 'hello-message))
   (is (fboundp 'load-gemma4-model))
   (is (fboundp 'load-llama-model))
+  (is (fboundp 'load-npu-backend))
   (is (fboundp 'load-qwen2-model))
   (is (fboundp 'load-gguf-tensor))
   (is (fboundp 'load-gguf-tensor-by-name))
   (is (fboundp 'make-gemma4-step-function))
   (is (fboundp 'make-llama-step-function))
   (is (fboundp 'make-qwen2-step-function))
+  (is (fboundp 'model-npu-layer-projection-names))
+  (is (fboundp 'npu-backend-available-p))
+  (is (fboundp 'npu-backend-runtime-version))
+  (is (fboundp 'register-model-npu-projection))
+  (is (fboundp 'clear-model-npu-projections))
+  (is (fboundp 'unregister-model-npu-projection))
   (is (fboundp 'map-view-of-file))
   (is (fboundp 'print-gguf-file))
   (is (fboundp 'read-gguf-header))
@@ -227,6 +251,7 @@
     (is (= 4 (llambda::gguf-model-head-count model)))
     (is (= 2 (llambda::gguf-model-kv-head-count model)))
     (is (= 32 (llambda::gguf-model-ffn-size model)))
+    (is (hash-table-p (llambda::gguf-model-npu-projections model)))
     (is (string= "output.weight"
                  (llambda::gguf-model-output-tensor-name model))))
   (let* ((kv-pairs '(("general.architecture" . "llama")
@@ -254,12 +279,52 @@
          (model (load-qwen2-model
                  nil
                  kv-pairs
-                 '((:name "token_embd.weight") (:name "output.weight")))))
+                 '((:name "token_embd.weight")
+                   (:name "output.weight")
+                   (:name "blk.0.attn_k.weight")
+                   (:name "blk.0.attn_output.weight")))))
     (is (string= "qwen2" (llambda::gguf-model-architecture model)))
     (is (= 16 (llambda::gguf-model-hidden-size model)))
     (is (= 4 (llambda::gguf-model-rope-dimension model)))
+    (is (equal '("blk.0.attn_k.weight"
+                 "blk.0.attn_output.weight")
+               (model-npu-layer-projection-names
+                model
+                '(0)
+                :roles '(:attention-key :attention-output))))
     (is (string= "output.weight"
                  (llambda::gguf-model-output-tensor-name model)))))
+
+(test npu-bf16-export-primitives
+  (is (= #x3f80 (llambda::single-float-to-bf16-bits 1.0f0)))
+  (is (= #xc000 (llambda::single-float-to-bf16-bits -2.0f0)))
+  (is (= #x3f80 (llambda::single-float-to-bf16-bits 1.001f0))))
+
+(test npu-soft-fallback
+  (let ((disabled-p nil))
+    (handler-bind ((warning #'muffle-warning))
+      (is (eq :cpu
+              (llambda::call-with-npu-runtime-fallback
+               (lambda ()
+                 (llambda::npu-backend-error "simulated bridge failure"))
+               (lambda () :cpu)
+               (lambda () (setf disabled-p t))
+               "test.weight")))
+      (is (not (null disabled-p)))
+      (is (null
+           (llambda::call-with-npu-setup-fallback
+            (lambda () (error "simulated missing bridge")))))
+      (let ((model
+              (llambda::make-gguf-model
+               :architecture "test"
+               :layer-count 1
+               :tensor-info-table (make-hash-table :test #'equal))))
+        (is (null
+             (llambda::try-enable-model-npu-projections
+              model
+              nil
+              :layer-indices '(0)
+              :projection-roles '(:attention-key))))))))
 
 (test sampling-primitives
   (flet ((approx= (left right &optional (epsilon 1.0e-5))
@@ -1643,6 +1708,9 @@ Hello<turn|>
                                   (test-gguf-file-response temp-path
                                                            :step-function step-function
                                                            :kv-cache (make-hash-table)
+                                                           :use-npu nil
+                                                           :npu-tensor-names
+                                                           '("missing.weight")
                                                            :max-tokens 1
                                                            :random-values '(0.1f0)
                                                            :stream response-stream)

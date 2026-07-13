@@ -46,6 +46,78 @@ working set, and reduce effective cache capacity.  The saved memory bandwidth
 more than compensates for the integer bit extraction, scale reconstruction,
 and float conversion performed by the fused kernels.
 
+Vectorized dot-product inner loop
+---------------------------------
+
+The Q4_K and Q6_K dot-product kernels use SBCL's sb-simd AVX2 and FMA
+operations explicitly.  Their expansion macros unroll the block body at compile
+time, so the generated inner loop does not dispatch on tensor formats or walk a
+generic sequence of quantized values.
+
+Each f32.8 value holds eight single-precision lanes.  The Q4_K loop reads eight
+packed bytes, extracts their low and high nibbles, converts those quantized
+values into two eight-lane float vectors, and applies the block scales and
+minimum offsets with packed arithmetic.  It loads the corresponding activation
+values eight at a time with f32.8-aref, then uses nested f32.8-fmadd operations
+to multiply both weight vectors and accumulate them into the same eight-lane
+running sum.
+
+The Q6_K loop follows the same pattern, reconstructing four groups of signed
+six-bit values from the low-nibble and high-bit streams.  Four packed weight
+vectors and four packed activation vectors feed a chain of fused
+multiply-adds.  Keeping eight independent partial sums in vector registers
+avoids a scalar reduction after every group; f32.8-horizontal+ reduces the
+accumulator only once after all blocks in a tensor row have been processed.
+
+Aggressive type declarations and the `(speed 3) (safety 0)` policy keep the hot
+path on unboxed single floats and fixnums, allowing SBCL to emit packed AVX2
+loads, arithmetic, and FMA instructions without generic arithmetic or
+per-element array dispatch.  This maximizes computation performed per memory
+transaction, although total model throughput still reaches the memory-bandwidth
+ceiling described above.
+
+Representative SBCL disassembly
+-------------------------------
+
+The following excerpt was produced on Windows x86-64 with SBCL 2.6.5 by
+evaluating:
+
+    (disassemble #'llambda::dot-product-with-q4-k-m-tensor-data)
+
+Addresses and register allocation can change between builds, but this section
+is the generated body for one unrolled Q4_K group.  The first pair of
+VMULPS/VSUBPS instructions applies a block scale and minimum offset to an
+eight-lane weight vector.  The second pair does the same for the other nibble
+stream, after which two VMOVUPS instructions load 16 activations and two
+VFMADD213PS instructions accumulate both products.
+
+    ; B895: C4E36518C101     VINSERTF128 YMM0, YMM3, YMM1, 1
+    ; B89B: C5FC59C6         VMULPS YMM0, YMM0, YMM6
+    ; B89F: C57C5CFF         VSUBPS YMM15, YMM0, YMM7
+    ...
+    ; B954: C4E36518C101     VINSERTF128 YMM0, YMM3, YMM1, 1
+    ; B95A: C4C17C59C0       VMULPS YMM0, YMM0, YMM8
+    ; B95F: C4C17C5CD1       VSUBPS YMM2, YMM0, YMM9
+    ; B964: 488B46F9         MOV RAX, [RSI-7]
+    ; B968: 488D4F0E         LEA RCX, [RDI+14]
+    ; B96C: 4839C8           CMP RAX, RCX
+    ; B96F: 0F864E2A0000     JBE L3
+    ; B975: C5FC104C7E01     VMOVUPS YMM1, [RSI+RDI*2+1]
+    ; B97B: 488D4740         LEA RAX, [RDI+64]
+    ; B97F: 488B4EF9         MOV RCX, [RSI-7]
+    ; B983: 488D500E         LEA RDX, [RAX+14]
+    ; B987: 4839D1           CMP RCX, RDX
+    ; B98A: 0F86382A0000     JBE L4
+    ; B990: C5FC105C4601     VMOVUPS YMM3, [RSI+RAX*2+1]
+    ; B996: C46275A8FC       VFMADD213PS YMM15, YMM1, YMM4
+    ; B99B: C4C265A8D7       VFMADD213PS YMM2, YMM3, YMM15
+    ; B9A0: C5FC28E2         VMOVAPS YMM4, YMM2
+
+The integer instructions between the vector operations are SBCL's array bounds
+checks and address calculations for the two activation loads.  The key
+throughput property is that each pair of FMA instructions advances 16 scalar
+products while retaining the running accumulator in a YMM register.
+
 This tradeoff applies to large matrix weights that are streamed for every
 token.  Small vectors such as normalization weights are still converted to
 single-float arrays and cached because they are repeatedly reused and readily
@@ -77,6 +149,93 @@ token.
 
 Sampling supports repetition penalty, top-k, top-p, temperature, architecture
 specific stop tokens, and streamed detokenization.
+
+Experimental Ryzen AI NPU path
+------------------------------
+
+The CPU implementation remains the default runtime.  An optional native
+llambda_npu.dll bridge now provides a flat C ABI over ONNX Runtime and AMD's
+VitisAI execution provider.  Lisp loads the matching ONNX Runtime before the
+bridge, probes provider availability, creates fixed-shape sessions, and passes
+single-float array storage directly through CFFI.  The bridge disables ONNX
+Runtime's CPU execution-provider fallback, so a graph that cannot run on the
+NPU cannot produce a misleading successful NPU benchmark.
+
+The high-level inference entrypoint requires :use-npu t in addition to an
+explicit tensor or layer selection.  Without that flag it neither loads the
+bridge nor creates NPU sessions.  Missing hardware, a disabled provider, a
+missing bridge or ONNX Runtime, conversion failure, and session-creation errors
+produce a warning and leave the complete model on the CPU.  If the native
+bridge reports an error during a matrix operation, llambda removes that
+projection, warns once, and immediately recomputes the same operation with the
+packed CPU kernel.  The provider's internal CPU fallback stays disabled; the
+fallback is explicit in llambda and therefore cannot disguise whether a graph
+actually ran on the NPU.
+
+Each gguf-model has an opt-in table of NPU projections keyed by GGUF tensor
+name.  register-model-npu-projection validates the ONNX input and output sizes
+against the tensor's columns and rows.  The ordinary
+gguf-model-matrix-vector-multiply-into path uses a registered session and
+otherwise retains the existing AVX2 implementation.  Sessions are persistent
+to avoid recompiling graphs for each token and must be released with
+clear-model-npu-projections.
+
+The initial hardware validation used an AMD Ryzen AI 9 HX PRO 370 with the
+DEV_17F0 XDNA2 NPU, Ryzen AI Software 1.7.1, and its ONNX Runtime 1.23.3 build.
+AMD's quicktest and the same model through the CFFI bridge both completed on
+VitisAIExecutionProvider.  With CPU fallback disabled, a synthetic BF16
+5120-by-5120 projection took about 15.3 seconds to create its first session and
+averaged 1.63 ms over 20 warm runs.  The current packed Q4_K AVX2 kernel
+averaged 3.24 ms for blk.0.attn_output.weight of the 5120-wide Qwen2 test
+model.  This is promising but is not yet an end-to-end speedup: the NPU test
+used preconverted BF16 weights and excluded GGUF conversion, cache storage,
+whole-model NPU memory pressure, and token-generation scheduling.
+
+The complete exporter-to-CFFI path was also checked with the real
+blk.0.attn_k.weight Q4_K tensor from that Qwen2 model.  After conversion to a
+1024-by-5120 BF16 Gemm graph, its NPU output differed from the direct packed
+Q4_K CPU result by at most 0.000442 and by 0.000089 on average for the test
+input.  This difference is the expected additional BF16 rounding.
+
+export-model-npu-projection provides the first conversion path.  It
+dequantizes a selected two-dimensional GGUF tensor one row at a time, rounds
+the values to BF16, and invokes native/generate-matmul-model.py to embed those
+row-major weights in a fixed-shape ONNX Gemm graph.  The temporary raw BF16
+stream is removed after the ONNX file is written, while the caller-selected
+ONNX path remains available for later sessions.
+
+ensure-model-npu-projection adds automatic content-addressed cache management.
+The native bridge computes SHA-256 directly over the packed mapped tensor, and
+the cache key also includes dimensions, GGML type, bridge version, generator
+SHA-256, and ONNX Runtime version.  The generated ONNX graph is reused without
+repeating GGUF dequantization.  Graph export writes a unique sibling temporary
+file and uses MoveFileExW with replace and write-through flags only after
+generation succeeds.  enable-model-npu-projections applies this operation to
+an explicit tensor list and transactionally removes sessions it added if a
+later tensor fails.
+
+Ryzen AI Software 1.7.1 accepted cacheDir/cacheKey provider options but did not
+emit reusable compiler artifacts for these generated BF16 Gemm graphs in the
+tested configuration.  Reopening the same cached ONNX graph still took about
+10.2 seconds because VitisAI compiled it again.  Persistent sessions therefore
+remain essential: conversion is cached across processes, while compilation is
+amortized across all token steps in one model lifetime.
+
+INT8 conversion may reduce NPU weight storage further if its accuracy and
+conversion cost are acceptable.  Per-row dispatch remains deliberately
+unsupported; only complete projections are large enough to amortize submission
+and synchronization.  The next integration step is architecture-aware
+selection of a bounded set of projections and end-to-end inference benchmarks;
+blindly converting every tensor would roughly expand quantized model storage
+to BF16 size and create hundreds of expensive VitisAI sessions.
+
+model-npu-layer-projection-names therefore selects an explicit bounded set by
+layer and role, validating every resulting tensor against the loaded
+architecture.  test-gguf-file-response accepts those layer selections or raw
+tensor names, enables the sessions before prompt evaluation, and releases them
+when generation exits.  A real Qwen2 prompt completed through this end-to-end
+path with blk.0.attn_k.weight routed to the NPU and all other projections left
+on the CPU.
 
 Forged-array experiment
 -----------------------

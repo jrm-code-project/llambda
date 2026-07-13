@@ -5,6 +5,9 @@
 
 (cffi:use-foreign-library kernel32)
 
+(cffi:define-foreign-library llambda-npu
+  (:windows (:default "llambda_npu")))
+
 (cffi:defctype handle :pointer)
 (cffi:defctype dword :uint32)
 
@@ -32,6 +35,280 @@
 (defparameter *gemv-kernel* nil)
 (defparameter *gpt2-unicode-byte-table* nil)
 (defparameter *gpt2-byte-unicode-table* nil)
+(defparameter *npu-library* nil)
+(defparameter *npu-runtime-library* nil)
+
+(cffi:defcfun ("SetDllDirectoryW" %set-dll-directory) :boolean
+  (pathname :pointer))
+(cffi:defcfun ("GetDllDirectoryW" %get-dll-directory) dword
+  (buffer-length dword)
+  (buffer :pointer))
+(cffi:defcfun ("MoveFileExW" %move-file-ex) :boolean
+  (existing-path :pointer)
+  (new-path :pointer)
+  (flags dword))
+
+(cffi:defcfun ("llambda_npu_probe" %npu-probe) :int)
+(cffi:defcfun ("llambda_npu_bridge_version" %npu-bridge-version) :string)
+(cffi:defcfun ("llambda_npu_runtime_version" %npu-runtime-version) :string)
+(cffi:defcfun ("llambda_npu_last_error" %npu-last-error) :string)
+(cffi:defcfun ("llambda_npu_sha256" %npu-sha256) :int
+  (data :pointer)
+  (data-size :size)
+  (output :pointer)
+  (output-size :size))
+(cffi:defcfun ("llambda_npu_session_create" %npu-session-create) :int
+  (model-path :string)
+  (cache-dir :string)
+  (cache-key :string)
+  (result :pointer))
+(cffi:defcfun ("llambda_npu_session_destroy" %npu-session-destroy) :void
+  (session :pointer))
+(cffi:defcfun ("llambda_npu_session_input_element_count"
+               %npu-session-input-element-count) :size
+  (session :pointer))
+(cffi:defcfun ("llambda_npu_session_output_element_count"
+               %npu-session-output-element-count) :size
+  (session :pointer))
+(cffi:defcfun ("llambda_npu_session_run" %npu-session-run) :int
+  (session :pointer)
+  (input :pointer)
+  (input-element-count :size)
+  (output :pointer)
+  (output-element-count :size))
+
+(defstruct (npu-session (:constructor %make-npu-session))
+  pointer
+  input-element-count
+  output-element-count)
+
+(define-condition npu-backend-error (simple-error) ())
+
+(defun npu-backend-error (format-control &rest format-arguments)
+  (error 'npu-backend-error
+         :format-control format-control
+         :format-arguments format-arguments))
+
+(defun default-npu-library-pathname ()
+  (asdf:system-relative-pathname
+   :llambda
+   #P"native/build/Release/llambda_npu.dll"))
+
+(defun load-npu-backend (&optional (pathname (default-npu-library-pathname)))
+  (or *npu-library*
+      (let* ((native-pathname (uiop:native-namestring pathname))
+             (directory (uiop:pathname-directory-pathname pathname))
+             (native-directory (uiop:native-namestring directory))
+             (runtime-pathname (merge-pathnames #P"onnxruntime.dll" directory)))
+        (unless (probe-file runtime-pathname)
+          (error "ONNX Runtime was not found beside the NPU bridge at ~a."
+                 runtime-pathname))
+        (cffi:with-foreign-object (previous-directory :uint16 32768)
+          (let* ((previous-length
+                   (%get-dll-directory 32768 previous-directory))
+                 (previous-value
+                   (and (plusp previous-length)
+                        (cffi:foreign-string-to-lisp
+                         previous-directory
+                         :count previous-length
+                         :encoding :utf-16le))))
+            (when (>= previous-length 32768)
+              (error "The existing DLL search directory exceeds 32767 characters."))
+            (unwind-protect
+                (progn
+                  (cffi:with-foreign-string
+                      (directory-pointer native-directory :encoding :utf-16le)
+                    (unless (%set-dll-directory directory-pointer)
+                      (error "SetDllDirectoryW failed for ~a."
+                             native-directory)))
+                  (setf *npu-runtime-library*
+                        (cffi:load-foreign-library
+                         (uiop:native-namestring runtime-pathname)))
+                  (setf *npu-library*
+                        (cffi:load-foreign-library native-pathname)))
+              (if previous-value
+                  (cffi:with-foreign-string
+                      (previous-pointer previous-value :encoding :utf-16le)
+                    (unless (%set-dll-directory previous-pointer)
+                      (error "Unable to restore the DLL search directory.")))
+                  (unless (%set-dll-directory (cffi:null-pointer))
+                    (error "Unable to restore the default DLL search path.")))))))))
+
+(defun require-npu-backend ()
+  (unless *npu-library*
+    (npu-backend-error
+     "The NPU backend is not loaded. Call LOAD-NPU-BACKEND first.")))
+
+(defun npu-backend-available-p ()
+  (require-npu-backend)
+  (let ((result (%npu-probe)))
+    (cond ((= result 1) t)
+          ((zerop result) nil)
+          (t (npu-backend-error
+              "NPU backend probe failed: ~a" (%npu-last-error))))))
+
+(defun npu-backend-runtime-version ()
+  (require-npu-backend)
+  (or (%npu-runtime-version)
+      (npu-backend-error
+       "Unable to query ONNX Runtime: ~a" (%npu-last-error))))
+
+(defun npu-bridge-version ()
+  (require-npu-backend)
+  (or (%npu-bridge-version)
+      (npu-backend-error
+       "Unable to query the NPU bridge version: ~a"
+       (%npu-last-error))))
+
+(defun check-npu-status (status operation)
+  (unless (zerop status)
+    (npu-backend-error "~a failed: ~a" operation (%npu-last-error))))
+
+(defun make-npu-session (model-path &key cache-directory cache-key)
+  (require-npu-backend)
+  (cffi:with-foreign-object (result :pointer)
+    (check-npu-status
+     (%npu-session-create
+      (uiop:native-namestring model-path)
+      (if cache-directory
+          (uiop:native-namestring cache-directory)
+          "")
+      (or cache-key "")
+      result)
+     "NPU session creation")
+    (let ((pointer (cffi:mem-ref result :pointer)))
+      (%make-npu-session
+       :pointer pointer
+       :input-element-count (%npu-session-input-element-count pointer)
+       :output-element-count (%npu-session-output-element-count pointer)))))
+
+(defun close-npu-session (session)
+  (let ((pointer (npu-session-pointer session)))
+    (unless (cffi:null-pointer-p pointer)
+      (%npu-session-destroy pointer)
+      (setf (npu-session-pointer session) (cffi:null-pointer))))
+  nil)
+
+(defun run-npu-session-into (dest session input)
+  (unless (= (length input) (npu-session-input-element-count session))
+    (error "NPU input length ~d does not match session input length ~d."
+           (length input)
+           (npu-session-input-element-count session)))
+  (unless (= (length dest) (npu-session-output-element-count session))
+    (error "NPU output length ~d does not match session output length ~d."
+           (length dest)
+           (npu-session-output-element-count session)))
+  (cffi:with-pointer-to-vector-data (input-pointer input)
+    (cffi:with-pointer-to-vector-data (output-pointer dest)
+      (handler-case
+          (check-npu-status
+           (%npu-session-run (npu-session-pointer session)
+                             input-pointer
+                             (length input)
+                             output-pointer
+                             (length dest))
+           "NPU inference")
+        (npu-backend-error (condition)
+          (error condition))
+        (error (condition)
+          (npu-backend-error
+           "NPU bridge invocation failed: ~a" condition)))))
+  dest)
+
+(defun single-float-to-bf16-bits (value)
+  #+sbcl
+  (let* ((bits (sb-kernel::single-float-bits value))
+         (rounding-bias (+ #x7fff (ldb (byte 1 16) bits))))
+    (ldb (byte 16 16) (+ bits rounding-bias)))
+  #-sbcl
+  (error "BF16 projection export currently requires SBCL."))
+
+(defun write-bf16-le (stream value)
+  (let ((bits (single-float-to-bf16-bits value)))
+    (write-byte (ldb (byte 8 0) bits) stream)
+    (write-byte (ldb (byte 8 8) bits) stream)))
+
+(defun default-npu-model-generator-pathname ()
+  (asdf:system-relative-pathname
+   :llambda
+   #P"native/generate-matmul-model.py"))
+
+(defun replace-file-atomically (source destination)
+  (cffi:with-foreign-string
+      (source-pointer (uiop:native-namestring source) :encoding :utf-16le)
+    (cffi:with-foreign-string
+        (destination-pointer
+         (uiop:native-namestring destination)
+         :encoding :utf-16le)
+      (unless (%move-file-ex source-pointer destination-pointer #x9)
+        (error "MoveFileExW failed while replacing ~a." destination))))
+  destination)
+
+(defun export-model-npu-projection
+    (model tensor-name onnx-path
+     &key
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
+         (dimensions (getf tensor-info :dimensions)))
+    (unless (= 2 (length dimensions))
+      (error "NPU projection export requires a two-dimensional tensor, not ~s."
+             dimensions))
+    (let* ((column-count (tensor-column-count tensor-info))
+           (row-count (tensor-row-count tensor-info))
+           (row (make-array column-count :element-type 'single-float))
+           (raw-path
+             (merge-pathnames
+              (make-pathname
+               :name (format nil "llambda-npu-weights-~d-~d"
+                             (get-universal-time)
+                             (random most-positive-fixnum))
+               :type "bf16")
+              (uiop:temporary-directory)))
+           (temporary-onnx-path
+             (make-pathname
+              :name (format nil "~a-~d"
+                            (or (pathname-name onnx-path) "projection")
+                            (random most-positive-fixnum))
+              :type "onnx.tmp"
+              :defaults onnx-path))
+           (command-prefix
+             (if (listp python-command)
+                 python-command
+                 (list python-command))))
+      (ensure-directories-exist onnx-path)
+      (unwind-protect
+          (progn
+            (with-open-file
+                (stream raw-path
+                        :direction :output
+                        :if-exists :supersede
+                        :element-type '(unsigned-byte 8))
+              (dotimes (row-index row-count)
+                (load-gguf-tensor-row-into
+                 row
+                 (gguf-model-mapping model)
+                 tensor-info
+                 row-index)
+                (dotimes (column-index column-count)
+                  (write-bf16-le stream (aref row column-index)))))
+            (uiop:run-program
+             (append command-prefix
+                     (list (uiop:native-namestring generator-path)
+                           (uiop:native-namestring temporary-onnx-path)
+                           "--rows" (write-to-string row-count)
+                           "--columns" (write-to-string column-count)
+                           "--dtype" "bfloat16"
+                           "--weights" (uiop:native-namestring raw-path)))
+             :output *standard-output*
+             :error-output *error-output*)
+            (replace-file-atomically temporary-onnx-path onnx-path)
+            onnx-path)
+        (when (probe-file raw-path)
+          (delete-file raw-path))
+        (when (probe-file temporary-onnx-path)
+          (delete-file temporary-onnx-path))))))
+
 
 (cffi:defcfun ("CreateFileW" create-file) handle
   (file-name :pointer)
@@ -1011,6 +1288,20 @@
                                  (temperature 1.0)
                                  (max-tokens 256)
                                  random-values
+                                 (use-npu nil)
+                                 npu-tensor-names
+                                 npu-layer-indices
+                                 (npu-projection-roles
+                                   '(:attention-query
+                                     :attention-key
+                                     :attention-value
+                                     :attention-output
+                                     :ffn-gate
+                                     :ffn-up
+                                     :ffn-down))
+                                 (npu-cache-directory
+                                   (default-npu-cache-directory))
+                                 (npu-python-command '("python"))
                                  (stream *standard-output*)
                                  (random-state *random-state*))
   (call-with-file pathname
@@ -1035,6 +1326,10 @@
                                            ((string= architecture "qwen2")
                                             (load-qwen2-model mapping kv-pairs tensor-infos))
                                            (t nil))))
+                             (npu-requested-p
+                               (and use-npu
+                                    (or npu-tensor-names
+                                        npu-layer-indices)))
                              (effective-step-function (or step-function
                                                           (and model
                                                                (case (intern (string-upcase architecture)
@@ -1047,37 +1342,59 @@
                                                                  (otherwise nil)))))
                              (effective-kv-cache (or kv-cache (make-hash-table)))
                              (effective-eos-token-id
-                              (or eos-token-id (resolve-eos-token-id kv-pairs))))
-                        (format stream "Model: ~a~%" pathname)
-                        (format stream "Architecture: ~a~%" architecture)
-                        (format stream "Prompt: ~a~%Response: " prompt)
-                        (unless effective-step-function
-                          (error
-                           "Cannot run prompt against ~a yet: GGUF metadata loaded (~a, ~d tensors), but tensor loading and the real forward-pass step function are not implemented."
-                           pathname
-                           architecture
-                           (getf header :tensor-count)))
-                        (multiple-value-bind (generated-ids generated-text last-logits)
-                            (generate-from-prompt kv-pairs
-                                                 prompt
-                                                 effective-step-function
-                                                 effective-kv-cache
-                                                 :use-thought-channel use-thought-channel
-                                                 :eos-token-id effective-eos-token-id
-                                                 :repetition-penalty repetition-penalty
-                                                 :top-k top-k
-                                                 :top-p top-p
-                                                 :temperature temperature
-                                                 :max-tokens max-tokens
-                                                 :random-values random-values
-                                                 :stream stream
-                                                 :random-state random-state)
-                          (terpri stream)
-                          (values header
-                                 kv-pairs
-                                 generated-ids
-                                 generated-text
-                                 last-logits)))))))
+                              (or eos-token-id (resolve-eos-token-id kv-pairs)))
+                             (npu-active-p nil))
+                        (when (and use-npu (not npu-requested-p))
+                          (warn "NPU acceleration was requested without any usable projections; continuing on the CPU."))
+                        (when npu-requested-p
+                          (setf npu-active-p
+                               (if model
+                                   (try-enable-model-npu-projections
+                                    model
+                                    npu-tensor-names
+                                    :layer-indices npu-layer-indices
+                                    :projection-roles npu-projection-roles
+                                    :cache-directory npu-cache-directory
+                                    :python-command npu-python-command)
+                                   (progn
+                                     (warn "NPU acceleration requires the built-in model loader; continuing on the CPU.")
+                                     nil))))
+                        (unwind-protect
+                            (progn
+                             (format stream "Model: ~a~%" pathname)
+                             (format stream "Architecture: ~a~%" architecture)
+                             (format stream "Prompt: ~a~%Response: " prompt)
+                             (unless effective-step-function
+                               (error
+                                "Cannot run prompt against ~a yet: GGUF metadata loaded (~a, ~d tensors), but tensor loading and the real forward-pass step function are not implemented."
+                                pathname
+                                architecture
+                                (getf header :tensor-count)))
+                             (multiple-value-bind
+                                   (generated-ids generated-text last-logits)
+                                 (generate-from-prompt
+                                  kv-pairs
+                                  prompt
+                                  effective-step-function
+                                  effective-kv-cache
+                                  :use-thought-channel use-thought-channel
+                                  :eos-token-id effective-eos-token-id
+                                  :repetition-penalty repetition-penalty
+                                  :top-k top-k
+                                  :top-p top-p
+                                  :temperature temperature
+                                  :max-tokens max-tokens
+                                  :random-values random-values
+                                  :stream stream
+                                  :random-state random-state)
+                               (terpri stream)
+                               (values header
+                                       kv-pairs
+                                       generated-ids
+                                       generated-text
+                                       last-logits)))
+                          (when (and model npu-active-p)
+                            (clear-model-npu-projections model))))))))
 
 (defun test-llm-response (kv-pairs step-function kv-cache
                            &key
@@ -1445,7 +1762,280 @@ Write a haiku about a hacker drinking coffee.<turn|>
   shared-kv-layers
   per-layer-embedding-size
   final-logit-softcap
-  output-tensor-name)
+  output-tensor-name
+  (npu-projections (make-hash-table :test #'equal)))
+
+(defun register-model-npu-projection
+    (model tensor-name onnx-path &key cache-directory cache-key)
+  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
+         (projections (gguf-model-npu-projections model)))
+    (when (gethash tensor-name projections)
+      (error "Tensor ~s already has an NPU projection." tensor-name))
+    (let ((session (make-npu-session onnx-path
+                                     :cache-directory cache-directory
+                                     :cache-key cache-key)))
+      (unwind-protect
+          (progn
+            (unless (= (tensor-column-count tensor-info)
+                       (npu-session-input-element-count session))
+              (error "NPU input size does not match tensor ~s." tensor-name))
+            (unless (= (tensor-row-count tensor-info)
+                       (npu-session-output-element-count session))
+              (error "NPU output size does not match tensor ~s." tensor-name))
+            (setf (gethash tensor-name projections) session)
+            (setf session nil))
+        (when session
+          (close-npu-session session)))))
+  model)
+
+(defun unregister-model-npu-projection (model tensor-name)
+  (let* ((projections (gguf-model-npu-projections model))
+         (session (gethash tensor-name projections)))
+    (when session
+      (remhash tensor-name projections)
+      (close-npu-session session)))
+  model)
+
+(defun clear-model-npu-projections (model)
+  (maphash (lambda (tensor-name session)
+             (declare (ignore tensor-name))
+             (close-npu-session session))
+           (gguf-model-npu-projections model))
+  (clrhash (gguf-model-npu-projections model))
+  model)
+
+(defun tensor-content-sha256 (model tensor-info)
+  (require-npu-backend)
+  (let ((byte-size (getf tensor-info :byte-size))
+        (data-offset (getf tensor-info :data-offset)))
+    (unless (and byte-size data-offset)
+      (error "Tensor ~s does not have mapped byte-size and offset metadata."
+             (getf tensor-info :name)))
+    (cffi:with-foreign-object (output :char 65)
+      (check-npu-status
+       (%npu-sha256
+        (cffi:inc-pointer (gguf-model-mapping model) data-offset)
+        byte-size
+        output
+        65)
+       "Tensor SHA-256")
+      (cffi:foreign-string-to-lisp output :encoding :ascii))))
+
+(defun byte-vector-sha256 (octets)
+  (cffi:with-foreign-object (output :char 65)
+    (cffi:with-pointer-to-vector-data (input octets)
+      (check-npu-status
+       (%npu-sha256 input (length octets) output 65)
+       "Byte vector SHA-256"))
+    (cffi:foreign-string-to-lisp output :encoding :ascii)))
+
+(defun file-sha256 (pathname)
+  (with-open-file (stream pathname :element-type '(unsigned-byte 8))
+    (let* ((length (file-length stream))
+           (octets (make-array length :element-type '(unsigned-byte 8))))
+      (unless (= length (read-sequence octets stream))
+        (error "Unable to read all bytes from ~a." pathname))
+      (byte-vector-sha256 octets))))
+
+(defun default-npu-cache-directory ()
+  (let ((base (or (uiop:getenv "LOCALAPPDATA")
+                  (uiop:native-namestring (uiop:temporary-directory)))))
+    (merge-pathnames #P"llambda/npu-cache/"
+                     (uiop:ensure-directory-pathname base))))
+
+(defun npu-cache-component (value)
+  (map 'string
+       (lambda (character)
+         (if (or (alphanumericp character)
+                 (char= character #\-)
+                 (char= character #\.))
+             character
+             #\-))
+       value))
+
+(defun model-npu-projection-cache-key
+    (model tensor-info generator-path)
+  (format nil "bridge-~a-generator-~a-ort-~a-ggml-~d-~{~d~^-~}-~a"
+          (npu-cache-component (npu-bridge-version))
+          (file-sha256 generator-path)
+          (npu-cache-component (npu-backend-runtime-version))
+          (getf tensor-info :type-tag)
+          (getf tensor-info :dimensions)
+          (tensor-content-sha256 model tensor-info)))
+
+(defun model-npu-projection-cache-pathnames
+    (model tensor-name &optional (cache-directory
+                                  (default-npu-cache-directory))
+                              (generator-path
+                                (default-npu-model-generator-pathname)))
+  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
+         (cache-key
+           (model-npu-projection-cache-key
+            model tensor-info generator-path))
+         (root (uiop:ensure-directory-pathname cache-directory))
+         (projection-directory
+           (merge-pathnames
+            (make-pathname :directory `(:relative ,cache-key))
+            root)))
+    (values (merge-pathnames #P"projection.onnx" projection-directory)
+            root
+            cache-key)))
+
+(defun ensure-model-npu-projection
+    (model tensor-name
+     &key
+       (cache-directory (default-npu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (when (gethash tensor-name (gguf-model-npu-projections model))
+    (return-from ensure-model-npu-projection (values model nil t)))
+  (multiple-value-bind (onnx-path provider-cache-directory cache-key)
+      (model-npu-projection-cache-pathnames
+       model tensor-name cache-directory generator-path)
+    (let ((reused-p (not (null (probe-file onnx-path)))))
+      (unless reused-p
+        (export-model-npu-projection
+         model tensor-name onnx-path
+         :python-command python-command
+         :generator-path generator-path))
+      (register-model-npu-projection
+       model tensor-name onnx-path
+       :cache-directory provider-cache-directory
+       :cache-key cache-key)
+      (values model onnx-path reused-p))))
+
+(defun enable-model-npu-projections
+    (model tensor-names
+     &key
+       (cache-directory (default-npu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (let ((added-tensor-names '())
+        (completed-p nil))
+    (unwind-protect
+        (progn
+          (dolist (tensor-name tensor-names)
+            (unless (gethash tensor-name
+                             (gguf-model-npu-projections model))
+              (ensure-model-npu-projection
+               model tensor-name
+               :cache-directory cache-directory
+               :python-command python-command
+               :generator-path generator-path)
+              (push tensor-name added-tensor-names)))
+          (setf completed-p t)
+          model)
+      (unless completed-p
+        (dolist (tensor-name added-tensor-names)
+          (unregister-model-npu-projection model tensor-name))))))
+
+(defun call-with-npu-setup-fallback (setup-function)
+  (handler-case
+      (funcall setup-function)
+    (error (condition)
+      (warn "NPU setup failed; continuing on the CPU: ~a" condition)
+      nil)))
+
+(defun try-enable-model-npu-projections
+    (model tensor-names
+     &key
+       layer-indices
+       (projection-roles
+         '(:attention-query
+           :attention-key
+           :attention-value
+           :attention-output
+           :ffn-gate
+           :ffn-up
+           :ffn-down))
+       (cache-directory (default-npu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (call-with-npu-setup-fallback
+   (lambda ()
+     (let ((resolved-tensor-names
+             (remove-duplicates
+              (append tensor-names
+                      (when layer-indices
+                        (model-npu-layer-projection-names
+                         model
+                         layer-indices
+                         :roles projection-roles)))
+              :test #'equal)))
+       (unless resolved-tensor-names
+         (npu-backend-error
+          "NPU acceleration was requested without any projections."))
+     (unless *npu-library*
+       (load-npu-backend))
+     (unless (npu-backend-available-p)
+       (npu-backend-error "NPU acceleration is unavailable."))
+     (enable-model-npu-projections
+      model
+      resolved-tensor-names
+      :cache-directory cache-directory
+      :python-command python-command
+      :generator-path generator-path)
+       t))))
+
+(defparameter +npu-projection-role-suffixes+
+  '((:attention-query . "attn_q.weight")
+    (:attention-key . "attn_k.weight")
+    (:attention-value . "attn_v.weight")
+    (:attention-output . "attn_output.weight")
+    (:ffn-gate . "ffn_gate.weight")
+    (:ffn-up . "ffn_up.weight")
+    (:ffn-down . "ffn_down.weight")))
+
+(defun model-npu-layer-projection-names
+    (model layer-indices
+     &key
+       (roles '(:attention-query
+                :attention-key
+                :attention-value
+                :attention-output
+                :ffn-gate
+                :ffn-up
+                :ffn-down)))
+  (let ((names '()))
+    (dolist (layer-index layer-indices)
+      (unless (and (integerp layer-index)
+                   (<= 0 layer-index)
+                   (< layer-index (gguf-model-layer-count model)))
+        (error "Layer index ~s is invalid for a ~d-layer model."
+               layer-index
+               (gguf-model-layer-count model)))
+      (dolist (role roles)
+        (let ((suffix (cdr (assoc role +npu-projection-role-suffixes+))))
+          (unless suffix
+            (error "Unknown NPU projection role ~s." role))
+          (let ((tensor-name (format nil "blk.~d.~a" layer-index suffix)))
+            (unless (gguf-model-tensor-info model tensor-name)
+              (error "Model architecture ~a has no ~s projection in layer ~d."
+                     (gguf-model-architecture model)
+                     role
+                     layer-index))
+            (push tensor-name names)))))
+    (nreverse names)))
+
+(defun enable-model-npu-layer-projections
+    (model layer-indices
+     &key
+       (roles '(:attention-query
+                :attention-key
+                :attention-value
+                :attention-output
+                :ffn-gate
+                :ffn-up
+                :ffn-down))
+       (cache-directory (default-npu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (enable-model-npu-projections
+   model
+   (model-npu-layer-projection-names model layer-indices :roles roles)
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
 
 (defun make-tensor-info-table (tensor-infos)
   (let ((table (make-hash-table :test #'equal)))
@@ -2705,17 +3295,42 @@ It extracts the underlying simple arrays once before entering the loop to elimin
         (setf (aref dest row-index)
               (dot-product-with-tensor-row mapping tensor-info (+ start-row row-index) vector)))))))
 
+(defun call-with-npu-runtime-fallback
+    (npu-function cpu-function disable-function tensor-name)
+  (handler-case
+      (funcall npu-function)
+    (npu-backend-error (condition)
+      (funcall disable-function)
+      (warn "NPU projection ~s failed and was disabled; recomputing on the CPU: ~a"
+            tensor-name
+            condition)
+      (funcall cpu-function))))
+
 (defun gguf-model-matrix-vector-multiply-into (dest model tensor-name vector)
   (declare (optimize (speed 3) (safety 0))
           (type (simple-array single-float (*)) dest vector))
-  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
-        (row-count (tensor-row-count tensor-info)))
-    (%gguf-model-matrix-vector-multiply-into dest
-                                            (gguf-model-mapping model)
-                                            tensor-info
-                                            vector
-                                            0
-                                            row-count)))
+  (flet ((run-on-cpu ()
+           (let* ((tensor-info
+                    (gguf-model-tensor-info model tensor-name t))
+                  (row-count (tensor-row-count tensor-info)))
+             (%gguf-model-matrix-vector-multiply-into
+              dest
+              (gguf-model-mapping model)
+              tensor-info
+              vector
+              0
+              row-count))))
+    (let ((npu-session
+            (gethash tensor-name (gguf-model-npu-projections model))))
+      (if npu-session
+          (call-with-npu-runtime-fallback
+           (lambda ()
+             (run-npu-session-into dest npu-session vector))
+           #'run-on-cpu
+           (lambda ()
+             (unregister-model-npu-projection model tensor-name))
+           tensor-name)
+          (run-on-cpu)))))
 
 (defun gguf-model-matrix-vector-multiply (model tensor-name vector)
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))

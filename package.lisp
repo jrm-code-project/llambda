@@ -24,19 +24,31 @@
            #:detokenize-token-id
            #:detokenize-token-ids
            #:decode-next-token
+           #:default-npu-cache-directory
+           #:enable-model-npu-projections
+           #:enable-model-npu-layer-projections
+           #:ensure-model-npu-projection
            #:evaluate-prompt
+           #:export-model-npu-projection
            #:generate-from-prompt
            #:generate-token-loop
            #:hello-message
            #:find-gguf-tensor-info
            #:load-gemma4-model
            #:load-llama-model
+           #:load-npu-backend
            #:load-qwen2-model
            #:load-gguf-tensor
            #:load-gguf-tensor-by-name
            #:make-gemma4-step-function
            #:make-llama-step-function
            #:make-qwen2-step-function
+           #:model-npu-layer-projection-names
+           #:npu-backend-available-p
+           #:npu-backend-runtime-version
+           #:register-model-npu-projection
+           #:clear-model-npu-projections
+           #:unregister-model-npu-projection
            #:map-view-of-file
            #:main
            #:print-gguf-file

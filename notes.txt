@@ -1,0 +1,64 @@
+Current implementation notes
+============================
+
+llambda is a Windows-focused Common Lisp runtime that parses GGUF files and
+runs supported quantized language models directly in SBCL.  It does not call
+llama.cpp or another inference library.
+
+GGUF access
+-----------
+
+The active inference path opens files with CreateFileW and maps them read-only
+with CreateFileMappingW and MapViewOfFile.  The GGUF parser reads the header,
+metadata, tensor dimensions, type tags, and aligned data offsets from that
+mapping.
+
+The model is not copied wholesale into the Lisp heap and the main inference
+path does not require forged Lisp arrays.  Matrix-vector kernels address each
+tensor row in the mapped file and decode or dequantize it while computing the
+dot product.  Small vector tensors such as normalization weights and RoPE
+factors are loaded into single-float Lisp arrays on demand and cached by
+gguf-model.
+
+Supported tensor encodings are F32, F16, BF16, Q5_0, Q8_0, Q4_K, Q5_K, and
+Q6_K.  Q4_K, Q5_K, and Q6_K matrix-vector operations use specialized kernels;
+the Q4_K and Q6_K hot loops use SBCL AVX2/FMA SIMD.  Large row sets run through
+a persistent lparallel kernel (24 workers by default, enabled at 96 rows).
+
+Inference architecture
+----------------------
+
+test-gguf-file-response is the end-to-end entrypoint.  It maps the GGUF,
+selects a loader from general.architecture, constructs a model-specific step
+function, tokenizes and evaluates the prompt, and samples continuation tokens.
+
+The current architecture loaders and forward passes are:
+
+  * Gemma 4, including sliding/global attention, shared KV layers, optional
+    per-layer embeddings, Gemma BPE, and Gemma chat formatting.
+  * Llama 3.1, including grouped-query attention, scaled RoPE, SwiGLU, the
+    llama-bpe pre-tokenizer, GPT-2 byte-level BPE, and instruct chat formatting.
+  * Qwen3Next, including its hybrid attention/recurrent layers and MoE path.
+  * Nemotron-H MoE, including attention, recurrent SSM, and routed FFN layers.
+
+Autoregressive state is caller-owned in the KV-cache hash table.  Step
+functions close over a compute-buffer and reuse single-float vectors, fixnum
+vectors, and displaced head views to avoid repeated allocation.  Prompt
+evaluation suppresses vocabulary-logit computation until the final prompt
+token.
+
+Sampling supports repetition penalty, top-k, top-p, temperature, architecture
+specific stop tokens, and streamed detokenization.
+
+Forged-array experiment
+-----------------------
+
+copy-tensors-to-aligned-temp-file and map-gguf-tensors-to-aligned-arrays remain
+in llambda.lisp as an experimental alternative.  They copy tensors into
+64-KiB-aligned chunks of a temporary mapped file, reserve 16 bytes for an SBCL
+array header, and use SBCL internals to expose the mapped payload as arrays.
+
+That experiment is not used by the model loaders or forward-pass step
+functions.  It is SBCL- and Windows-specific, duplicates tensor storage, and
+requires the returned views, mapping handle, and file handle to remain alive
+until the caller explicitly cleans them up.

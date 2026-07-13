@@ -33,6 +33,7 @@ Lisp.
   ## Requirements
 
 *   **SBCL:** You must run a modern SBCL compiled with SIMD support. 
+*   **Operating System:** The current file-mapping layer requires Windows and uses `CreateFileMappingW`/`MapViewOfFile`. Porting it to Unix should be straightforward by replacing the small Windows-specific file and mapping layer with `open`/`mmap` equivalents.
 *   **Hardware:** An x86_64 CPU with AVX2 instruction set support. Multi-core processors heavily recommended to prevent memory-bus starvation.
 *   **Dependencies:** `sb-simd`, `lparallel`.
 

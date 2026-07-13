@@ -31,6 +31,7 @@
 (defparameter *gemv-min-parallel-rows* 96)
 (defparameter *gemv-kernel* nil)
 (defparameter *gpt2-unicode-byte-table* nil)
+(defparameter *gpt2-byte-unicode-table* nil)
 
 (cffi:defcfun ("CreateFileW" create-file) handle
   (file-name :pointer)
@@ -864,6 +865,15 @@
       (search "<turn|>" prompt)
       (search "<bos>" prompt)))
 
+(defun llama3-tokenizer-p (kv-pairs)
+  (and (string= (or (tokenizer-model kv-pairs) "") "gpt2")
+       (string= (or (gguf-kv-value-or-nil kv-pairs "tokenizer.ggml.pre") "")
+                "llama-bpe")))
+
+(defun llama3-chat-prompt-p (prompt)
+  (or (search "<|begin_of_text|>" prompt)
+      (search "<|start_header_id|>" prompt)))
+
 (defun gemma4-chat-template-uses-channel-p (chat-template)
   (when chat-template
     (let* ((model-turn-index (search "<|turn>model" chat-template :from-end t))
@@ -880,8 +890,8 @@
                                           &key
                                             use-thought-channel)
   (let ((chat-template (gguf-kv-value-or-nil kv-pairs "tokenizer.chat_template")))
-    (if (and (string= (or (tokenizer-model kv-pairs) "")
-                   "gemma4")
+    (cond
+      ((and (string= (or (tokenizer-model kv-pairs) "") "gemma4")
             chat-template
             (not (gemma4-chat-prompt-p prompt)))
        (values (if (and use-thought-channel
@@ -890,8 +900,19 @@
                            prompt)
                    (format nil "<bos><|turn>user~%~a<turn|>~%<|turn>model~%"
                            prompt))
-               nil)
-        (values prompt add-bos))))
+              nil))
+      ((and (llama3-tokenizer-p kv-pairs)
+            chat-template
+            (not (llama3-chat-prompt-p prompt)))
+       (values (format nil
+                      "<|begin_of_text|><|start_header_id|>user<|end_header_id|>~%~%~a<|eot_id|><|start_header_id|>assistant<|end_header_id|>~%~%"
+                      prompt)
+              nil))
+      ((and (llama3-tokenizer-p kv-pairs)
+            (search "<|begin_of_text|>" prompt))
+       (values prompt nil))
+      (t
+       (values prompt add-bos)))))
 
 (defun generate-from-prompt (kv-pairs prompt step-function kv-cache
                               &key
@@ -942,6 +963,13 @@
       (let ((turn-end-token-id (gethash "<turn|>" (tokenizer-token-id-table kv-pairs))))
         (when turn-end-token-id
           (push turn-end-token-id stop-token-ids))))
+    (when (llama3-tokenizer-p kv-pairs)
+      (let ((token-id-table (tokenizer-token-id-table kv-pairs)))
+        (dolist (token '("<|eot_id|>" "<|end_of_text|>"))
+          (multiple-value-bind (token-id presentp)
+              (gethash token token-id-table)
+            (when presentp
+              (push token-id stop-token-ids))))))
     (nreverse (remove-duplicates stop-token-ids :test #'=))))
 
 (defun test-gguf-file-response (pathname
@@ -976,6 +1004,8 @@
                                             (load-nemotron-h-moe-model mapping kv-pairs tensor-infos))
                                            ((string= architecture "qwen3next")
                                             (load-qwen3next-model mapping kv-pairs tensor-infos))
+                                           ((string= architecture "llama")
+                                            (load-llama-model mapping kv-pairs tensor-infos))
                                            (t nil))))
                              (effective-step-function (or step-function
                                                           (and model
@@ -984,6 +1014,7 @@
                                                                  (:GEMMA4 (make-gemma4-step-function model))
                                                                  (:NEMOTRON_H_MOE (make-nemotron-h-moe-step-function model))
                                                                  (:QWEN3NEXT (make-qwen3next-step-function model))
+                                                                 (:LLAMA (make-llama-step-function model))
                                                                  (otherwise nil)))))
                              (effective-kv-cache (or kv-cache (make-hash-table)))
                              (effective-eos-token-id
@@ -3941,6 +3972,169 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                           (gguf-model-load-vector-tensor model "output_norm.weight")
                           :epsilon norm-epsilon)))))))
 
+(defun load-llama-model (mapping kv-pairs tensor-infos)
+  (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
+    (unless (string= architecture "llama")
+      (error "LOAD-LLAMA-MODEL only supports general.architecture = \"llama\", got ~s."
+             architecture))
+    (let ((tensor-info-table (make-tensor-info-table tensor-infos)))
+      (make-gguf-model
+       :mapping mapping
+       :kv-pairs kv-pairs
+       :tensor-infos tensor-infos
+       :tensor-info-table tensor-info-table
+       :tensor-cache (make-hash-table :test #'equal)
+       :architecture architecture
+       :hidden-size (gguf-kv-value kv-pairs "llama.embedding_length")
+       :layer-count (gguf-kv-value kv-pairs "llama.block_count")
+       :head-count (gguf-kv-value kv-pairs "llama.attention.head_count")
+       :kv-head-count (gguf-kv-value kv-pairs "llama.attention.head_count_kv")
+       :ffn-size (gguf-kv-value kv-pairs "llama.feed_forward_length")
+       :norm-epsilon (gguf-kv-value kv-pairs "llama.attention.layer_norm_rms_epsilon")
+       :rope-base (gguf-kv-value kv-pairs "llama.rope.freq_base")
+       :rope-dimension (gguf-kv-value kv-pairs "llama.rope.dimension_count")
+       :output-tensor-name (if (gethash "output.weight" tensor-info-table)
+                              "output.weight"
+                              "token_embd.weight")))))
+
+(defun make-llama-step-function (model)
+  (let* ((head-count (gguf-model-head-count model))
+         (kv-head-count (gguf-model-kv-head-count model))
+         (hidden-size (gguf-model-hidden-size model))
+         (head-size (/ hidden-size head-count))
+         (norm-epsilon (gguf-model-norm-epsilon model))
+         (rope-dimension (gguf-model-rope-dimension model))
+         (rope-base (gguf-model-rope-base model))
+         (rope-factors (when (gguf-model-tensor-info model "rope_freqs.weight" nil)
+                         (gguf-model-load-vector-tensor model "rope_freqs.weight")))
+         (attention-scale (coerce (/ (sqrt head-size)) 'single-float))
+         (compute-buffer (make-compute-buffer)))
+    (unless (zerop (mod hidden-size head-count))
+      (error "Llama hidden size ~d is not divisible by head count ~d."
+             hidden-size
+             head-count))
+    (unless (zerop (mod head-count kv-head-count))
+      (error "Llama head count ~d is not divisible by KV head count ~d."
+             head-count
+             kv-head-count))
+    (lambda (token-id position kv-cache)
+      (let ((input-embedding
+              (compute-buffer-vector compute-buffer :llama-input-embedding hidden-size))
+            (x (compute-buffer-vector compute-buffer :llama-x hidden-size)))
+        (gguf-model-token-row-into input-embedding model "token_embd.weight" token-id)
+        (replace x input-embedding)
+        (dotimes (layer-index (gguf-model-layer-count model))
+          (let* ((attn-input
+                   (compute-buffer-vector compute-buffer :llama-attn-input hidden-size))
+                 (q-length
+                   (tensor-row-count
+                    (gguf-model-tensor-info model
+                                           (make-layer-tensor-name layer-index "attn_q")
+                                           t)))
+                 (k-length
+                   (tensor-row-count
+                    (gguf-model-tensor-info model
+                                           (make-layer-tensor-name layer-index "attn_k")
+                                           t)))
+                 (v-length
+                   (tensor-row-count
+                    (gguf-model-tensor-info model
+                                           (make-layer-tensor-name layer-index "attn_v")
+                                           t)))
+                 (q (compute-buffer-vector compute-buffer :llama-q q-length))
+                 (k (compute-buffer-vector compute-buffer :llama-k k-length))
+                 (v (compute-buffer-vector compute-buffer :llama-v v-length))
+                 (q-heads (compute-buffer-chunks compute-buffer :llama-q-heads q head-count))
+                 (k-heads (compute-buffer-chunks compute-buffer :llama-k-heads k kv-head-count))
+                 (v-heads (compute-buffer-chunks compute-buffer :llama-v-heads v kv-head-count))
+                 (attention-context
+                   (compute-buffer-vector compute-buffer :llama-attention-context q-length))
+                 (attention-output
+                   (compute-buffer-vector compute-buffer :llama-attention-output hidden-size))
+                 (ffn-input
+                   (compute-buffer-vector compute-buffer :llama-ffn-input hidden-size))
+                 (ffn-gate
+                   (compute-buffer-vector compute-buffer
+                                         :llama-ffn-gate
+                                         (gguf-model-layer-ffn-size model layer-index)))
+                 (ffn-up
+                   (compute-buffer-vector compute-buffer
+                                         :llama-ffn-up
+                                         (gguf-model-layer-ffn-size model layer-index)))
+                 (ffn-down
+                   (compute-buffer-vector compute-buffer :llama-ffn-down hidden-size)))
+            (unless (= (length (aref q-heads 0))
+                       (length (aref k-heads 0))
+                       (length (aref v-heads 0))
+                       head-size)
+              (error "Llama layer ~d has incompatible Q/K/V head dimensions." layer-index))
+            (rms-norm-into attn-input
+                          x
+                          (gguf-model-load-vector-tensor
+                           model
+                           (make-layer-tensor-name layer-index "attn_norm"))
+                          :epsilon norm-epsilon)
+            (gguf-model-matrix-vector-multiply-into
+             q model (make-layer-tensor-name layer-index "attn_q") attn-input)
+            (gguf-model-matrix-vector-multiply-into
+             k model (make-layer-tensor-name layer-index "attn_k") attn-input)
+            (gguf-model-matrix-vector-multiply-into
+             v model (make-layer-tensor-name layer-index "attn_v") attn-input)
+            (dotimes (head-index head-count)
+              (apply-rope-head-in-place (aref q-heads head-index)
+                                       position
+                                       rope-dimension
+                                       rope-base
+                                       rope-factors))
+            (dotimes (head-index kv-head-count)
+              (apply-rope-head-in-place (aref k-heads head-index)
+                                       position
+                                       rope-dimension
+                                       rope-base
+                                       rope-factors))
+            (vector-scale-into q q attention-scale)
+            (compute-gemma4-attention-into attention-context
+                                          compute-buffer
+                                          model
+                                          layer-index
+                                          layer-index
+                                          position
+                                          q-heads
+                                          k-heads
+                                          v-heads
+                                          kv-cache)
+            (gguf-model-matrix-vector-multiply-into
+             attention-output
+             model
+             (make-layer-tensor-name layer-index "attn_output")
+             attention-context)
+            (vector-add-into x x attention-output)
+            (rms-norm-into ffn-input
+                          x
+                          (gguf-model-load-vector-tensor
+                           model
+                           (make-layer-tensor-name layer-index "ffn_norm"))
+                          :epsilon norm-epsilon)
+            (gguf-model-matrix-vector-multiply-into
+             ffn-gate model (make-layer-tensor-name layer-index "ffn_gate") ffn-input)
+            (gguf-model-matrix-vector-multiply-into
+             ffn-up model (make-layer-tensor-name layer-index "ffn_up") ffn-input)
+            (apply-silu-into ffn-gate ffn-gate)
+            (vector-elementwise-multiply-into ffn-gate ffn-gate ffn-up)
+            (gguf-model-matrix-vector-multiply-into
+             ffn-down model (make-layer-tensor-name layer-index "ffn_down") ffn-gate)
+            (vector-add-into x x ffn-down)))
+        (when *compute-gguf-logits*
+          (gguf-model-matrix-vector-multiply
+           model
+           (gguf-model-output-tensor-name model)
+           (rms-norm-into (compute-buffer-vector compute-buffer
+                                                :llama-output-norm
+                                                hidden-size)
+                          x
+                          (gguf-model-load-vector-tensor model "output_norm.weight")
+                          :epsilon norm-epsilon)))))))
+
 (defun load-gemma4-model (mapping kv-pairs tensor-infos)
   (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
     (unless (string= architecture "gemma4")
@@ -4498,6 +4692,15 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (setf *gpt2-unicode-byte-table*
             (make-gpt2-unicode-byte-table))))
 
+(defun gpt2-byte-unicode-table ()
+  (or *gpt2-byte-unicode-table*
+      (setf *gpt2-byte-unicode-table*
+            (let ((table (make-array 256 :element-type 'character)))
+             (maphash (lambda (character octet)
+                        (setf (aref table octet) character))
+                      (gpt2-unicode-byte-table))
+             table))))
+
 (defun gpt2-token-string-to-octets (token-string)
   (let ((table (gpt2-unicode-byte-table))
         (octets (make-array (length token-string) :element-type '(unsigned-byte 8))))
@@ -4753,6 +4956,157 @@ It extracts the underlying simple arrays once before entering the loop to elimin
         (append-fragment-token-ids fragment-start length)))
     (nreverse token-ids)))
 
+(defun tokenize-gpt2-text-fragment (fragment token-id-table bpe-rank-table)
+  (labels ((letter-p (character)
+             (alpha-char-p character))
+           (number-p (character)
+             (not (null (digit-char-p character))))
+           (symbol-p (character)
+             (and (not (member character '(#\Space #\Tab #\Newline #\Return #\Page)))
+                  (not (letter-p character))
+                  (not (number-p character))))
+           (consume-while (start predicate)
+             (let ((cursor start))
+               (loop while (and (< cursor (length fragment))
+                                (funcall predicate (char fragment cursor)))
+                     do (incf cursor))
+               cursor))
+           (matching-contraction-end (start)
+             (when (char= (char fragment start) #\')
+               (dolist (suffix '("'re" "'ve" "'ll" "'s" "'t" "'m" "'d"))
+                 (let ((end (+ start (length suffix))))
+                   (when (and (<= end (length fragment))
+                              (string-equal suffix fragment
+                                            :start2 start
+                                            :end2 end))
+                     (return end))))))
+           (split-pre-tokens ()
+             (let ((segments '())
+                   (cursor 0)
+                   (fragment-length (length fragment)))
+               (flet ((emit (end)
+                        (push (subseq fragment cursor end) segments)
+                        (setf cursor end)))
+                 (loop while (< cursor fragment-length)
+                       do (let* ((character (char fragment cursor))
+                                 (contraction-end
+                                   (matching-contraction-end cursor)))
+                            (cond
+                              (contraction-end
+                               (emit contraction-end))
+                              ((letter-p character)
+                               (emit (consume-while cursor #'letter-p)))
+                              ((and (not (member character '(#\Newline #\Return)))
+                                    (not (letter-p character))
+                                    (not (number-p character))
+                                    (< (1+ cursor) fragment-length)
+                                    (letter-p (char fragment (1+ cursor))))
+                               (emit (consume-while (1+ cursor) #'letter-p)))
+                              ((number-p character)
+                               (emit (min fragment-length
+                                          (+ cursor
+                                             (min 3
+                                                  (- (consume-while cursor #'number-p)
+                                                     cursor))))))
+                              ((or (symbol-p character)
+                                   (and (char= character #\Space)
+                                        (< (1+ cursor) fragment-length)
+                                        (symbol-p (char fragment (1+ cursor)))))
+                               (let* ((symbol-start (if (char= character #\Space)
+                                                        (1+ cursor)
+                                                        cursor))
+                                      (symbol-end (consume-while symbol-start #'symbol-p))
+                                      (end (consume-while
+                                            symbol-end
+                                            (lambda (ch)
+                                              (member ch '(#\Newline #\Return))))))
+                                 (emit end)))
+                              ((member character '(#\Space #\Tab #\Newline #\Return #\Page))
+                               (let* ((run-end
+                                       (consume-while
+                                        cursor
+                                        (lambda (ch)
+                                          (member ch
+                                                  '(#\Space #\Tab #\Newline #\Return #\Page)))))
+                                      (last-newline
+                                       (position-if
+                                        (lambda (ch)
+                                          (member ch '(#\Newline #\Return)))
+                                        fragment
+                                        :start cursor
+                                        :end run-end
+                                        :from-end t)))
+                                 (cond
+                                   (last-newline
+                                    (emit (1+ last-newline)))
+                                   ((= run-end fragment-length)
+                                    (emit run-end))
+                                   ((> (- run-end cursor) 1)
+                                    (emit (1- run-end)))
+                                   (t
+                                    (emit run-end)))))
+                              (t
+                               (emit (1+ cursor)))))))
+               (nreverse segments)))
+           (tokenize-pre-token (pre-token)
+             (let* ((byte-unicode-table (gpt2-byte-unicode-table))
+                    (pieces
+                      (map 'list
+                           (lambda (octet)
+                             (string (aref byte-unicode-table octet)))
+                           (utf8-string-to-octets pre-token))))
+               (do ()
+                   (nil)
+                 (let ((merge-index (find-best-bpe-merge pieces bpe-rank-table)))
+                   (unless merge-index
+                     (return))
+                   (setf pieces (merge-string-pieces pieces merge-index))))
+               (mapcar (lambda (piece)
+                         (multiple-value-bind (token-id presentp)
+                             (gethash piece token-id-table)
+                           (unless presentp
+                             (error "No GPT2 token found for byte-encoded piece ~s."
+                                    piece))
+                           token-id))
+                       pieces))))
+    (let ((token-ids '()))
+      (dolist (pre-token (split-pre-tokens) token-ids)
+        (setf token-ids
+              (nconc token-ids (tokenize-pre-token pre-token)))))))
+
+(defun tokenize-gpt2-prompt (kv-pairs prompt)
+  (let ((token-id-table (tokenizer-token-id-table kv-pairs))
+        (bpe-rank-table (tokenizer-merge-rank-table kv-pairs))
+        (special-tokens (tokenizer-special-tokens kv-pairs))
+        (token-ids '())
+        (cursor 0)
+        (fragment-start 0)
+        (prompt-length (length prompt)))
+    (labels ((append-fragment (start end)
+               (when (< start end)
+                 (setf token-ids
+                       (nconc token-ids
+                              (tokenize-gpt2-text-fragment
+                               (subseq prompt start end)
+                               token-id-table
+                               bpe-rank-table))))))
+      (loop while (< cursor prompt-length)
+            for special-token = (find-matching-special-token prompt cursor special-tokens)
+            do (if special-token
+                   (progn
+                     (append-fragment fragment-start cursor)
+                     (multiple-value-bind (token-id presentp)
+                         (gethash special-token token-id-table)
+                       (unless presentp
+                         (error "Special token ~s missing from token id table."
+                                special-token))
+                       (setf token-ids (nconc token-ids (list token-id))))
+                     (incf cursor (length special-token))
+                     (setf fragment-start cursor))
+                   (incf cursor)))
+      (append-fragment fragment-start prompt-length))
+    token-ids))
+
 (defun tokenize-greedy-token-prompt (kv-pairs prompt)
   (let* ((token-table (tokenizer-entry-table kv-pairs))
         (pieces (make-base-token-pieces kv-pairs prompt token-table)))
@@ -4818,10 +5172,14 @@ It extracts the underlying simple arrays once before entering the loop to elimin
   (let* ((include-bos (if add-bos-p
                           add-bos
                           (default-add-bos-p kv-pairs)))
-         (token-ids (if (string= (or (tokenizer-model kv-pairs) "")
-                                 "gemma4")
-                        (tokenize-gemma4-prompt kv-pairs prompt)
-                        (tokenize-greedy-token-prompt kv-pairs prompt))))
+         (tokenizer-model (or (tokenizer-model kv-pairs) ""))
+         (token-ids (cond
+                      ((string= tokenizer-model "gemma4")
+                       (tokenize-gemma4-prompt kv-pairs prompt))
+                      ((string= tokenizer-model "gpt2")
+                       (tokenize-gpt2-prompt kv-pairs prompt))
+                      (t
+                       (tokenize-greedy-token-prompt kv-pairs prompt)))))
     (if include-bos
         (let ((bos-token-id (resolve-bos-token-id kv-pairs)))
           (unless bos-token-id

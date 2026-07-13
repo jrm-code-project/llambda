@@ -21,9 +21,11 @@
                           #:generate-token-loop
                           #:hello-message
                           #:load-gemma4-model
+                          #:load-llama-model
                           #:load-gguf-tensor
                           #:load-gguf-tensor-by-name
                           #:make-gemma4-step-function
+                          #:make-llama-step-function
                           #:map-view-of-file
                           #:print-gguf-file
                           #:print-gguf-floating-point-tables
@@ -79,9 +81,11 @@
   (is (fboundp 'generate-token-loop))
   (is (fboundp 'hello-message))
   (is (fboundp 'load-gemma4-model))
+  (is (fboundp 'load-llama-model))
   (is (fboundp 'load-gguf-tensor))
   (is (fboundp 'load-gguf-tensor-by-name))
   (is (fboundp 'make-gemma4-step-function))
+  (is (fboundp 'make-llama-step-function))
   (is (fboundp 'map-view-of-file))
   (is (fboundp 'print-gguf-file))
   (is (fboundp 'read-gguf-header))
@@ -199,6 +203,40 @@
       (is (= 4.0f0 (aref (aref cached-key-heads 1) 1)))
       (is (= 6.0f0 (aref (aref cached-value-heads 0) 1)))
       (is (= 7.0f0 (aref (aref cached-value-heads 1) 0))))))
+
+(test llama-model-loader
+  (let* ((kv-pairs '(("general.architecture" . "llama")
+                     ("llama.embedding_length" . 16)
+                     ("llama.block_count" . 2)
+                     ("llama.attention.head_count" . 4)
+                     ("llama.attention.head_count_kv" . 2)
+                     ("llama.feed_forward_length" . 32)
+                     ("llama.attention.layer_norm_rms_epsilon" . 1.0e-5)
+                     ("llama.rope.freq_base" . 500000.0)
+                     ("llama.rope.dimension_count" . 4)))
+         (tensor-infos '((:name "token_embd.weight")
+                         (:name "output.weight")))
+         (model (load-llama-model nil kv-pairs tensor-infos)))
+    (is (string= "llama" (llambda::gguf-model-architecture model)))
+    (is (= 16 (llambda::gguf-model-hidden-size model)))
+    (is (= 2 (llambda::gguf-model-layer-count model)))
+    (is (= 4 (llambda::gguf-model-head-count model)))
+    (is (= 2 (llambda::gguf-model-kv-head-count model)))
+    (is (= 32 (llambda::gguf-model-ffn-size model)))
+    (is (string= "output.weight"
+                 (llambda::gguf-model-output-tensor-name model))))
+  (let* ((kv-pairs '(("general.architecture" . "llama")
+                     ("llama.embedding_length" . 16)
+                     ("llama.block_count" . 1)
+                     ("llama.attention.head_count" . 4)
+                     ("llama.attention.head_count_kv" . 2)
+                     ("llama.feed_forward_length" . 32)
+                     ("llama.attention.layer_norm_rms_epsilon" . 1.0e-5)
+                     ("llama.rope.freq_base" . 500000.0)
+                     ("llama.rope.dimension_count" . 4)))
+         (model (load-llama-model nil kv-pairs '((:name "token_embd.weight")))))
+    (is (string= "token_embd.weight"
+                 (llambda::gguf-model-output-tensor-name model)))))
 
 (test sampling-primitives
   (flet ((approx= (left right &optional (epsilon 1.0e-5))
@@ -1267,6 +1305,57 @@
                                 :add-bos nil)))
     (is (equal '(11 12 13 14)
                (tokenize-prompt kv-pairs "😀" :add-bos nil)))))
+
+(test tokenize-prompt-llama-bpe
+  (let ((kv-pairs
+          `(("tokenizer.ggml.model" . "gpt2")
+            ("tokenizer.ggml.pre" . "llama-bpe")
+            ("tokenizer.ggml.tokens"
+             . ("H" "e" "l" "o" "He" "Hel" "Hell" "Hello"
+               ,(string (code-char #x0120))
+               ,(format nil "~cw" (code-char #x0120))
+               ,(format nil "~cwo" (code-char #x0120))
+               ,(format nil "~cwor" (code-char #x0120))
+               ,(format nil "~cworl" (code-char #x0120))
+               ,(format nil "~cworld" (code-char #x0120))
+               "<|begin_of_text|>" "<|eot_id|>"))
+            ("tokenizer.ggml.token_type"
+             . (1 1 1 1 1 1 1 1 1 1 1 1 1 1 3 3))
+            ("tokenizer.ggml.merges"
+             . ("H e" "He l" "Hel l" "Hell o"
+               "Ġ w" "Ġw o" "Ġwo r" "Ġwor l" "Ġworl d"))
+            ("tokenizer.ggml.bos_token_id" . 14))))
+    (is (equal '(7 13)
+               (tokenize-prompt kv-pairs "Hello world" :add-bos nil)))
+    (is (equal '(14 7 15)
+               (tokenize-prompt
+               kv-pairs
+               "<|begin_of_text|>Hello<|eot_id|>"
+               :add-bos nil)))))
+
+(test tokenize-prompt-llama-number-boundaries
+  (let ((kv-pairs
+          '(("tokenizer.ggml.model" . "gpt2")
+            ("tokenizer.ggml.pre" . "llama-bpe")
+            ("tokenizer.ggml.tokens"
+             . ("1" "2" "3" "4" "5" "12" "123" "1234" "12345" "45"))
+            ("tokenizer.ggml.token_type" . (1 1 1 1 1 1 1 1 1 1))
+            ("tokenizer.ggml.merges"
+             . ("1 2" "12 3" "123 4" "1234 5" "4 5")))))
+    (is (equal '(6 9)
+               (tokenize-prompt kv-pairs "12345" :add-bos nil)))))
+
+(test maybe-prepare-prompt-for-generation-llama
+  (let ((kv-pairs '(("tokenizer.ggml.model" . "gpt2")
+                   ("tokenizer.ggml.pre" . "llama-bpe")
+                   ("tokenizer.chat_template" . "dummy"))))
+    (multiple-value-bind (prepared-prompt effective-add-bos)
+        (llambda::maybe-prepare-prompt-for-generation kv-pairs "Hello" t)
+      (is (search "<|begin_of_text|><|start_header_id|>user<|end_header_id|>"
+                 prepared-prompt))
+      (is (search "Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+                 prepared-prompt))
+      (is (null effective-add-bos)))))
 
 (test maybe-prepare-prompt-for-generation-gemma4
   (let ((kv-pairs '(("tokenizer.ggml.model" . "gemma4")

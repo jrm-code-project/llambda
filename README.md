@@ -28,6 +28,7 @@ Lisp.
 *   **Zero-Drift KV Cache:** Safe, shared-KV reuse and perfectly aligned RoPE scaling. Exact-logit replay tests against fresh un-cached generations yield a `max_diff` of `0.0`.
 *   **Advanced Sampling:** Built-in Top-K, Top-P (Nucleus), and repetition penalties executing in-place with zero heap allocation in the hot path.
 *   **Gemma4 Support:** Full support for Gemma4 architectures, including BPE tokenization, proper instruction-tuning chat templates (`<bos><|turn>user...`), and explicit tool-calling channel overrides. 
+*   **Llama 3.1 Support:** Native grouped-query attention, scaled RoPE, byte-level BPE, and instruct chat-template handling for Llama 3.1 GGUF models.
 
   ## Requirements
 
@@ -62,8 +63,8 @@ vectors on the heap, performance will catastrophically collapse.
 *   [x] Gemma4 Base & Instruct (Verified)
 *   [x] Top-K / Top-P / Rep-Pen Sampler
 *   [x] AVX2/FMA `Q4_K_M` and `Q6_K` paths
-*   [ ] Qwen3 / MoE Routing (In Progress)
-*   [ ] LLaMA 3.1 Architecture (Planned)
+*   [x] Qwen3Next and Nemotron-H MoE inference
+*   [x] Llama 3.1 architecture and instruct tokenization
 
   ## Author **Joe Marshall**
 

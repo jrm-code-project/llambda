@@ -132,6 +132,8 @@ void configure_directml_session_options(Ort::SessionOptions& options) {
   options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
   options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
   options.DisableMemPattern();
+  // DirectML dispatches D3D12 compute shaders. Reject graphs that would need
+  // ONNX Runtime's CPU execution provider instead of hiding a CPU fallback.
   options.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
   Ort::ThrowOnError(
       get_directml_api()->SessionOptionsAppendExecutionProvider_DML(

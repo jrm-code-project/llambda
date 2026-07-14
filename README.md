@@ -29,7 +29,7 @@ Lisp.
 *   **Zero-Drift KV Cache:** Safe, shared-KV reuse and perfectly aligned RoPE scaling. Exact-logit replay tests against fresh un-cached generations yield a `max_diff` of `0.0`.
 *   **Advanced Sampling:** Built-in Top-K, Top-P (Nucleus), and repetition penalties executing in-place with zero heap allocation in the hot path.
 *   **Experimental Ryzen AI NPU backend:** Fixed-shape ONNX projections can replace selected CPU matrix-vector operations through an optional CFFI bridge. The CPU implementation remains the mandatory default and fallback.
-*   **Experimental DirectML GPU backend:** Selected projections can run on DirectML-capable AMD, Intel, or NVIDIA GPUs. Routing is always NPU, then GPU, then CPU.
+*   **Experimental DirectML GPU backend:** Selected projections can run on DirectML-capable AMD, Intel, or NVIDIA GPUs. Routing is always GPU, then NPU, then CPU.
 
 ### Supported architectures
 
@@ -52,10 +52,13 @@ Architecture selection uses the GGUF `general.architecture` metadata value.
 
 ### Optional DirectML GPU backend
 
-The GPU backend uses ONNX Runtime's DirectML execution provider on Windows.
-Build the native bridge against an ONNX Runtime distribution that includes
-DirectML. `ORT_ROOT` may be passed directly to CMake; the Ryzen AI installation
-remains the default when it is not specified:
+The GPU backend uses ONNX Runtime's DirectML execution provider to dispatch
+D3D12 compute shaders on Windows. ONNX Runtime CPU execution-provider fallback
+is disabled for GPU sessions, so an unsupported graph fails GPU setup and
+continues through llambda's explicit NPU/CPU fallback rather than being
+reported as GPU work. Build the native bridge against an ONNX Runtime
+distribution that includes DirectML. `ORT_ROOT` may be passed directly to
+CMake; the Ryzen AI installation remains the default when it is not specified:
 
 ```powershell
 .\native\build-npu.ps1 `
@@ -90,9 +93,9 @@ float32 graphs for DirectML.
 
 If DirectML, a compatible GPU, graph conversion, or session setup is
 unavailable, llambda warns and continues on the CPU. A runtime GPU failure
-disables only that tensor's GPU session and recomputes it on the CPU. When both
-accelerators are enabled for a tensor, llambda tries the NPU first, then the
-GPU, and finally the CPU.
+disables only that tensor's GPU session and tries an enabled NPU session before
+recomputing on the CPU. When both accelerators are enabled for a tensor, llambda
+tries the GPU first, then the NPU, and finally the CPU.
 
 ### Optional AMD Ryzen AI NPU backend
 
@@ -153,8 +156,8 @@ CPU, and leaves the remaining model usable. Low-level setup APIs remain
 fail-fast so callers can diagnose configuration problems.
 
 NPU and GPU setup are independent. Enabling both preserves working GPU
-sessions if NPU setup fails and vice versa. Runtime NPU failures fall through
-to an enabled GPU session before using the CPU.
+sessions if NPU setup fails and vice versa. Runtime GPU failures fall through
+to an enabled NPU session before using the CPU.
 
 ```lisp
 (llambda:test-gguf-file-response
@@ -187,10 +190,10 @@ output drift from the CPU result.
   :gpu-python-command '("conda" "run" "-n" "ryzen-ai-dunce" "python"))
 ```
 
-The benchmark requests both accelerators explicitly, prepares the NPU first,
-and reports an unavailable backend without preventing the remaining
-measurements. Pass `:use-npu nil` or `:use-gpu nil` to benchmark a subset.
-Cached projection graphs make subsequent runs skip export.
+The benchmark requests both accelerators explicitly and reports an unavailable
+backend without preventing the remaining measurements. Pass `:use-npu nil` or
+`:use-gpu nil` to benchmark a subset. Cached projection graphs make subsequent
+runs skip export.
 
   ## Quickstart
 
@@ -242,7 +245,7 @@ vectors on the heap, performance will catastrophically collapse.
 *   [x] Qwen2, Qwen3Next, and Nemotron-H MoE inference
 *   [x] Llama 3.1 architecture and instruct tokenization
 *   [x] Optional VitisAI CFFI bridge and per-projection NPU routing
-*   [x] Optional DirectML GPU bridge with NPU-to-GPU-to-CPU routing
+*   [x] Optional DirectML GPU bridge with GPU-to-NPU-to-CPU routing
 *   [x] Per-tensor GGUF-to-BF16 ONNX export
 *   [x] Automatic content-addressed NPU projection cache
 *   [x] Architecture-aware projection selection and end-to-end NPU inference

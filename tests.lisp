@@ -380,52 +380,52 @@
               :layer-indices '(0)
               :projection-roles '(:attention-key))))))))
 
-(test accelerator-priority-and-soft-fallback
+(test gpu-priority-and-soft-fallback
   (let ((npu-disabled-p nil)
         (gpu-disabled-p nil)
-        (gpu-called-p nil)
+        (npu-called-p nil)
         (cpu-called-p nil))
-    (is (eq :npu
-            (llambda::call-with-npu-runtime-fallback
-             (lambda () :npu)
+    (is (eq :gpu
+            (llambda::call-with-gpu-runtime-fallback
+             (lambda () :gpu)
              (lambda ()
-              (setf gpu-called-p t)
-              :gpu)
-             (lambda () (setf npu-disabled-p t))
+              (setf npu-called-p t)
+              :npu)
+             (lambda () (setf gpu-disabled-p t))
              "test.weight")))
-    (is (not gpu-called-p))
+    (is (not npu-called-p))
     (handler-bind ((warning #'muffle-warning))
-      (is (eq :gpu
-              (llambda::call-with-npu-runtime-fallback
+      (is (eq :npu
+              (llambda::call-with-gpu-runtime-fallback
               (lambda ()
-                (llambda::npu-backend-error "simulated NPU failure"))
+                (llambda::gpu-backend-error "simulated GPU failure"))
               (lambda ()
-                (llambda::call-with-gpu-runtime-fallback
-                 (lambda () :gpu)
+                (llambda::call-with-npu-runtime-fallback
+                 (lambda () :npu)
                  (lambda ()
                    (setf cpu-called-p t)
                    :cpu)
-                 (lambda () (setf gpu-disabled-p t))
+                 (lambda () (setf npu-disabled-p t))
                  "test.weight"))
-              (lambda () (setf npu-disabled-p t))
+              (lambda () (setf gpu-disabled-p t))
               "test.weight")))
-      (is (not (null npu-disabled-p)))
-      (is (not gpu-disabled-p))
+      (is (not (null gpu-disabled-p)))
+      (is (not npu-disabled-p))
       (is (not cpu-called-p))
       (setf npu-disabled-p nil
             gpu-disabled-p nil)
       (is (eq :cpu
-              (llambda::call-with-npu-runtime-fallback
+              (llambda::call-with-gpu-runtime-fallback
               (lambda ()
-                (llambda::npu-backend-error "simulated NPU failure"))
+                (llambda::gpu-backend-error "simulated GPU failure"))
               (lambda ()
-                (llambda::call-with-gpu-runtime-fallback
+                (llambda::call-with-npu-runtime-fallback
                  (lambda ()
-                   (llambda::gpu-backend-error "simulated GPU failure"))
+                   (llambda::npu-backend-error "simulated NPU failure"))
                  (lambda () :cpu)
-                 (lambda () (setf gpu-disabled-p t))
+                 (lambda () (setf npu-disabled-p t))
                  "test.weight"))
-              (lambda () (setf npu-disabled-p t))
+              (lambda () (setf gpu-disabled-p t))
               "test.weight")))
       (is (not (null npu-disabled-p)))
       (is (not (null gpu-disabled-p)))
@@ -670,7 +670,26 @@
                                     handle
                                     (lambda (mapping)
                                       (cffi:mem-aref mapping :unsigned-char 1))))
-                                 :share-mode 0))))
+                                 :share-mode 0)))
+          (call-with-file
+           temp-path
+           (lambda (handle)
+             (cffi:with-foreign-string
+                 (mapping-name
+                  (format nil "llambda-map-test-~d" (get-universal-time))
+                  :encoding :utf-16le)
+               (call-with-mapped-file
+                handle
+                (lambda (mapping)
+                  (declare (ignore mapping))
+                  (signals error
+                    (call-with-mapped-file
+                     handle
+                     (lambda (duplicate-mapping)
+                       (declare (ignore duplicate-mapping)))
+                     :name mapping-name)))
+                :name mapping-name)))
+           :share-mode 0))
       (when (probe-file temp-path)
         (delete-file temp-path)))))
 
@@ -739,6 +758,102 @@
                                        :share-mode 0))))
         (when (probe-file temp-path)
           (delete-file temp-path))))))
+
+(test malformed-gguf-input-is-bounded
+  (labels ((write-u32-le (stream value)
+             (loop for index from 0 below 4
+                   do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+           (write-u64-le (stream value)
+             (loop for index from 0 below 8
+                   do (write-byte (ldb (byte 8 (* 8 index)) value) stream)))
+           (write-header (stream tensor-count metadata-count)
+             (map nil
+                  (lambda (character)
+                    (write-byte (char-code character) stream))
+                  "GGUF")
+             (write-u32-le stream 3)
+             (write-u64-le stream tensor-count)
+             (write-u64-le stream metadata-count))
+           (write-string-field (stream value)
+             (let ((octets
+                     #+sbcl
+                     (sb-ext:string-to-octets value :external-format :utf-8)
+                     #-sbcl
+                     (map '(vector (unsigned-byte 8)) #'char-code value)))
+               (write-u64-le stream (length octets))
+               (write-sequence octets stream)))
+           (fixture-error (suffix writer reader)
+             (let ((path
+                     (merge-pathnames
+                      (make-pathname
+                       :name (format nil "llambda-malformed-gguf-~a-~d"
+                                     suffix
+                                     (get-universal-time))
+                       :type "gguf")
+                      (uiop:temporary-directory))))
+               (unwind-protect
+                   (progn
+                     (with-open-file
+                         (stream path
+                                 :direction :output
+                                 :if-exists :supersede
+                                 :if-does-not-exist :create
+                                 :element-type '(unsigned-byte 8))
+                       (funcall writer stream))
+                     (handler-case
+                         (call-with-file
+                          path
+                          (lambda (handle)
+                            (with-mapped-file (mapping handle)
+                              (funcall reader mapping)))
+                          :share-mode 0)
+                       (error (condition)
+                         (princ-to-string condition))))
+                 (when (probe-file path)
+                   (delete-file path))))))
+    (is (search
+         "exceeds mapped file length"
+         (fixture-error
+          "header"
+          (lambda (stream)
+            (map nil
+                 (lambda (character)
+                   (write-byte (char-code character) stream))
+                 "GGUF"))
+          #'read-gguf-header)))
+    (is (search
+         "exceeds mapped file length"
+         (fixture-error
+          "metadata-string"
+          (lambda (stream)
+            (write-header stream 0 1)
+            (write-u64-le stream 1024)
+            (loop repeat 5 do (write-byte 0 stream)))
+          #'read-gguf-kv-pairs)))
+    (is (search
+         "invalid dimension count"
+         (fixture-error
+          "dimensions"
+          (lambda (stream)
+            (write-header stream 1 0)
+            (write-string-field stream "x")
+            (write-u32-le stream 5)
+            (loop repeat 20 do (write-byte 0 stream)))
+          #'read-gguf-tensor-infos)))
+    (is (search
+         "exceeds mapped file length"
+         (fixture-error
+          "tensor-data"
+          (lambda (stream)
+            (write-header stream 1 0)
+            (write-string-field stream "x")
+            (write-u32-le stream 1)
+            (write-u64-le stream 1)
+            (write-u32-le stream 0)
+            (write-u64-le stream 0)
+            (loop until (zerop (mod (file-position stream) 32))
+                  do (write-byte 0 stream)))
+          #'read-gguf-tensor-infos)))))
 
 (test read-gguf-kv-pairs
   (let* ((temp-path (merge-pathnames
@@ -1852,7 +1967,7 @@ Hello<turn|>
                                     :element-type '(unsigned-byte 8))
               (map nil (lambda (ch) (write-byte (char-code ch) stream)) "GGUF")
               (write-u32-le stream 3)
-              (write-u64-le stream 17)
+              (write-u64-le stream 0)
               (write-u64-le stream 6)
 
               (write-string-field stream "general.architecture")

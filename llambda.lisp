@@ -17,6 +17,7 @@
 (defconstant +open-existing+ 3)
 (defconstant +file-attribute-normal+ #x00000080)
 (defconstant +page-readonly+ #x00000002)
+(defconstant +error-already-exists+ 183)
 (defconstant +qk-k+ 256)
 (defconstant +k-scale-size+ 12)
 (defconstant +q6-k-scale-count+ 16)
@@ -40,6 +41,7 @@
 (defparameter *npu-library* nil)
 (defparameter *gpu-library* nil)
 (defparameter *npu-runtime-library* nil)
+(defparameter *mapped-regions* nil)
 
 (cffi:defcfun ("SetDllDirectoryW" %set-dll-directory) :boolean
   (pathname :pointer))
@@ -490,9 +492,57 @@
   (source :pointer)
   (length :size))
 
+(cffi:defcfun ("GetFileSizeEx" get-file-size-ex) :boolean
+  (file handle)
+  (file-size :pointer))
+
+(cffi:defcfun ("GetLastError" get-last-error) dword)
+
+(defstruct (mapped-region
+            (:constructor make-mapped-region (pointer byte-length)))
+  pointer
+  byte-length)
+
 (defun invalid-handle-p (handle)
   (= (cffi:pointer-address handle)
      (1- (ash 1 (* 8 (cffi:foreign-type-size :pointer))))))
+
+(defun file-handle-byte-length (file-handle)
+  (cffi:with-foreign-object (file-size :int64)
+    (unless (get-file-size-ex file-handle file-size)
+      (error "GetFileSizeEx failed."))
+    (let ((byte-length (cffi:mem-ref file-size :int64)))
+      (when (minusp byte-length)
+        (error "GetFileSizeEx returned a negative file size: ~d." byte-length))
+      byte-length)))
+
+(defun find-mapped-region (pointer)
+  (let ((address (cffi:pointer-address pointer)))
+    (find address
+          *mapped-regions*
+          :key (lambda (region)
+                 (cffi:pointer-address (mapped-region-pointer region)))
+          :test #'=)))
+
+(defun require-mapped-region (pointer operation)
+  (or (find-mapped-region pointer)
+      (error "~a requires a pointer supplied by CALL-WITH-MAPPED-FILE."
+             operation)))
+
+(defun ensure-mapped-range (region offset byte-length description)
+  (unless (and (integerp offset) (not (minusp offset)))
+    (error "~a has invalid byte offset ~s." description offset))
+  (unless (and (integerp byte-length) (not (minusp byte-length)))
+    (error "~a has invalid byte length ~s." description byte-length))
+  (let ((region-length (mapped-region-byte-length region)))
+    (unless (and (<= offset region-length)
+                 (<= byte-length (- region-length offset)))
+      (error "~a byte range [~d, ~d) exceeds mapped file length ~d."
+             description
+             offset
+             (+ offset byte-length)
+             region-length)))
+  offset)
 
 (defun call-with-file (pathname receiver
                        &key
@@ -529,28 +579,60 @@
                                 (file-offset-high 0)
                                 (file-offset-low 0)
                                 (number-of-bytes-to-map 0))
-  (let ((mapping-handle (create-file-mapping file-handle
-                                             mapping-attributes
-                                             protect
-                                             maximum-size-high
-                                             maximum-size-low
-                                             name)))
-    (when (cffi:null-pointer-p mapping-handle)
-      (error "CreateFileMappingW failed."))
-    (unwind-protect
-        (let ((mapping (map-view-of-file mapping-handle
-                                         desired-access
-                                         file-offset-high
-                                         file-offset-low
-                                         number-of-bytes-to-map)))
-          (when (cffi:null-pointer-p mapping)
-            (error "MapViewOfFile failed."))
-          (unwind-protect
-              (funcall receiver mapping)
-            (unless (unmap-view-of-file mapping)
-              (error "UnmapViewOfFile failed."))))
-      (unless (close-handle mapping-handle)
-        (error "CloseHandle failed for file mapping object.")))))
+  (let* ((file-byte-length (file-handle-byte-length file-handle))
+         (mapping-byte-length
+           (+ (ash maximum-size-high 32) maximum-size-low))
+         (effective-mapping-byte-length
+           (if (zerop mapping-byte-length)
+               file-byte-length
+               mapping-byte-length))
+         (file-offset (+ (ash file-offset-high 32) file-offset-low))
+         (view-byte-length
+           (if (zerop number-of-bytes-to-map)
+               (- effective-mapping-byte-length file-offset)
+               number-of-bytes-to-map)))
+    (unless (<= file-offset effective-mapping-byte-length)
+      (error "Mapped file offset ~d exceeds mapping length ~d."
+             file-offset
+             effective-mapping-byte-length))
+    (unless (and (not (minusp view-byte-length))
+                 (<= view-byte-length
+                     (- effective-mapping-byte-length file-offset)))
+      (error "Mapped view length ~d at offset ~d exceeds mapping length ~d."
+             view-byte-length
+             file-offset
+             effective-mapping-byte-length))
+    (let* ((mapping-handle (create-file-mapping file-handle
+                                               mapping-attributes
+                                               protect
+                                               maximum-size-high
+                                               maximum-size-low
+                                               name))
+           (mapping-already-exists-p
+             (and (not (cffi:null-pointer-p name))
+                  (= (get-last-error) +error-already-exists+))))
+      (when (cffi:null-pointer-p mapping-handle)
+        (error "CreateFileMappingW failed."))
+      (when mapping-already-exists-p
+        (close-handle mapping-handle)
+        (error "CALL-WITH-MAPPED-FILE refuses an existing named mapping because its byte length cannot be verified."))
+      (unwind-protect
+          (let ((mapping (map-view-of-file mapping-handle
+                                           desired-access
+                                           file-offset-high
+                                           file-offset-low
+                                           number-of-bytes-to-map)))
+            (when (cffi:null-pointer-p mapping)
+              (error "MapViewOfFile failed."))
+            (unwind-protect
+                (let ((*mapped-regions*
+                        (cons (make-mapped-region mapping view-byte-length)
+                              *mapped-regions*)))
+                  (funcall receiver mapping))
+              (unless (unmap-view-of-file mapping)
+                (error "UnmapViewOfFile failed."))))
+        (unless (close-handle mapping-handle)
+          (error "CloseHandle failed for file mapping object."))))))
 
 (defmacro with-file-handle ((handle pathname) &body body)
   `(call-with-file ,pathname
@@ -1669,74 +1751,151 @@ Write a haiku about a hacker drinking coffee.<turn|>
 :stream stream
    :random-state random-state))
 
-(defun read-gguf-string (pointer offset)
-  (let* ((length (read-u64-le pointer offset))
-         (start (+ offset 8))
-         (end (+ start length)))
-    (values (octets-to-utf8-string (read-octets pointer start length))
-            end)))
+(defun gguf-read-u32-le (region offset description)
+  (ensure-mapped-range region offset 4 description)
+  (read-u32-le (mapped-region-pointer region) offset))
 
-(defun read-gguf-value (pointer offset type-tag)
+(defun gguf-read-u64-le (region offset description)
+  (ensure-mapped-range region offset 8 description)
+  (read-u64-le (mapped-region-pointer region) offset))
+
+(defun gguf-read-octets (region offset length description)
+  (ensure-mapped-range region offset length description)
+  (unless (<= length array-dimension-limit)
+    (error "~a length ~d exceeds the Lisp array dimension limit."
+           description
+           length))
+  (read-octets (mapped-region-pointer region) offset length))
+
+(defun gguf-value-minimum-byte-size (type-tag)
   (case type-tag
-    (0 (values (cffi:mem-aref pointer :unsigned-char offset)
-               (+ offset 1)))
-    (1 (values (unsigned-to-signed
-                (cffi:mem-aref pointer :unsigned-char offset)
-                8)
-               (+ offset 1)))
-    (2 (values (read-u16-le pointer offset)
-               (+ offset 2)))
-    (3 (values (unsigned-to-signed (read-u16-le pointer offset) 16)
-               (+ offset 2)))
-    (4 (values (read-u32-le pointer offset)
-               (+ offset 4)))
-    (5 (values (unsigned-to-signed (read-u32-le pointer offset) 32)
-               (+ offset 4)))
-    (6 (values (cffi:mem-ref (cffi:inc-pointer pointer offset) :float)
-               (+ offset 4)))
-    (7 (values (not (zerop (cffi:mem-aref pointer :unsigned-char offset)))
-               (+ offset 1)))
-    (8 (read-gguf-string pointer offset))
-    (9 (let ((element-type (read-u32-le pointer offset))
-             (length (read-u64-le pointer (+ offset 4)))
-             (cursor (+ offset 12))
-             (values '()))
-         (dotimes (index length)
-           (multiple-value-bind (element next-cursor)
-               (read-gguf-value pointer cursor element-type)
-             (push element values)
-             (setf cursor next-cursor)))
-         (values (nreverse values) cursor)))
-    (10 (values (read-u64-le pointer offset)
-                (+ offset 8)))
-    (11 (values (unsigned-to-signed (read-u64-le pointer offset) 64)
-                (+ offset 8)))
-    (12 (values (cffi:mem-ref (cffi:inc-pointer pointer offset) :double)
-                (+ offset 8)))
+    ((0 1 7) 1)
+    ((2 3) 2)
+    ((4 5 6) 4)
+    ((8 10 11 12) 8)
+    (9 12)
     (otherwise
      (error "Unsupported GGUF metadata value type: ~a." type-tag))))
 
+(defun ensure-gguf-count-fits
+    (region offset count minimum-byte-size description)
+  (unless (and (integerp count) (not (minusp count)))
+    (error "~a has invalid count ~s." description count))
+  (let ((remaining (- (mapped-region-byte-length region) offset)))
+    (unless (and (not (minusp remaining))
+                (<= count (floor remaining minimum-byte-size)))
+      (error "~a count ~d cannot fit in the ~d mapped bytes remaining."
+             description
+             count
+             (max remaining 0))))
+  count)
+
+(defun read-gguf-string (region offset)
+  (let* ((length (gguf-read-u64-le region offset "GGUF string length"))
+         (start (+ offset 8))
+         (end (+ start length)))
+    (values (octets-to-utf8-string
+             (gguf-read-octets region start length "GGUF string"))
+            end)))
+
+(defun read-gguf-value (region offset type-tag)
+  (let ((pointer (mapped-region-pointer region)))
+  (case type-tag
+    (0 (ensure-mapped-range region offset 1 "GGUF uint8 metadata value")
+       (values (cffi:mem-aref pointer :unsigned-char offset)
+               (+ offset 1)))
+    (1 (ensure-mapped-range region offset 1 "GGUF int8 metadata value")
+       (values (unsigned-to-signed
+                (cffi:mem-aref pointer :unsigned-char offset)
+                8)
+               (+ offset 1)))
+    (2 (ensure-mapped-range region offset 2 "GGUF uint16 metadata value")
+       (values (read-u16-le pointer offset)
+               (+ offset 2)))
+    (3 (ensure-mapped-range region offset 2 "GGUF int16 metadata value")
+       (values (unsigned-to-signed (read-u16-le pointer offset) 16)
+               (+ offset 2)))
+    (4 (values (gguf-read-u32-le region offset "GGUF uint32 metadata value")
+               (+ offset 4)))
+    (5 (values (unsigned-to-signed
+               (gguf-read-u32-le region offset "GGUF int32 metadata value")
+               32)
+               (+ offset 4)))
+    (6 (ensure-mapped-range region offset 4 "GGUF float32 metadata value")
+       (values (cffi:mem-ref (cffi:inc-pointer pointer offset) :float)
+               (+ offset 4)))
+    (7 (ensure-mapped-range region offset 1 "GGUF boolean metadata value")
+       (values (not (zerop (cffi:mem-aref pointer :unsigned-char offset)))
+               (+ offset 1)))
+    (8 (read-gguf-string region offset))
+    (9 (let ((element-type
+               (gguf-read-u32-le region offset
+                                "GGUF metadata array element type"))
+             (length
+               (gguf-read-u64-le region (+ offset 4)
+                                "GGUF metadata array length"))
+             (cursor (+ offset 12))
+             (values '()))
+         (when (= element-type 9)
+           (error "Nested GGUF metadata arrays are unsupported."))
+         (ensure-gguf-count-fits
+          region
+          cursor
+          length
+          (gguf-value-minimum-byte-size element-type)
+          "GGUF metadata array")
+         (loop repeat length
+               do
+           (multiple-value-bind (element next-cursor)
+               (read-gguf-value region cursor element-type)
+             (push element values)
+             (setf cursor next-cursor)))
+         (values (nreverse values) cursor)))
+    (10 (values (gguf-read-u64-le region offset "GGUF uint64 metadata value")
+                (+ offset 8)))
+    (11 (values (unsigned-to-signed
+                (gguf-read-u64-le region offset "GGUF int64 metadata value")
+                64)
+                (+ offset 8)))
+    (12 (ensure-mapped-range region offset 8 "GGUF float64 metadata value")
+        (values (cffi:mem-ref (cffi:inc-pointer pointer offset) :double)
+                (+ offset 8)))
+    (otherwise
+     (error "Unsupported GGUF metadata value type: ~a." type-tag)))))
+
 (defun read-gguf-header (mapped-file)
-  (let ((magic (map 'string #'code-char (read-octets mapped-file 0 4))))
+  (let* ((region (require-mapped-region mapped-file "READ-GGUF-HEADER"))
+         (magic
+           (map 'string
+               #'code-char
+               (gguf-read-octets region 0 4 "GGUF magic"))))
     (unless (string= magic "GGUF")
       (error "Invalid GGUF magic: ~s." magic))
     (list :magic magic
-          :version (read-u32-le mapped-file 4)
-          :tensor-count (read-u64-le mapped-file 8)
-          :metadata-kv-count (read-u64-le mapped-file 16)
+          :version (gguf-read-u32-le region 4 "GGUF version")
+          :tensor-count (gguf-read-u64-le region 8 "GGUF tensor count")
+          :metadata-kv-count
+          (gguf-read-u64-le region 16 "GGUF metadata count")
           :header-size 24)))
 
 (defun read-gguf-metadata-section (mapped-file)
-  (let* ((header (read-gguf-header mapped-file))
+  (let* ((region
+           (require-mapped-region mapped-file "READ-GGUF-METADATA-SECTION"))
+         (header (read-gguf-header mapped-file))
          (cursor (getf header :header-size))
          (metadata-kv-count (getf header :metadata-kv-count))
          (pairs '()))
-    (dotimes (index metadata-kv-count)
+    (ensure-gguf-count-fits
+     region cursor metadata-kv-count 13 "GGUF metadata")
+    (loop repeat metadata-kv-count
+          do
       (multiple-value-bind (key key-end)
-          (read-gguf-string mapped-file cursor)
-        (let ((type-tag (read-u32-le mapped-file key-end)))
+          (read-gguf-string region cursor)
+        (let ((type-tag
+               (gguf-read-u32-le region key-end
+                                 "GGUF metadata value type")))
           (multiple-value-bind (value next-cursor)
-              (read-gguf-value mapped-file (+ key-end 4) type-tag)
+              (read-gguf-value region (+ key-end 4) type-tag)
             (push (cons key value) pairs)
             (setf cursor next-cursor)))))
     (values (nreverse pairs) cursor)))
@@ -1748,8 +1907,15 @@ Write a haiku about a hacker drinking coffee.<turn|>
   (* alignment (ceiling offset alignment)))
 
 (defun gguf-alignment (kv-pairs)
-  (or (gguf-kv-value-or-nil kv-pairs "general.alignment")
-      32))
+  (let ((alignment
+          (or (gguf-kv-value-or-nil kv-pairs "general.alignment")
+              32)))
+    (unless (and (integerp alignment)
+                 (plusp alignment)
+                 (zerop (logand alignment (1- alignment))))
+      (error "GGUF alignment must be a positive power of two, got ~s."
+             alignment))
+    alignment))
 
 (defun supported-ggml-type-p (type-tag)
   (member type-tag
@@ -1806,45 +1972,86 @@ Write a haiku about a hacker drinking coffee.<turn|>
        (ggml-type-size type-tag))))
 
 (defun read-gguf-tensor-infos (mapped-file)
-  (let* ((header (read-gguf-header mapped-file))
+  (let* ((region
+           (require-mapped-region mapped-file "READ-GGUF-TENSOR-INFOS"))
+         (header (read-gguf-header mapped-file))
          (tensor-count (getf header :tensor-count)))
     (multiple-value-bind (kv-pairs cursor)
         (read-gguf-metadata-section mapped-file)
       (let ((tensor-infos '()))
-        (dotimes (index tensor-count)
+        (ensure-gguf-count-fits
+         region cursor tensor-count 24 "GGUF tensor info")
+        (loop repeat tensor-count
+              do
           (multiple-value-bind (name name-end)
-              (read-gguf-string mapped-file cursor)
-            (let* ((dimension-count (read-u32-le mapped-file name-end))
-                   (dimension-cursor (+ name-end 4))
-                   (dimensions (let ((dimensions '()))
+              (read-gguf-string region cursor)
+            (let* ((dimension-count
+                     (gguf-read-u32-le region name-end
+                                      "GGUF tensor dimension count"))
+                   (dimension-cursor (+ name-end 4)))
+              (unless (<= 1 dimension-count 4)
+                (error "Tensor ~s has invalid dimension count ~d; GGUF permits 1 through 4."
+                       name
+                       dimension-count))
+              (ensure-mapped-range
+               region
+               dimension-cursor
+               (+ (* dimension-count 8) 12)
+               "GGUF tensor dimensions, type, and offset")
+              (let* ((dimensions (let ((dimensions '()))
                                  (dotimes (dimension-index dimension-count (nreverse dimensions))
                                    (declare (fixnum dimension-index))
-                                   (push (read-u64-le mapped-file
-                                                      (+ dimension-cursor
-                                                         (* dimension-index 8)))
+                                   (push (gguf-read-u64-le
+                                          region
+                                          (+ dimension-cursor
+                                             (* dimension-index 8))
+                                          "GGUF tensor dimension")
                                          dimensions))))
                    (type-cursor (+ dimension-cursor (* dimension-count 8)))
-                   (type-tag (read-u32-le mapped-file type-cursor))
-                   (offset (read-u64-le mapped-file (+ type-cursor 4)))
+                   (type-tag
+                     (gguf-read-u32-le region type-cursor
+                                      "GGUF tensor type"))
+                   (offset
+                     (gguf-read-u64-le region (+ type-cursor 4)
+                                      "GGUF tensor offset"))
                    (next-cursor (+ type-cursor 12))
                    (element-count (reduce #'* dimensions :initial-value 1))
                    (byte-size (when (supported-ggml-type-p type-tag)
                                 (ggml-tensor-byte-size type-tag element-count))))
-              (push (list :name name
-                          :dimension-count dimension-count
-                          :dimensions dimensions
-                          :type-tag type-tag
-                          :type-name (ggml-type-name type-tag)
-                          :offset offset
-                          :element-count element-count
-                          :byte-size byte-size)
-                    tensor-infos)
-              (setf cursor next-cursor))))
+                (unless (every #'plusp dimensions)
+                  (error "Tensor ~s has non-positive dimensions ~s."
+                         name
+                         dimensions))
+                (push (list :name name
+                            :dimension-count dimension-count
+                            :dimensions dimensions
+                            :type-tag type-tag
+                            :type-name (ggml-type-name type-tag)
+                            :offset offset
+                            :element-count element-count
+                            :byte-size byte-size)
+                      tensor-infos)
+                (setf cursor next-cursor)))))
         (let ((tensor-data-start (align-offset cursor (gguf-alignment kv-pairs))))
+          (when tensor-infos
+            (ensure-mapped-range
+             region tensor-data-start 0 "GGUF tensor data start"))
           (mapcar (lambda (tensor-info)
-                    (append tensor-info
-                            (list :data-offset (+ tensor-data-start
-                                                  (getf tensor-info :offset)))))
+                    (let* ((data-offset
+                             (+ tensor-data-start
+                                (getf tensor-info :offset)))
+                           (byte-size (getf tensor-info :byte-size)))
+                      (ensure-mapped-range
+                       region
+                       data-offset
+                       (or byte-size 0)
+                       (format nil "GGUF tensor ~s"
+                               (getf tensor-info :name)))
+                      (append tensor-info
+                              (list :data-offset data-offset
+                                    :data-end
+                                    (and byte-size
+                                         (+ data-offset byte-size))))))
                   (nreverse tensor-infos)))))))
 
 (defun find-gguf-tensor-info (tensor-infos tensor-name)
@@ -1931,8 +2138,16 @@ Write a haiku about a hacker drinking coffee.<turn|>
 (defun load-gguf-tensor (mapped-file tensor-info)
   (let* ((type-tag (getf tensor-info :type-tag))
          (element-count (getf tensor-info :element-count))
+         (byte-size (getf tensor-info :byte-size))
          (tensor-pointer (cffi:inc-pointer mapped-file
                                            (getf tensor-info :data-offset))))
+    (let ((region (find-mapped-region mapped-file)))
+      (when (and region byte-size)
+        (ensure-mapped-range
+         region
+         (getf tensor-info :data-offset)
+         byte-size
+         (format nil "GGUF tensor ~s" (getf tensor-info :name)))))
     (case type-tag
       (#.+ggml-type-f32+ (load-f32-tensor tensor-pointer element-count))
       (#.+ggml-type-f16+ (load-f16-tensor tensor-pointer element-count))
@@ -3680,7 +3895,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (funcall npu-function)
     (npu-backend-error (condition)
       (funcall disable-function)
-      (warn "NPU projection ~s failed and was disabled; using the next available backend: ~a"
+      (warn "NPU projection ~s failed and was disabled; recomputing on the CPU: ~a"
             tensor-name
             condition)
       (funcall cpu-function))))
@@ -3691,7 +3906,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (funcall gpu-function)
     (gpu-backend-error (condition)
       (funcall disable-function)
-      (warn "GPU projection ~s failed and was disabled; recomputing on the CPU: ~a"
+      (warn "GPU projection ~s failed and was disabled; using the next available backend: ~a"
             tensor-name
             condition)
       (funcall cpu-function))))
@@ -3710,30 +3925,30 @@ It extracts the underlying simple arrays once before entering the loop to elimin
               vector
               0
               row-count))))
-    (labels ((run-on-gpu-or-cpu ()
-               (let ((gpu-session
+    (labels ((run-on-npu-or-cpu ()
+               (let ((npu-session
                        (gethash tensor-name
-                                (gguf-model-gpu-projections model))))
-                 (if gpu-session
-                     (call-with-gpu-runtime-fallback
+                                (gguf-model-npu-projections model))))
+                 (if npu-session
+                     (call-with-npu-runtime-fallback
                       (lambda ()
-                        (run-gpu-session-into dest gpu-session vector))
+                        (run-npu-session-into dest npu-session vector))
                       #'run-on-cpu
                       (lambda ()
-                        (unregister-model-gpu-projection model tensor-name))
+                        (unregister-model-npu-projection model tensor-name))
                       tensor-name)
                      (run-on-cpu)))))
-      (let ((npu-session
-              (gethash tensor-name (gguf-model-npu-projections model))))
-        (if npu-session
-            (call-with-npu-runtime-fallback
+      (let ((gpu-session
+              (gethash tensor-name (gguf-model-gpu-projections model))))
+        (if gpu-session
+            (call-with-gpu-runtime-fallback
              (lambda ()
-               (run-npu-session-into dest npu-session vector))
-             #'run-on-gpu-or-cpu
+               (run-gpu-session-into dest gpu-session vector))
+             #'run-on-npu-or-cpu
              (lambda ()
-               (unregister-model-npu-projection model tensor-name))
+               (unregister-model-gpu-projection model tensor-name))
              tensor-name)
-            (run-on-gpu-or-cpu))))))
+            (run-on-npu-or-cpu))))))
 
 (defun gguf-model-matrix-vector-multiply (model tensor-name vector)
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))

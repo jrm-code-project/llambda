@@ -15,3 +15,18 @@
   :perform (test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call '#:llambda/tests '#:run-tests)))
+
+(asdf:defsystem #:llambda/chatbot
+  :description "Chatbot backend adapter for native llambda GGUF inference"
+  :depends-on (#:llambda #:chatbot)
+  :serial t
+  :components ((:file "chatbot-backend")))
+
+(asdf:defsystem #:llambda/chatbot-tests
+  :depends-on (#:llambda/chatbot #:fiveam)
+  :serial t
+  :components ((:file "chatbot-backend-tests"))
+  :perform (test-op (op c)
+             (declare (ignore op c))
+             (unless (uiop:symbol-call '#:llambda/chatbot-tests '#:run-tests)
+               (error "llambda chatbot backend tests failed."))))

@@ -23,6 +23,7 @@
                           #:export-model-npu-projection
                           #:find-gguf-tensor-info
                           #:generate-from-prompt
+                          #:generate-gguf-response
                           #:generate-token-loop
                           #:hello-message
                           #:load-gemma4-model
@@ -97,6 +98,7 @@
   (is (fboundp 'export-model-npu-projection))
   (is (fboundp 'find-gguf-tensor-info))
   (is (fboundp 'generate-from-prompt))
+  (is (fboundp 'generate-gguf-response))
   (is (fboundp 'generate-token-loop))
   (is (fboundp 'hello-message))
   (is (fboundp 'load-gemma4-model))
@@ -1561,7 +1563,8 @@ Hello<turn|>
                             (otherwise #(0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0
                                          0.0f0 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0
                                          0.0f0 0.0f0 0.0f0 4.0f0)))))
-         (kv-cache (make-hash-table)))
+         (kv-cache (make-hash-table))
+         (callback-text '()))
     (let ((prompt-logits (evaluate-prompt '(42 0 1) step-function kv-cache)))
       (is (equal '((1 2) (0 1) (42 0)) calls))
       (is (= 10.0f0 (aref prompt-logits 15))))
@@ -1576,9 +1579,12 @@ Hello<turn|>
                              :eos-token-id 17
                              :start-position 2
                              :temperature 1.0f0
+                             :callback (lambda (text)
+                                         (push text callback-text))
                              :random-values '(0.1f0 0.1f0 0.1f0 0.1f0))
       (is (equal '(15 16) generated-ids))
       (is (string= " world!" generated-text))
+      (is (equal '(" world" "!") (nreverse callback-text)))
       (is (= 10.0f0 (aref last-logits 17)))
       (is (equal '((16 3) (15 2)) calls)))
     (setf calls '())

@@ -134,6 +134,26 @@ incurs that compilation cost again.
   :repetition-penalty 1.15)
 ```
 
+### Chatbot backend plugin
+
+Load `llambda/chatbot` after the sibling `chatbot` system. It registers
+`:llambda` in chatbot's pluggable backend registry. The chatbot model value is
+the local GGUF pathname:
+
+```lisp
+(asdf:load-system :llambda/chatbot)
+
+(defparameter *local-chat*
+  (chatbot:new-chat
+   :backend :llambda
+   :model "D:/path/to/model.gguf"))
+
+(chatbot:chat "Write a haiku about Lisp." :conversation *local-chat*)
+```
+
+Text callbacks, conversation history, system instructions, temperature, and
+top-p are supported. File attachments and tool calls are not supported.
+
   ## Performance & Optimization
 
   If you are modifying the core dot-product macros (`expand-q4-k-body`), heed

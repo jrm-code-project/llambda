@@ -31,6 +31,7 @@
            #:evaluate-prompt
            #:export-model-npu-projection
            #:generate-from-prompt
+           #:generate-gguf-response
            #:generate-token-loop
            #:hello-message
            #:find-gguf-tensor-info

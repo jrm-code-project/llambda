@@ -1085,6 +1085,7 @@
                               (temperature 1.0)
                               (max-tokens 256)
                               random-values
+                              callback
                               (stream *standard-output*)
                               (random-state *random-state*))
   (let ((current-logits initial-logits)
@@ -1124,7 +1125,9 @@
           (return))
         (push token-id generated-token-ids)
         (unless (gpt2-tokenizer-p kv-pairs)
-          (write-string token-text stream))
+          (write-string token-text stream)
+          (when callback
+            (funcall callback token-text)))
         (setf current-logits
               (funcall step-function
                        token-id
@@ -1135,6 +1138,8 @@
             (if (gpt2-tokenizer-p kv-pairs)
                 (detokenize-token-ids kv-pairs ordered-token-ids stream)
                 (detokenize-token-ids kv-pairs ordered-token-ids (make-broadcast-stream)))))
+      (when (and callback (gpt2-tokenizer-p kv-pairs))
+        (funcall callback generated-text))
       (values ordered-token-ids generated-text current-logits))))
 
 (defun gemma4-chat-prompt-p (prompt)
@@ -1219,6 +1224,7 @@
                                 (temperature 1.0)
                                 (max-tokens 256)
                                 random-values
+                                callback
                                 (stream *standard-output*)
                                 (random-state *random-state*))
   (multiple-value-bind (prepared-prompt effective-add-bos)
@@ -1242,6 +1248,7 @@
                            :temperature temperature
                            :max-tokens max-tokens
                            :random-values random-values
+                           :callback callback
                            :stream stream
                            :random-state random-state))))
 
@@ -1275,8 +1282,8 @@
             (incf token-id)))))
     (nreverse (remove-duplicates stop-token-ids :test #'=))))
 
-(defun test-gguf-file-response (pathname
-                               &key
+(defun generate-gguf-response (pathname
+                              &key
                                  (prompt "Hello, How are you?")
                                  step-function
                                  kv-cache
@@ -1302,6 +1309,8 @@
                                  (npu-cache-directory
                                    (default-npu-cache-directory))
                                  (npu-python-command '("python"))
+                                 callback
+                                 print-metadata
                                  (stream *standard-output*)
                                  (random-state *random-state*))
   (call-with-file pathname
@@ -1361,9 +1370,10 @@
                                      nil))))
                         (unwind-protect
                             (progn
-                             (format stream "Model: ~a~%" pathname)
-                             (format stream "Architecture: ~a~%" architecture)
-                             (format stream "Prompt: ~a~%Response: " prompt)
+                             (when print-metadata
+                               (format stream "Model: ~a~%" pathname)
+                               (format stream "Architecture: ~a~%" architecture)
+                               (format stream "Prompt: ~a~%Response: " prompt))
                              (unless effective-step-function
                                (error
                                 "Cannot run prompt against ~a yet: GGUF metadata loaded (~a, ~d tensors), but tensor loading and the real forward-pass step function are not implemented."
@@ -1385,9 +1395,11 @@
                                   :temperature temperature
                                   :max-tokens max-tokens
                                   :random-values random-values
+                                  :callback callback
                                   :stream stream
                                   :random-state random-state)
-                               (terpri stream)
+                               (when print-metadata
+                                 (terpri stream))
                                (values header
                                        kv-pairs
                                        generated-ids
@@ -1395,6 +1407,9 @@
                                        last-logits)))
                           (when (and model npu-active-p)
                             (clear-model-npu-projections model))))))))
+
+(defun test-gguf-file-response (pathname &rest arguments)
+  (apply #'generate-gguf-response pathname :print-metadata t arguments))
 
 (defun test-llm-response (kv-pairs step-function kv-cache
                            &key

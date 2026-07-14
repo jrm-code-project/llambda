@@ -1,6 +1,15 @@
 (defpackage #:llambda/tests
   (:use #:cl #:fiveam)
-  (:import-from #:llambda #:call-with-file
+  (:import-from #:llambda #:aligned-tensor-mapping-closed-p
+                          #:aligned-tensor-mapping-p
+                          #:aligned-tensor-mapping-tensors
+                          #:aligned-tensor-view-dot-product
+                          #:aligned-tensor-view-element-type
+                          #:aligned-tensor-view-length
+                          #:aligned-tensor-view-p
+                          #:aligned-tensor-view-ref
+                          #:call-with-aligned-tensor-mapping
+                          #:call-with-file
                           #:call-with-mapped-file
                           #:apply-repetition-penalty
                           #:apply-top-k
@@ -9,7 +18,10 @@
                           #:apply-rope
                           #:apply-silu
                           #:benchmark-gguf-projection-backends
+                          #:close-aligned-tensor-mapping
+                          #:close-gemv-runtime
                           #:close-handle
+                          #:close-model
                           #:create-file
                           #:dequantize-q4-k-m
                           #:dequantize-q6-k
@@ -73,6 +85,7 @@
                           #:tokenize-prompt
                           #:unmap-view-of-file
                           #:vector-matrix-multiply
+                          #:with-aligned-tensor-mapping
                           #:with-file-handle
                           #:with-mapped-file)
   (:export #:run-tests))
@@ -88,6 +101,15 @@
   (is (string= "llambda ready." (hello-message))))
 
 (test windows-bindings
+  (is (fboundp 'aligned-tensor-mapping-closed-p))
+  (is (fboundp 'aligned-tensor-mapping-p))
+  (is (fboundp 'aligned-tensor-mapping-tensors))
+  (is (fboundp 'aligned-tensor-view-dot-product))
+  (is (fboundp 'aligned-tensor-view-element-type))
+  (is (fboundp 'aligned-tensor-view-length))
+  (is (fboundp 'aligned-tensor-view-p))
+  (is (fboundp 'aligned-tensor-view-ref))
+  (is (fboundp 'call-with-aligned-tensor-mapping))
   (is (fboundp 'call-with-file))
   (is (fboundp 'call-with-mapped-file))
   (is (fboundp 'apply-repetition-penalty))
@@ -97,8 +119,11 @@
   (is (fboundp 'apply-rope))
   (is (fboundp 'apply-silu))
   (is (fboundp 'benchmark-gguf-projection-backends))
+  (is (fboundp 'close-aligned-tensor-mapping))
+  (is (fboundp 'close-gemv-runtime))
   (is (fboundp 'create-file))
   (is (fboundp 'close-handle))
+  (is (fboundp 'close-model))
   (is (fboundp 'dequantize-q4-k-m))
   (is (fboundp 'dequantize-q6-k))
   (is (fboundp 'detokenize-token-id))
@@ -157,6 +182,7 @@
   (is (fboundp 'tokenize-prompt))
   (is (fboundp 'unmap-view-of-file))
   (is (fboundp 'vector-matrix-multiply))
+  (is (macro-function 'with-aligned-tensor-mapping))
   (is (macro-function 'with-file-handle))
   (is (macro-function 'with-mapped-file)))
 
@@ -323,6 +349,30 @@
                 :roles '(:attention-key :attention-output))))
     (is (string= "output.weight"
                  (llambda::gguf-model-output-tensor-name model)))))
+
+(test native-runtime-close-lifecycle
+  (let* ((tensor-cache (make-hash-table :test #'equal))
+         (model
+           (llambda::make-gguf-model
+            :mapping (cffi:make-pointer 1)
+            :tensor-cache tensor-cache
+            :npu-projections (make-hash-table :test #'equal)
+            :gpu-projections (make-hash-table :test #'equal))))
+    (setf (gethash "cached.weight" tensor-cache) #(1.0f0))
+    (is (eq model (close-model model)))
+    (is (llambda::gguf-model-closed-p model))
+    (is (null (llambda::gguf-model-mapping model)))
+    (is (zerop (hash-table-count tensor-cache)))
+    (is (eq model (close-model model)))
+    (signals error
+      (register-model-npu-projection model "closed.weight" #P"closed.onnx"))
+    (signals error
+      (register-model-gpu-projection model "closed.weight" #P"closed.onnx")))
+  (let ((llambda::*gemv-worker-count* 1))
+    (is (llambda::ensure-gemv-kernel))
+    (is (null (close-gemv-runtime)))
+    (is (null llambda::*gemv-kernel*))
+    (is (null (close-gemv-runtime)))))
 
 (test npu-bf16-export-primitives
   (is (= #x3f80 (llambda::single-float-to-bf16-bits 1.0f0)))
@@ -1364,41 +1414,72 @@
               (write-u16-le stream #x3C00)
               (write-u16-le stream #x3C00))
 
-            ;; Map GGUF tensors to native SBCL arrays
-            (let* ((res (map-gguf-tensors-to-aligned-arrays temp-gguf temp-backed))
-                   (arrays (getf res :arrays))
-                   (views (getf res :views))
-                   (mapping (getf res :mapping))
-                   (file (getf res :file)))
-              (is (= 2 (length arrays)))
-              
-              ;; Verify Tensor 1 (F32)
-              (let ((arr1 (first arrays)))
-                (is (typep arr1 '(vector single-float 4)))
-                (is (= 4 (length arr1)))
-                (is (= 1.5f0 (aref arr1 0)))
-                (is (= 2.5f0 (aref arr1 1)))
-                (is (= 3.5f0 (aref arr1 2)))
-                (is (= 4.5f0 (aref arr1 3)))
-                ;; Verify that forged-dot-product works flawlessly on the forged arrays
-                (is (= 41.0f0 (forged-dot-product arr1 arr1))))
+            (let ((mapping nil)
+                  (tensors nil))
+              (with-aligned-tensor-mapping
+                  (active-mapping temp-gguf temp-backed)
+                (setf mapping active-mapping
+                      tensors
+                      (aligned-tensor-mapping-tensors active-mapping))
+                (is (aligned-tensor-mapping-p active-mapping))
+                (is (not (aligned-tensor-mapping-closed-p active-mapping)))
+                (is (= 2 (length tensors)))
 
-              ;; Verify Tensor 2 (F16 -> byte vector)
-              (let ((arr2 (second arrays)))
-                (is (typep arr2 '(vector (unsigned-byte 8) 8)))
-                (is (= 8 (length arr2)))
-                ;; #x3C00 is little endian: low byte = #x00, high byte = #x3C
-                (is (= #x00 (aref arr2 0)))
-                (is (= #x3C (aref arr2 1)))
-                ;; #xC000 is little endian: low byte = #x00, high byte = #xC0
-                (is (= #x00 (aref arr2 2)))
-                (is (= #xC0 (aref arr2 3))))
+                ;; Verify Tensor 1 (F32)
+                (let ((tensor1 (first tensors)))
+                  (is (aligned-tensor-view-p tensor1))
+                  (is (eq :single-float
+                          (aligned-tensor-view-element-type tensor1)))
+                  (is (= 4 (aligned-tensor-view-length tensor1)))
+                  (is (= 1.5f0 (aligned-tensor-view-ref tensor1 0)))
+                  (is (= 2.5f0 (aligned-tensor-view-ref tensor1 1)))
+                  (is (= 3.5f0 (aligned-tensor-view-ref tensor1 2)))
+                  (is (= 4.5f0 (aligned-tensor-view-ref tensor1 3)))
+                  (is (= 41.0f0
+                         (aligned-tensor-view-dot-product
+                          tensor1 tensor1))))
 
-              ;; Clean up mappings and close handles
-              (dolist (v views)
-                (unmap-view-of-file v))
-              (close-handle mapping)
-              (close-handle file))
+                ;; Verify Tensor 2 (F16 -> byte vector)
+                (let ((tensor2 (second tensors)))
+                  (is (aligned-tensor-view-p tensor2))
+                  (is (eq :unsigned-byte-8
+                          (aligned-tensor-view-element-type tensor2)))
+                  (is (= 8 (aligned-tensor-view-length tensor2)))
+                  (is (= #x00 (aligned-tensor-view-ref tensor2 0)))
+                  (is (= #x3C (aligned-tensor-view-ref tensor2 1)))
+                  (is (= #x00 (aligned-tensor-view-ref tensor2 2)))
+                  (is (= #xC0 (aligned-tensor-view-ref tensor2 3)))))
+              (is (aligned-tensor-mapping-closed-p mapping))
+              (is (null (aligned-tensor-mapping-tensors mapping)))
+              (dolist (tensor tensors)
+                (signals error
+                  (aligned-tensor-view-ref tensor 0)))
+              (is (eq mapping (close-aligned-tensor-mapping mapping)))
+              (is (eq mapping (close-aligned-tensor-mapping mapping))))
+            (let ((failed-mapping nil)
+                  (condition nil))
+              (handler-case
+                  (call-with-aligned-tensor-mapping
+                   temp-gguf
+                   temp-backed
+                   (lambda (mapping)
+                     (setf failed-mapping mapping)
+                     (error "primary receiver failure")))
+                (error (caught-condition)
+                  (setf condition caught-condition)))
+              (is (search "primary receiver failure"
+                          (princ-to-string condition)))
+              (is (aligned-tensor-mapping-closed-p failed-mapping)))
+            (let ((escaped-mapping nil))
+              (is (eq :escaped
+                      (catch 'escape-mapping
+                        (call-with-aligned-tensor-mapping
+                         temp-gguf
+                         temp-backed
+                         (lambda (mapping)
+                           (setf escaped-mapping mapping)
+                           (throw 'escape-mapping :escaped))))))
+              (is (aligned-tensor-mapping-closed-p escaped-mapping)))
             :ok)
         (progn
           (when (probe-file temp-gguf)

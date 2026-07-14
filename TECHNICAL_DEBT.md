@@ -6,7 +6,7 @@ request to replace the specialized numeric kernels.
 
 ## Snapshot
 
-- `llambda.lisp` contains 6,974 lines and 313 `defun` forms.
+- `llambda.lisp` contains 7,182 lines and 323 `defun` forms.
 - It combines Win32 resource management, GGUF parsing, tensor formats,
   quantized kernels, accelerator integration, sampling, tokenization, and five
   model architectures.
@@ -26,7 +26,7 @@ Priority meanings:
 | Rank | Priority | Item | Primary consequence |
 | ---: | :---: | --- | --- |
 | 1 | P0 | GGUF reads were not bounded by the mapped file size (**addressed 2026-07-14**) | Malformed input could drive out-of-bounds native reads or excessive allocation |
-| 2 | P0 | Native resource ownership and forged arrays lack a safe lifecycle | Dangling arrays, leaked views/handles/sessions, and SBCL-version fragility |
+| 2 | P0 | Native resource ownership and forged arrays lacked a safe lifecycle (**addressed 2026-07-14**) | Dangling arrays, leaked views/handles/sessions, and SBCL-version fragility |
 | 3 | P1 | Architecture support is centralized in a superset model and large forward passes | Adding or changing a model family touches multiple coupled dispatch sites |
 | 4 | P1 | Accelerator implementations are duplicated and coupled through NPU-named state | Backend behavior can drift and another provider would multiply code paths |
 | 5 | P1 | Inference state is implicit and step functions are non-reentrant | Concurrent or interleaved use can corrupt scratch or architecture-specific state |
@@ -78,22 +78,27 @@ buffers remain supported by the low-level tensor-loading API.
 
 ## 2. Make native ownership explicit
 
+**Status: Addressed on 2026-07-14.** Aligned tensors are now opaque foreign
+views owned by an `aligned-tensor-mapping`; the public path no longer forges
+Lisp array headers. Closing the owner invalidates every tensor view before
+unmapping and is idempotent. Scoped call/with APIs preserve non-local exits and
+the primary failure. Models and the GEMV worker kernel also have explicit close
+operations, and high-level generation closes its model after accelerator setup
+or inference.
+
 **Evidence**
 
-- `gguf-model` stores a borrowed mapping pointer alongside caches and
-  accelerator sessions (`llambda.lisp:1958-1982`).
-- Public model loaders return models without owning or closing their mapping
-  (`llambda.lisp:5221-5272`, `5434-5467`).
-- NPU/GPU sessions require manual unregister/clear calls
-  (`llambda.lisp:1984-2057`).
-- `map-gguf-tensors-to-aligned-arrays` returns live views and handles in a
-  plist but has no matching close operation (`llambda.lisp:6641-6762`).
-- That function forges SBCL object headers using hard-coded widetags, object
-  offsets, and internal slots (`llambda.lisp:6714-6749`).
-- The global `lparallel` kernel is persistent and has no public shutdown
-  lifecycle (`llambda.lisp:663-674`).
+- GEMV kernel shutdown is explicit at `llambda.lisp:758-768`.
+- Model ownership and idempotent accelerator/cache cleanup are represented at
+  `llambda.lisp:2174-2199` and `2283-2298`.
+- Opaque aligned tensor owners and views are defined at
+  `llambda.lisp:6881-6944`.
+- Idempotent invalidation/cleanup and scoped ownership are implemented at
+  `llambda.lisp:6946-7025`.
+- Aligned mapping acquisition transfers all handles and views into one owner
+  and cleans up on every non-local exit (`llambda.lisp:7027-7176`).
 
-**Why this is debt**
+**Original risk**
 
 The code exposes objects whose validity depends on external handles remaining
 open, but the ownership relationship is not represented by the type system or
@@ -101,20 +106,23 @@ API. The forged arrays are especially hazardous: using one after unmapping is
 a native-memory error, while SBCL layout changes can invalidate the forging
 logic even when callers clean up correctly.
 
-**Remediation**
+**Implemented remediation**
 
-1. Add idempotent `close-model`, `close-aligned-mapping`, and
-   `close-gemv-runtime` operations plus `call-with-*`/`with-*` scopes.
-2. Replace the aligned-mapping plist with a structure that owns its views,
-   mapping handle, file handle, and validity state.
-3. Keep forged arrays behind an explicitly SBCL-specific module; prefer
-   foreign-storage accessors or a copy-based fallback at public boundaries.
-4. Invalidate access before unmapping and preserve the primary condition when
-   cleanup also fails.
-5. Use finalizers only as leak protection, not as the primary lifecycle.
+1. Added idempotent `close-model`, `close-aligned-tensor-mapping`, and
+   `close-gemv-runtime` operations.
+2. Replaced the aligned-mapping plist with a structure that owns its tensor
+   views, mapped views, mapping handle, file handle, and validity state.
+3. Replaced forged Lisp arrays with opaque checked foreign-storage views while
+   retaining zero-copy access and direct float dot products.
+4. Added `call-with-aligned-tensor-mapping` and
+   `with-aligned-tensor-mapping`; view access is invalidated before unmapping,
+   and cleanup does not replace a primary non-local exit.
+5. Kept lifecycle deterministic rather than relying on finalizers.
 
-**Exit criterion:** every native handle, view, session, worker pool, and
-mapping has one documented owner and an idempotent close path.
+**Exit criterion met:** every native handle, mapped view, accelerator session,
+worker pool, and aligned tensor mapping has a documented owner and explicit
+idempotent close path. Model mappings remain intentionally borrowed from the
+surrounding `with-mapped-file` scope and are invalidated by `close-model`.
 
 ## 3. Replace central architecture dispatch with descriptors
 

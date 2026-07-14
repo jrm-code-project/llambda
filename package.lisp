@@ -9,7 +9,16 @@
                 #:make-f32.8)
   (:import-from #:sb-simd-fma
                 #:f32.8-fmadd)
-  (:export #:call-with-file
+  (:export #:aligned-tensor-mapping-closed-p
+           #:aligned-tensor-mapping-p
+           #:aligned-tensor-mapping-tensors
+           #:aligned-tensor-view-dot-product
+           #:aligned-tensor-view-element-type
+           #:aligned-tensor-view-length
+           #:aligned-tensor-view-p
+           #:aligned-tensor-view-ref
+           #:call-with-aligned-tensor-mapping
+           #:call-with-file
            #:call-with-mapped-file
            #:apply-repetition-penalty
            #:apply-top-k
@@ -18,7 +27,10 @@
            #:apply-rope
            #:apply-silu
            #:benchmark-gguf-projection-backends
+           #:close-aligned-tensor-mapping
+           #:close-gemv-runtime
            #:close-handle
+           #:close-model
            #:create-file
            #:dequantize-q4-k-m
            #:dequantize-q6-k
@@ -84,5 +96,6 @@
            #:tokenize-prompt
            #:unmap-view-of-file
            #:vector-matrix-multiply
+           #:with-aligned-tensor-mapping
            #:with-file-handle
            #:with-mapped-file))

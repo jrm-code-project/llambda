@@ -755,6 +755,17 @@
           (lparallel:make-kernel *gemv-worker-count* :name "llambda-gemv")))
   *gemv-kernel*)
 
+(defun close-gemv-runtime ()
+  "Stop and release the process-global GEMV worker kernel, if one exists.
+
+The caller must ensure that no inference request is using the kernel."
+  (when *gemv-kernel*
+    (let ((kernel *gemv-kernel*))
+      (let ((lparallel:*kernel* kernel))
+        (lparallel:end-kernel :wait t))
+      (setf *gemv-kernel* nil)))
+  nil)
+
 (defun parallel-gemv-row-count-p (row-count)
   (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
            (fixnum row-count))
@@ -1615,13 +1626,12 @@
                                                                  (otherwise nil)))))
                              (effective-kv-cache (or kv-cache (make-hash-table)))
                              (effective-eos-token-id
-                              (or eos-token-id (resolve-eos-token-id kv-pairs)))
-                             (npu-active-p nil)
-                             (gpu-active-p nil))
-                        (when (and use-npu (not npu-requested-p))
-                          (warn "NPU acceleration was requested without any usable projections; continuing on the CPU."))
-                        (when npu-requested-p
-                          (setf npu-active-p
+                              (or eos-token-id (resolve-eos-token-id kv-pairs))))
+                        (unwind-protect
+                            (progn
+                             (when (and use-npu (not npu-requested-p))
+                               (warn "NPU acceleration was requested without any usable projections; continuing on the CPU."))
+                             (when npu-requested-p
                                (if model
                                    (try-enable-model-npu-projections
                                     model
@@ -1630,26 +1640,19 @@
                                     :projection-roles npu-projection-roles
                                     :cache-directory npu-cache-directory
                                     :python-command npu-python-command)
-                                   (progn
-                                     (warn "NPU acceleration requires the built-in model loader; continuing on the CPU.")
-                                     nil))))
-                        (when (and use-gpu (not gpu-requested-p))
-                          (warn "GPU acceleration was requested without any usable projections; continuing without GPU acceleration."))
-                        (when gpu-requested-p
-                          (setf gpu-active-p
-                                (if model
-                                    (try-enable-model-gpu-projections
-                                     model
-                                     gpu-tensor-names
-                                     :layer-indices gpu-layer-indices
-                                     :projection-roles gpu-projection-roles
-                                     :cache-directory gpu-cache-directory
-                                     :python-command gpu-python-command)
-                                    (progn
-                                     (warn "GPU acceleration requires the built-in model loader; continuing without GPU acceleration.")
-                                     nil))))
-                        (unwind-protect
-                            (progn
+                                   (warn "NPU acceleration requires the built-in model loader; continuing on the CPU.")))
+                             (when (and use-gpu (not gpu-requested-p))
+                               (warn "GPU acceleration was requested without any usable projections; continuing without GPU acceleration."))
+                             (when gpu-requested-p
+                               (if model
+                                   (try-enable-model-gpu-projections
+                                    model
+                                    gpu-tensor-names
+                                    :layer-indices gpu-layer-indices
+                                    :projection-roles gpu-projection-roles
+                                    :cache-directory gpu-cache-directory
+                                    :python-command gpu-python-command)
+                                   (warn "GPU acceleration requires the built-in model loader; continuing without GPU acceleration.")))
                              (when print-metadata
                                (format stream "Model: ~a~%" pathname)
                                (format stream "Architecture: ~a~%" architecture)
@@ -1685,10 +1688,8 @@
                                        generated-ids
                                        generated-text
                                        last-logits)))
-                          (when (and model gpu-active-p)
-                            (clear-model-gpu-projections model))
-                          (when (and model npu-active-p)
-                            (clear-model-npu-projections model))))))))
+                          (when model
+                            (close-model model))))))))
 
 (defun test-gguf-file-response (pathname &rest arguments)
   (apply #'generate-gguf-response pathname :print-metadata t arguments))
@@ -2194,10 +2195,17 @@ Write a haiku about a hacker drinking coffee.<turn|>
   final-logit-softcap
   output-tensor-name
   (npu-projections (make-hash-table :test #'equal))
-  (gpu-projections (make-hash-table :test #'equal)))
+  (gpu-projections (make-hash-table :test #'equal))
+  (closed-p nil))
+
+(defun ensure-model-open (model operation)
+  (when (gguf-model-closed-p model)
+    (error "~a cannot use a closed GGUF model." operation))
+  model)
 
 (defun register-model-npu-projection
     (model tensor-name onnx-path &key cache-directory cache-key)
+  (ensure-model-open model "REGISTER-MODEL-NPU-PROJECTION")
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
          (projections (gguf-model-npu-projections model)))
     (when (gethash tensor-name projections)
@@ -2236,6 +2244,7 @@ Write a haiku about a hacker drinking coffee.<turn|>
   model)
 
 (defun register-model-gpu-projection (model tensor-name onnx-path)
+  (ensure-model-open model "REGISTER-MODEL-GPU-PROJECTION")
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
          (projections (gguf-model-gpu-projections model)))
     (when (gethash tensor-name projections)
@@ -2269,6 +2278,21 @@ Write a haiku about a hacker drinking coffee.<turn|>
              (close-gpu-session session))
            (gguf-model-gpu-projections model))
   (clrhash (gguf-model-gpu-projections model))
+  model)
+
+(defun close-model (model)
+  "Release accelerator sessions and cached tensors owned by MODEL.
+
+The GGUF mapping is borrowed from the surrounding WITH-MAPPED-FILE scope and
+is invalidated here, but its handle remains owned by that scope."
+  (unless (gguf-model-closed-p model)
+    (clear-model-gpu-projections model)
+    (clear-model-npu-projections model)
+    (let ((tensor-cache (gguf-model-tensor-cache model)))
+      (when tensor-cache
+        (clrhash tensor-cache)))
+    (setf (gguf-model-mapping model) nil
+          (gguf-model-closed-p model) t))
   model)
 
 (defun tensor-content-sha256 (model tensor-info)
@@ -2638,6 +2662,7 @@ Write a haiku about a hacker drinking coffee.<turn|>
             tensor-info))))
 
 (defun gguf-model-tensor-info (model tensor-name &optional requiredp)
+  (ensure-model-open model "GGUF-MODEL-TENSOR-INFO")
   (let ((tensor-info (gethash tensor-name (gguf-model-tensor-info-table model))))
     (when (and requiredp (null tensor-info))
       (error "Model is missing required tensor ~s." tensor-name))
@@ -6853,16 +6878,164 @@ and copy all tensors into 64KB-aligned chunks, offset by 16 bytes for an SBCL ar
                     (close-handle temp-handle)))))
           total-temp-size))))))
 
-(defun map-gguf-tensors-to-aligned-arrays (gguf-pathname temp-pathname)
-  "Read GGUF-PATHNAME, allocate TEMP-PATHNAME, map and copy all tensors into 64KB-aligned chunks,
-forge native SBCL array pointers pointing to these chunks, and return the list of forged arrays.
-Returns a plist: (:arrays list-of-arrays :views views :mapping mapping-handle :file file-handle)"
+(defstruct (aligned-tensor-mapping
+            (:constructor %make-aligned-tensor-mapping
+                (&key tensors views mapping-handle file-handle)))
+  tensors
+  views
+  mapping-handle
+  file-handle
+  (closed-p nil))
+
+(defstruct (aligned-tensor-view
+            (:constructor %make-aligned-tensor-view
+                (&key mapping pointer length element-type)))
+  mapping
+  pointer
+  length
+  element-type)
+
+(defun ensure-aligned-tensor-view-open (tensor)
+  (let ((mapping (aligned-tensor-view-mapping tensor)))
+    (when (or (null mapping)
+              (aligned-tensor-mapping-closed-p mapping)
+              (cffi:null-pointer-p (aligned-tensor-view-pointer tensor)))
+      (error "The aligned tensor view is closed.")))
+  tensor)
+
+(defun aligned-tensor-view-ref (tensor index)
+  "Read one element from an open aligned tensor view."
+  (ensure-aligned-tensor-view-open tensor)
+  (unless (and (integerp index)
+               (<= 0 index)
+               (< index (aligned-tensor-view-length tensor)))
+    (error "Aligned tensor index ~s is outside [0, ~d)."
+           index
+           (aligned-tensor-view-length tensor)))
+  (ecase (aligned-tensor-view-element-type tensor)
+    (:single-float
+     (cffi:mem-aref
+      (aligned-tensor-view-pointer tensor) :float index))
+    (:unsigned-byte-8
+     (cffi:mem-aref
+      (aligned-tensor-view-pointer tensor) :unsigned-char index))))
+
+(defun aligned-tensor-view-dot-product (left right)
+  "Compute a dot product directly from two open aligned float tensor views."
+  (ensure-aligned-tensor-view-open left)
+  (ensure-aligned-tensor-view-open right)
+  (unless (and (eq :single-float (aligned-tensor-view-element-type left))
+               (eq :single-float (aligned-tensor-view-element-type right)))
+    (error "Aligned tensor dot products require single-float views."))
+  (let ((length (aligned-tensor-view-length left)))
+    (unless (= length (aligned-tensor-view-length right))
+      (error "Aligned tensor lengths do not match: ~d and ~d."
+             length
+             (aligned-tensor-view-length right)))
+    (let ((left-pointer (aligned-tensor-view-pointer left))
+          (right-pointer (aligned-tensor-view-pointer right))
+          (sum 0.0f0))
+      (declare (single-float sum)
+               (optimize (speed 3) (safety 0)))
+      (dotimes (index length sum)
+        (setf sum
+              (+ sum
+                 (* (cffi:mem-aref left-pointer :float index)
+                    (cffi:mem-aref right-pointer :float index))))))))
+
+(defun close-aligned-tensor-mapping (mapping)
+  "Invalidate tensor views and release every native resource owned by MAPPING.
+
+The operation is idempotent. Extracted tensor views reject access before their
+backing views are unmapped."
+  (check-type mapping aligned-tensor-mapping)
+  (unless (aligned-tensor-mapping-closed-p mapping)
+    (setf (aligned-tensor-mapping-closed-p mapping) t)
+    (dolist (tensor (aligned-tensor-mapping-tensors mapping))
+      (setf (aligned-tensor-view-pointer tensor) (cffi:null-pointer)
+            (aligned-tensor-view-mapping tensor) nil))
+    (setf (aligned-tensor-mapping-tensors mapping) nil))
+  (when (or (aligned-tensor-mapping-views mapping)
+            (aligned-tensor-mapping-mapping-handle mapping)
+            (aligned-tensor-mapping-file-handle mapping))
+    (let ((failed-views '())
+          (first-error nil))
+      (dolist (view (aligned-tensor-mapping-views mapping))
+        (unless (unmap-view-of-file view)
+          (push view failed-views)
+          (unless first-error
+            (setf first-error
+                  (make-condition
+                   'simple-error
+                   :format-control "UnmapViewOfFile failed for an aligned tensor view.")))))
+      (setf (aligned-tensor-mapping-views mapping) (nreverse failed-views))
+      (let ((mapping-handle
+              (aligned-tensor-mapping-mapping-handle mapping)))
+        (when mapping-handle
+          (if (close-handle mapping-handle)
+              (setf (aligned-tensor-mapping-mapping-handle mapping) nil)
+              (unless first-error
+                (setf first-error
+                      (make-condition
+                       'simple-error
+                       :format-control "CloseHandle failed for an aligned tensor mapping."))))))
+      (let ((file-handle (aligned-tensor-mapping-file-handle mapping)))
+        (when file-handle
+          (if (close-handle file-handle)
+              (setf (aligned-tensor-mapping-file-handle mapping) nil)
+              (unless first-error
+                (setf first-error
+                      (make-condition
+                       'simple-error
+                       :format-control "CloseHandle failed for an aligned tensor file."))))))
+      (when first-error
+        (error first-error))))
+  mapping)
+
+(defun report-aligned-tensor-cleanup-failure (condition)
+  (format *error-output*
+          "~&WARNING: Aligned tensor cleanup also failed: ~a~%"
+          condition)
+  (finish-output *error-output*))
+
+(defun call-with-aligned-tensor-mapping
+    (gguf-pathname temp-pathname receiver)
+  "Call RECEIVER with an aligned tensor mapping and always close it afterward."
+  (let ((mapping
+          (map-gguf-tensors-to-aligned-arrays gguf-pathname temp-pathname))
+        (completed-p nil))
+    (unwind-protect
+        (multiple-value-prog1
+            (funcall receiver mapping)
+          (setf completed-p t))
+      (handler-case
+          (close-aligned-tensor-mapping mapping)
+        (error (cleanup-condition)
+          (if completed-p
+              (error cleanup-condition)
+              (report-aligned-tensor-cleanup-failure
+               cleanup-condition)))))))
+
+(defmacro with-aligned-tensor-mapping
+    ((mapping gguf-pathname temp-pathname) &body body)
+  `(call-with-aligned-tensor-mapping
+    ,gguf-pathname
+    ,temp-pathname
+    (lambda (,mapping)
+      ,@body)))
+
+(defun %map-gguf-tensors-to-aligned-arrays
+    (gguf-pathname temp-pathname owner-receiver)
+  "Copy GGUF tensors into 64KB-aligned mapped chunks.
+
+Returns an ALIGNED-TENSOR-MAPPING that owns opaque zero-copy tensor views,
+mapped views, the mapping handle, and the file handle. Call
+CLOSE-ALIGNED-TENSOR-MAPPING when done, or prefer
+WITH-ALIGNED-TENSOR-MAPPING."
   (let ((generic-write #x40000000)
         (create-always 2)
         (page-readwrite #x00000004)
-        (file-map-write #x00000002)
-        (sbcl-widetag-single-float #xD1)
-        (sbcl-widetag-unsigned-byte-8 #x9D))
+        (file-map-write #x00000002))
     (call-with-file gguf-pathname
       (lambda (gguf-handle)
         (with-mapped-file (gguf-mapping gguf-handle)
@@ -6884,97 +7057,122 @@ Returns a plist: (:arrays list-of-arrays :views views :mapping mapping-handle :f
                                       (+ (getf (car (last temp-layout)) :target-offset)
                                          (* 65536 (ceiling (getf (car (last temp-layout)) :required-size) 65536)))
                                       0)))
-            (let* ((native-temp-path (uiop:native-namestring temp-pathname))
-                   (temp-name-ptr (cffi:foreign-alloc :uint16 :count (1+ (length native-temp-path)))))
-              (dotimes (i (length native-temp-path))
-                (setf (cffi:mem-aref temp-name-ptr :uint16 i)
-                      (char-code (char native-temp-path i))))
-              (setf (cffi:mem-aref temp-name-ptr :uint16 (length native-temp-path)) 0)
-              (let ((temp-handle (create-file temp-name-ptr
-                                              (logior +generic-read+ generic-write)
-                                              +file-share-read+
-                                              (cffi:null-pointer)
-                                              create-always
-                                              +file-attribute-normal+
-                                              (cffi:null-pointer))))
-                (cffi:foreign-free temp-name-ptr)
-                (when (invalid-handle-p temp-handle)
-                  (error "CreateFileW failed for temporary file ~a." native-temp-path))
-                (let ((temp-mapping-handle (create-file-mapping temp-handle
-                                                                (cffi:null-pointer)
-                                                                page-readwrite
-                                                                (ash total-temp-size -32)
-                                                                (logand total-temp-size #xFFFFFFFF)
-                                                                (cffi:null-pointer))))
-                  (when (cffi:null-pointer-p temp-mapping-handle)
-                    (close-handle temp-handle)
-                    (error "CreateFileMappingW failed for temporary file."))
-                  (let ((forged-arrays '())
-                        (views-list '()))
-                    (handler-case
-                        (dolist (layout temp-layout)
-                          (let* ((info (getf layout :info))
-                                 (byte-size (getf layout :byte-size))
-                                 (required-size (getf layout :required-size))
-                                 (target-offset (getf layout :target-offset))
-                                 (temp-view (map-view-of-file temp-mapping-handle
-                                                              file-map-write
-                                                              (ash target-offset -32)
-                                                              (logand target-offset #xFFFFFFFF)
-                                                              required-size)))
-                            (when (cffi:null-pointer-p temp-view)
-                              (error "MapViewOfFile failed at offset #x~X for size ~D."
-                                     target-offset required-size))
-                            (push temp-view views-list)
-                            ;; A. Write the appropriate 16-byte SBCL simple-array header
-                            (let* ((type-tag (getf info :type-tag))
-                                   (is-f32 (= type-tag +ggml-type-f32+))
-                                   (widetag (if is-f32
-                                                sbcl-widetag-single-float
-                                                sbcl-widetag-unsigned-byte-8))
-                                   (array-length (if is-f32
-                                                     (getf info :element-count)
-                                                     byte-size)))
-                              ;; Word 0: Widetag
-                              (setf (cffi:mem-ref temp-view :uint64 0) widetag)
-                              ;; Word 1: Length (as fixnum)
-                              (setf (cffi:mem-ref temp-view :uint64 8) (* array-length 2))
-                              
-                              ;; B. Copy the tensor data from the mapped GGUF file
-                              (let ((gguf-tensor-ptr (cffi:inc-pointer gguf-mapping
-                                                                        (getf info :data-offset)))
-                                    (temp-tensor-ptr (cffi:inc-pointer temp-view 16)))
-                                (rtl-move-memory temp-tensor-ptr
-                                                 gguf-tensor-ptr
-                                                 byte-size))
-                              
-                              ;; C. Forge the Lisp complex-vector pointing to this mapped view
-                              (let* ((aligned-addr (cffi:pointer-address temp-view))
-                                     (arr (sb-kernel:make-array-header sb-vm:complex-vector-widetag 1))
-                                     (arr-addr (- (sb-kernel:get-lisp-obj-address arr) 15))
-                                     (dummy-vector (if is-f32
-                                                       (make-array 1 :element-type 'single-float)
-                                                       (make-array 1 :element-type '(unsigned-byte 8)))))
-                                (setf (sb-kernel:%array-fill-pointer arr) array-length)
-                                (setf (sb-kernel:%array-available-elements arr) array-length)
-                                (sb-kernel:%set-array-dimension arr 0 array-length)
-                                (setf (sb-kernel:%array-data arr) dummy-vector)
-                                ;; Overwrite the data vector slot with our forged simple-array!
-                                (setf (sb-sys:sap-ref-64 (sb-sys:int-sap arr-addr) (* sb-vm:array-data-slot 8))
-                                      (+ aligned-addr 15))
-                                (push arr forged-arrays)))))
-                      (error (c)
-                        ;; If anything fails, unmap everything and clean up
-                        (dolist (v views-list) (unmap-view-of-file v))
-                        (close-handle temp-mapping-handle)
-                        (close-handle temp-handle)
-                        (error c)))
-                    ;; Keep the temp-mapping-handle and temp-handle open so memory remains mapped!
-                    ;; We return a plist with the forged arrays and the cleanup context.
-                    (list :arrays (nreverse forged-arrays)
-                          :views views-list
-                          :mapping temp-mapping-handle
-                          :file temp-handle)))))))))))
+            (let ((native-temp-path
+                    (uiop:native-namestring temp-pathname))
+                  (temp-handle nil)
+                  (temp-mapping-handle nil)
+                  (mapping nil)
+                  (completed-p nil))
+              (unwind-protect
+                  (cffi:with-foreign-string
+                      (temp-name-ptr native-temp-path :encoding :utf-16le)
+                    (setf temp-handle
+                          (create-file temp-name-ptr
+                                       (logior +generic-read+ generic-write)
+                                       +file-share-read+
+                                       (cffi:null-pointer)
+                                       create-always
+                                       +file-attribute-normal+
+                                       (cffi:null-pointer)))
+                    (when (invalid-handle-p temp-handle)
+                      (setf temp-handle nil)
+                      (error "CreateFileW failed for temporary file ~a."
+                             native-temp-path))
+                    (setf mapping
+                          (%make-aligned-tensor-mapping
+                           :tensors nil
+                           :views nil
+                           :mapping-handle nil
+                           :file-handle temp-handle))
+                    (funcall owner-receiver mapping)
+                    (unless (zerop total-temp-size)
+                      (setf temp-mapping-handle
+                            (create-file-mapping
+                             temp-handle
+                             (cffi:null-pointer)
+                             page-readwrite
+                             (ash total-temp-size -32)
+                             (logand total-temp-size #xFFFFFFFF)
+                             (cffi:null-pointer)))
+                      (when (cffi:null-pointer-p temp-mapping-handle)
+                        (setf temp-mapping-handle nil)
+                        (error "CreateFileMappingW failed for temporary file."))
+                      (setf (aligned-tensor-mapping-mapping-handle mapping)
+                            temp-mapping-handle))
+                    (dolist (layout temp-layout)
+                      (let* ((info (getf layout :info))
+                             (byte-size (getf layout :byte-size))
+                             (required-size (getf layout :required-size))
+                             (target-offset (getf layout :target-offset))
+                             (temp-view
+                               (map-view-of-file
+                                temp-mapping-handle
+                                file-map-write
+                                (ash target-offset -32)
+                                (logand target-offset #xFFFFFFFF)
+                                required-size)))
+                        (when (cffi:null-pointer-p temp-view)
+                          (error "MapViewOfFile failed at offset #x~X for size ~D."
+                                 target-offset required-size))
+                        (push temp-view
+                              (aligned-tensor-mapping-views mapping))
+                        (let* ((is-f32
+                                 (= (getf info :type-tag)
+                                    +ggml-type-f32+))
+                               (tensor-pointer
+                                 (cffi:inc-pointer temp-view 16))
+                               (tensor-length
+                                 (if is-f32
+                                     (getf info :element-count)
+                                     byte-size)))
+                          (rtl-move-memory
+                           tensor-pointer
+                           (cffi:inc-pointer
+                            gguf-mapping
+                            (getf info :data-offset))
+                           byte-size)
+                          (push
+                           (%make-aligned-tensor-view
+                            :mapping mapping
+                            :pointer tensor-pointer
+                            :length tensor-length
+                            :element-type
+                            (if is-f32
+                                :single-float
+                                :unsigned-byte-8))
+                           (aligned-tensor-mapping-tensors mapping)))))
+                    (setf (aligned-tensor-mapping-tensors mapping)
+                          (nreverse
+                           (aligned-tensor-mapping-tensors mapping))
+                          completed-p t)
+                    mapping)
+                (unless completed-p
+                  (handler-case
+                      (when mapping
+                        (close-aligned-tensor-mapping mapping))
+                    (error (cleanup-condition)
+                      (report-aligned-tensor-cleanup-failure
+                       cleanup-condition))))))))))))
+
+(defun map-gguf-tensors-to-aligned-arrays (gguf-pathname temp-pathname)
+  "Create an owning mapping of opaque zero-copy tensor views."
+  (let ((mapping nil)
+        (completed-p nil))
+    (unwind-protect
+        (multiple-value-prog1
+            (%map-gguf-tensors-to-aligned-arrays
+             gguf-pathname
+             temp-pathname
+             (lambda (owner)
+               (setf mapping owner)))
+          (setf completed-p t))
+      (unless completed-p
+        (when mapping
+          (handler-case
+              (close-aligned-tensor-mapping mapping)
+            (error (cleanup-condition)
+              (report-aligned-tensor-cleanup-failure
+               cleanup-condition))))))))
 
 (defun hello-message ()
   "Return the default startup message for llambda."

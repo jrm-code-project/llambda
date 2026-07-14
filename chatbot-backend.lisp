@@ -78,7 +78,11 @@
          (top-p
            (llambda-generation-option effective-generation-config
                                       :top-p
-                                      0.90f0)))
+                                      0.95f0))
+         (top-k
+           (llambda-generation-option effective-generation-config
+                                      :top-k
+                                      *llambda-top-k*)))
     (unless (and (stringp model-path) (string/= model-path ""))
       (error "llambda backend model must be a GGUF pathname string."))
     (multiple-value-bind (header kv-pairs generated-ids text last-logits)
@@ -86,7 +90,7 @@
                  model-path
                  :prompt prompt
                  :repetition-penalty *llambda-repetition-penalty*
-                 :top-k *llambda-top-k*
+                 :top-k top-k
                  :top-p (coerce top-p 'single-float)
                  :temperature (coerce temperature 'single-float)
                  :max-tokens *llambda-max-tokens*

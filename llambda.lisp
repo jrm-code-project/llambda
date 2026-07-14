@@ -28,6 +28,8 @@
 (defconstant +ggml-type-q4-k+ 12)
 (defconstant +ggml-type-q5-k+ 13)
 (defconstant +ggml-type-q6-k+ 14)
+(defconstant +default-top-k+ 40)
+(defconstant +default-top-p+ 0.95f0)
 
 (defparameter *compute-gguf-logits* t)
 (defparameter *gemv-worker-count* 24)
@@ -36,6 +38,7 @@
 (defparameter *gpt2-unicode-byte-table* nil)
 (defparameter *gpt2-byte-unicode-table* nil)
 (defparameter *npu-library* nil)
+(defparameter *gpu-library* nil)
 (defparameter *npu-runtime-library* nil)
 
 (cffi:defcfun ("SetDllDirectoryW" %set-dll-directory) :boolean
@@ -76,16 +79,45 @@
   (input-element-count :size)
   (output :pointer)
   (output-element-count :size))
+(cffi:defcfun ("llambda_gpu_probe" %gpu-probe) :int)
+(cffi:defcfun ("llambda_gpu_session_create" %gpu-session-create) :int
+  (model-path :string)
+  (result :pointer))
+(cffi:defcfun ("llambda_gpu_session_destroy" %gpu-session-destroy) :void
+  (session :pointer))
+(cffi:defcfun ("llambda_gpu_session_input_element_count"
+               %gpu-session-input-element-count) :size
+  (session :pointer))
+(cffi:defcfun ("llambda_gpu_session_output_element_count"
+               %gpu-session-output-element-count) :size
+  (session :pointer))
+(cffi:defcfun ("llambda_gpu_session_run" %gpu-session-run) :int
+  (session :pointer)
+  (input :pointer)
+  (input-element-count :size)
+  (output :pointer)
+  (output-element-count :size))
 
 (defstruct (npu-session (:constructor %make-npu-session))
   pointer
   input-element-count
   output-element-count)
 
+(defstruct (gpu-session (:constructor %make-gpu-session))
+  pointer
+  input-element-count
+  output-element-count)
+
 (define-condition npu-backend-error (simple-error) ())
+(define-condition gpu-backend-error (simple-error) ())
 
 (defun npu-backend-error (format-control &rest format-arguments)
   (error 'npu-backend-error
+         :format-control format-control
+         :format-arguments format-arguments))
+
+(defun gpu-backend-error (format-control &rest format-arguments)
+  (error 'gpu-backend-error
          :format-control format-control
          :format-arguments format-arguments))
 
@@ -93,6 +125,11 @@
   (asdf:system-relative-pathname
    :llambda
    #P"native/build/Release/llambda_npu.dll"))
+
+(defun default-gpu-library-pathname ()
+  (asdf:system-relative-pathname
+   :llambda
+   #P"native/build-gpu/Release/llambda_npu.dll"))
 
 (defun load-npu-backend (&optional (pathname (default-npu-library-pathname)))
   (or *npu-library*
@@ -125,7 +162,8 @@
                         (cffi:load-foreign-library
                          (uiop:native-namestring runtime-pathname)))
                   (setf *npu-library*
-                        (cffi:load-foreign-library native-pathname)))
+                        (cffi:load-foreign-library native-pathname))
+                  (setf *gpu-library* *npu-library*))
               (if previous-value
                   (cffi:with-foreign-string
                       (previous-pointer previous-value :encoding :utf-16le)
@@ -133,6 +171,14 @@
                       (error "Unable to restore the DLL search directory.")))
                   (unless (%set-dll-directory (cffi:null-pointer))
                     (error "Unable to restore the default DLL search path.")))))))))
+
+(defun load-gpu-backend (&optional (pathname (default-gpu-library-pathname)))
+  (or *gpu-library*
+      (progn
+        (if *npu-library*
+            (setf *gpu-library* *npu-library*)
+            (load-npu-backend pathname))
+        *gpu-library*)))
 
 (defun require-npu-backend ()
   (unless *npu-library*
@@ -146,6 +192,25 @@
           ((zerop result) nil)
           (t (npu-backend-error
               "NPU backend probe failed: ~a" (%npu-last-error))))))
+
+(defun require-gpu-backend ()
+  (unless *gpu-library*
+    (gpu-backend-error
+     "The GPU backend is not loaded. Call LOAD-GPU-BACKEND first.")))
+
+(defun gpu-backend-available-p ()
+  (require-gpu-backend)
+  (let ((result (%gpu-probe)))
+    (cond ((= result 1) t)
+          ((zerop result) nil)
+          (t (gpu-backend-error
+              "GPU backend probe failed: ~a" (%npu-last-error))))))
+
+(defun gpu-backend-runtime-version ()
+  (require-gpu-backend)
+  (or (%npu-runtime-version)
+      (gpu-backend-error
+       "Unable to query ONNX Runtime: ~a" (%npu-last-error))))
 
 (defun npu-backend-runtime-version ()
   (require-npu-backend)
@@ -215,6 +280,55 @@
            "NPU bridge invocation failed: ~a" condition)))))
   dest)
 
+(defun check-gpu-status (status operation)
+  (unless (zerop status)
+    (gpu-backend-error "~a failed: ~a" operation (%npu-last-error))))
+
+(defun make-gpu-session (model-path)
+  (require-gpu-backend)
+  (cffi:with-foreign-object (result :pointer)
+    (check-gpu-status
+     (%gpu-session-create (uiop:native-namestring model-path) result)
+     "GPU session creation")
+    (let ((pointer (cffi:mem-ref result :pointer)))
+      (%make-gpu-session
+       :pointer pointer
+       :input-element-count (%gpu-session-input-element-count pointer)
+       :output-element-count (%gpu-session-output-element-count pointer)))))
+
+(defun close-gpu-session (session)
+  (let ((pointer (gpu-session-pointer session)))
+    (unless (cffi:null-pointer-p pointer)
+      (%gpu-session-destroy pointer)
+      (setf (gpu-session-pointer session) (cffi:null-pointer))))
+  nil)
+
+(defun run-gpu-session-into (dest session input)
+  (unless (= (length input) (gpu-session-input-element-count session))
+    (error "GPU input length ~d does not match session input length ~d."
+           (length input)
+           (gpu-session-input-element-count session)))
+  (unless (= (length dest) (gpu-session-output-element-count session))
+    (error "GPU output length ~d does not match session output length ~d."
+           (length dest)
+           (gpu-session-output-element-count session)))
+  (cffi:with-pointer-to-vector-data (input-pointer input)
+    (cffi:with-pointer-to-vector-data (output-pointer dest)
+      (handler-case
+          (check-gpu-status
+           (%gpu-session-run (gpu-session-pointer session)
+                             input-pointer
+                             (length input)
+                             output-pointer
+                             (length dest))
+           "GPU inference")
+        (gpu-backend-error (condition)
+          (error condition))
+        (error (condition)
+          (gpu-backend-error
+           "GPU bridge invocation failed: ~a" condition)))))
+  dest)
+
 (defun single-float-to-bf16-bits (value)
   #+sbcl
   (let* ((bits (sb-kernel::single-float-bits value))
@@ -227,6 +341,16 @@
   (let ((bits (single-float-to-bf16-bits value)))
     (write-byte (ldb (byte 8 0) bits) stream)
     (write-byte (ldb (byte 8 8) bits) stream)))
+
+(defun write-f32-le (stream value)
+  #+sbcl
+  (let ((bits (sb-kernel::single-float-bits value)))
+    (dotimes (byte-index 4)
+      (write-byte (ldb (byte 8 (* byte-index 8)) bits) stream)))
+  #-sbcl
+  (declare (ignore stream value))
+  #-sbcl
+  (error "Float32 projection export currently requires SBCL."))
 
 (defun default-npu-model-generator-pathname ()
   (asdf:system-relative-pathname
@@ -244,15 +368,18 @@
         (error "MoveFileExW failed while replacing ~a." destination))))
   destination)
 
-(defun export-model-npu-projection
+(defun export-model-accelerator-projection
     (model tensor-name onnx-path
      &key
        (python-command '("python"))
-       (generator-path (default-npu-model-generator-pathname)))
+       (generator-path (default-npu-model-generator-pathname))
+       (weight-format :bfloat16))
+  (unless (member weight-format '(:bfloat16 :float32))
+    (error "Unknown accelerator projection weight format ~s." weight-format))
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
          (dimensions (getf tensor-info :dimensions)))
     (unless (= 2 (length dimensions))
-      (error "NPU projection export requires a two-dimensional tensor, not ~s."
+      (error "Accelerator projection export requires a two-dimensional tensor, not ~s."
              dimensions))
     (let* ((column-count (tensor-column-count tensor-info))
            (row-count (tensor-row-count tensor-info))
@@ -260,10 +387,12 @@
            (raw-path
              (merge-pathnames
               (make-pathname
-               :name (format nil "llambda-npu-weights-~d-~d"
+               :name (format nil "llambda-weights-~d-~d"
                              (get-universal-time)
                              (random most-positive-fixnum))
-               :type "bf16")
+               :type (ecase weight-format
+                       (:bfloat16 "bf16")
+                       (:float32 "f32")))
               (uiop:temporary-directory)))
            (temporary-onnx-path
              (make-pathname
@@ -291,14 +420,20 @@
                  tensor-info
                  row-index)
                 (dotimes (column-index column-count)
-                  (write-bf16-le stream (aref row column-index)))))
+                  (ecase weight-format
+                    (:bfloat16
+                     (write-bf16-le stream (aref row column-index)))
+                    (:float32
+                     (write-f32-le stream (aref row column-index)))))))
             (uiop:run-program
              (append command-prefix
                      (list (uiop:native-namestring generator-path)
                            (uiop:native-namestring temporary-onnx-path)
                            "--rows" (write-to-string row-count)
                            "--columns" (write-to-string column-count)
-                           "--dtype" "bfloat16"
+                           "--dtype" (ecase weight-format
+                                       (:bfloat16 "bfloat16")
+                                       (:float32 "float32"))
                            "--weights" (uiop:native-namestring raw-path)))
              :output *standard-output*
              :error-output *error-output*)
@@ -309,7 +444,17 @@
         (when (probe-file temporary-onnx-path)
           (delete-file temporary-onnx-path))))))
 
+(defun export-model-npu-projection
+    (model tensor-name onnx-path &rest arguments)
+  (apply #'export-model-accelerator-projection
+        model tensor-name onnx-path arguments))
 
+(defun export-model-gpu-projection
+    (model tensor-name onnx-path &rest arguments)
+  (unless (getf arguments :weight-format)
+    (setf arguments (append arguments '(:weight-format :float32))))
+  (apply #'export-model-accelerator-projection
+        model tensor-name onnx-path arguments))
 (cffi:defcfun ("CreateFileW" create-file) handle
   (file-name :pointer)
   (desired-access dword)
@@ -998,33 +1143,44 @@
                                     &key
                                       history
                                       (repetition-penalty 1.15f0)
-                                      (top-k 40)
-                                      (top-p 0.90f0)
+                                      (top-k +default-top-k+)
+                                      (top-p +default-top-p+)
                                       (temperature 1.0)
                                       top-k-workspace
                                       top-p-logit-workspace
                                       top-p-index-workspace
                                       random-value
                                       (random-state *random-state*))
-  (declare (single-float repetition-penalty)
-           (single-float top-p)
-           (fixnum top-k))
-  (let ((effective-logits (if (typep logits '(simple-array single-float (*)))
+  (declare (single-float repetition-penalty))
+  (let* ((effective-top-k (or top-k +default-top-k+))
+        (raw-top-p (or top-p +default-top-p+))
+        (effective-top-p
+          (if (realp raw-top-p)
+              (coerce raw-top-p 'single-float)
+              (error "TOP-P must be a real number or NIL, got ~s." top-p)))
+        (effective-logits (if (typep logits '(simple-array single-float (*)))
                               logits
                               (ensure-single-float-array logits))))
     (declare (type (simple-array single-float (*)) effective-logits))
+    (unless (and (typep effective-top-k 'fixnum)
+                 (not (minusp effective-top-k)))
+      (error "TOP-K must be a nonnegative fixnum or NIL, got ~s." top-k))
+    (unless (and (< 0.0f0 effective-top-p)
+                 (<= effective-top-p 1.0f0))
+      (error "TOP-P must satisfy 0.0 < p <= 1.0, got ~s." top-p))
     (when history
       (apply-repetition-penalty effective-logits history repetition-penalty))
     (if top-k-workspace
-        (apply-top-k-with-workspace effective-logits top-k top-k-workspace)
-        (apply-top-k effective-logits top-k))
+        (apply-top-k-with-workspace
+         effective-logits effective-top-k top-k-workspace)
+        (apply-top-k effective-logits effective-top-k))
     (if (and top-p-logit-workspace top-p-index-workspace)
         (apply-top-p-with-workspace effective-logits
-                                    top-p
+                                    effective-top-p
                                     temperature
                                     top-p-logit-workspace
                                     top-p-index-workspace)
-        (apply-top-p effective-logits top-p temperature))
+        (apply-top-p effective-logits effective-top-p temperature))
     (sample-from-probabilities
      (softmax (apply-temperature effective-logits temperature))
      :random-value random-value
@@ -1048,8 +1204,8 @@
                            &key
                              history
                              (repetition-penalty 1.15f0)
-                             (top-k 40)
-                             (top-p 0.90f0)
+                             (top-k +default-top-k+)
+                             (top-p +default-top-p+)
                              (temperature 1.0)
                              top-k-workspace
                              top-p-logit-workspace
@@ -1080,19 +1236,17 @@
                                stop-token-ids
                                (start-position 0)
                                (repetition-penalty 1.15f0)
-                               (top-k 40)
-                              (top-p 0.90f0)
+                               (top-k +default-top-k+)
+                              (top-p +default-top-p+)
                               (temperature 1.0)
                               (max-tokens 256)
                               random-values
                               callback
                               (stream *standard-output*)
                               (random-state *random-state*))
-  (let ((current-logits initial-logits)
+  (let ((effective-top-k (or top-k +default-top-k+))
+        (current-logits initial-logits)
         (generated-token-ids '())
-        (workspace-size (max 1 (if (zerop top-k)
-                                  (length initial-logits)
-                                  top-k)))
         (top-k-workspace nil)
         (top-p-logit-workspace nil)
         (top-p-index-workspace nil)
@@ -1101,10 +1255,20 @@
                                                 (when eos-token-id
                                                   (list eos-token-id))))
                             :test #'=)))
-    (declare (fixnum workspace-size))
-    (setf top-k-workspace (make-array workspace-size :element-type 'single-float)
-         top-p-logit-workspace (make-array workspace-size :element-type 'single-float)
-         top-p-index-workspace (make-array workspace-size :element-type 'fixnum))
+    (unless (and (typep effective-top-k 'fixnum)
+                (not (minusp effective-top-k)))
+      (error "TOP-K must be a nonnegative fixnum or NIL, got ~s." top-k))
+    (let ((workspace-size
+           (max 1 (if (zerop effective-top-k)
+                      (length initial-logits)
+                      effective-top-k))))
+      (declare (fixnum workspace-size))
+      (setf top-k-workspace
+           (make-array workspace-size :element-type 'single-float)
+           top-p-logit-workspace
+           (make-array workspace-size :element-type 'single-float)
+           top-p-index-workspace
+           (make-array workspace-size :element-type 'fixnum)))
     (dotimes (decode-index max-tokens)
       (declare (fixnum decode-index))
       (multiple-value-bind (token-id token-text)
@@ -1112,7 +1276,7 @@
                              current-logits
                              :history generated-token-ids
                              :repetition-penalty repetition-penalty
-                             :top-k top-k
+                             :top-k effective-top-k
                              :top-p top-p
                              :temperature temperature
                              :top-k-workspace top-k-workspace
@@ -1219,8 +1383,8 @@
                                 use-thought-channel
                                 eos-token-id
                                 (repetition-penalty 1.15f0)
-                                (top-k 40)
-                                (top-p 0.90f0)
+                                (top-k +default-top-k+)
+                                (top-p +default-top-p+)
                                 (temperature 1.0)
                                 (max-tokens 256)
                                 random-values
@@ -1290,8 +1454,8 @@
                                  eos-token-id
                                  use-thought-channel
                                  (repetition-penalty 1.15f0)
-                                 (top-k 40)
-                                 (top-p 0.90f0)
+                                 (top-k +default-top-k+)
+                                 (top-p +default-top-p+)
                                  (temperature 1.0)
                                  (max-tokens 256)
                                  random-values
@@ -1309,6 +1473,20 @@
                                  (npu-cache-directory
                                    (default-npu-cache-directory))
                                  (npu-python-command '("python"))
+                                 (use-gpu nil)
+                                 gpu-tensor-names
+                                 gpu-layer-indices
+                                 (gpu-projection-roles
+                                   '(:attention-query
+                                     :attention-key
+                                     :attention-value
+                                     :attention-output
+                                     :ffn-gate
+                                     :ffn-up
+                                     :ffn-down))
+                                 (gpu-cache-directory
+                                   (default-gpu-cache-directory))
+                                 (gpu-python-command '("python"))
                                  callback
                                  print-metadata
                                  (stream *standard-output*)
@@ -1339,6 +1517,10 @@
                                (and use-npu
                                     (or npu-tensor-names
                                         npu-layer-indices)))
+                             (gpu-requested-p
+                               (and use-gpu
+                                    (or gpu-tensor-names
+                                        gpu-layer-indices)))
                              (effective-step-function (or step-function
                                                           (and model
                                                                (case (intern (string-upcase architecture)
@@ -1352,7 +1534,8 @@
                              (effective-kv-cache (or kv-cache (make-hash-table)))
                              (effective-eos-token-id
                               (or eos-token-id (resolve-eos-token-id kv-pairs)))
-                             (npu-active-p nil))
+                             (npu-active-p nil)
+                             (gpu-active-p nil))
                         (when (and use-npu (not npu-requested-p))
                           (warn "NPU acceleration was requested without any usable projections; continuing on the CPU."))
                         (when npu-requested-p
@@ -1367,6 +1550,21 @@
                                     :python-command npu-python-command)
                                    (progn
                                      (warn "NPU acceleration requires the built-in model loader; continuing on the CPU.")
+                                     nil))))
+                        (when (and use-gpu (not gpu-requested-p))
+                          (warn "GPU acceleration was requested without any usable projections; continuing without GPU acceleration."))
+                        (when gpu-requested-p
+                          (setf gpu-active-p
+                                (if model
+                                    (try-enable-model-gpu-projections
+                                     model
+                                     gpu-tensor-names
+                                     :layer-indices gpu-layer-indices
+                                     :projection-roles gpu-projection-roles
+                                     :cache-directory gpu-cache-directory
+                                     :python-command gpu-python-command)
+                                    (progn
+                                     (warn "GPU acceleration requires the built-in model loader; continuing without GPU acceleration.")
                                      nil))))
                         (unwind-protect
                             (progn
@@ -1405,6 +1603,8 @@
                                        generated-ids
                                        generated-text
                                        last-logits)))
+                          (when (and model gpu-active-p)
+                            (clear-model-gpu-projections model))
                           (when (and model npu-active-p)
                             (clear-model-npu-projections model))))))))
 
@@ -1416,8 +1616,8 @@
                              use-thought-channel
                              eos-token-id
                              (repetition-penalty 1.15f0)
-                             (top-k 40)
-                             (top-p 0.90f0)
+                             (top-k +default-top-k+)
+                             (top-p +default-top-p+)
                              (temperature 1.0)
                              (max-tokens 256)
                              random-values
@@ -1447,8 +1647,8 @@
                                       (stream *standard-output*)
                                       use-thought-channel
                                       (repetition-penalty 1.15f0)
-                                      (top-k 40)
-                                      (top-p 0.90f0)
+                                      (top-k +default-top-k+)
+                                      (top-p +default-top-p+)
                                       (temperature 1.0)
                                       (max-tokens 256)
                                       random-values
@@ -1778,7 +1978,8 @@ Write a haiku about a hacker drinking coffee.<turn|>
   per-layer-embedding-size
   final-logit-softcap
   output-tensor-name
-  (npu-projections (make-hash-table :test #'equal)))
+  (npu-projections (make-hash-table :test #'equal))
+  (gpu-projections (make-hash-table :test #'equal)))
 
 (defun register-model-npu-projection
     (model tensor-name onnx-path &key cache-directory cache-key)
@@ -1817,6 +2018,42 @@ Write a haiku about a hacker drinking coffee.<turn|>
              (close-npu-session session))
            (gguf-model-npu-projections model))
   (clrhash (gguf-model-npu-projections model))
+  model)
+
+(defun register-model-gpu-projection (model tensor-name onnx-path)
+  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
+         (projections (gguf-model-gpu-projections model)))
+    (when (gethash tensor-name projections)
+      (error "Tensor ~s already has a GPU projection." tensor-name))
+    (let ((session (make-gpu-session onnx-path)))
+      (unwind-protect
+          (progn
+            (unless (= (tensor-column-count tensor-info)
+                       (gpu-session-input-element-count session))
+              (error "GPU input size does not match tensor ~s." tensor-name))
+            (unless (= (tensor-row-count tensor-info)
+                       (gpu-session-output-element-count session))
+              (error "GPU output size does not match tensor ~s." tensor-name))
+            (setf (gethash tensor-name projections) session)
+            (setf session nil))
+        (when session
+          (close-gpu-session session)))))
+  model)
+
+(defun unregister-model-gpu-projection (model tensor-name)
+  (let* ((projections (gguf-model-gpu-projections model))
+         (session (gethash tensor-name projections)))
+    (when session
+      (remhash tensor-name projections)
+      (close-gpu-session session)))
+  model)
+
+(defun clear-model-gpu-projections (model)
+  (maphash (lambda (tensor-name session)
+             (declare (ignore tensor-name))
+             (close-gpu-session session))
+           (gguf-model-gpu-projections model))
+  (clrhash (gguf-model-gpu-projections model))
   model)
 
 (defun tensor-content-sha256 (model tensor-info)
@@ -1858,6 +2095,9 @@ Write a haiku about a hacker drinking coffee.<turn|>
     (merge-pathnames #P"llambda/npu-cache/"
                      (uiop:ensure-directory-pathname base))))
 
+(defun default-gpu-cache-directory ()
+  (default-npu-cache-directory))
+
 (defun npu-cache-component (value)
   (map 'string
        (lambda (character)
@@ -1869,11 +2109,12 @@ Write a haiku about a hacker drinking coffee.<turn|>
        value))
 
 (defun model-npu-projection-cache-key
-    (model tensor-info generator-path)
-  (format nil "bridge-~a-generator-~a-ort-~a-ggml-~d-~{~d~^-~}-~a"
+    (model tensor-info generator-path &key (weight-format :bfloat16))
+  (format nil "bridge-~a-generator-~a-ort-~a-weights-~(~a~)-ggml-~d-~{~d~^-~}-~a"
           (npu-cache-component (npu-bridge-version))
           (file-sha256 generator-path)
           (npu-cache-component (npu-backend-runtime-version))
+          weight-format
           (getf tensor-info :type-tag)
           (getf tensor-info :dimensions)
           (tensor-content-sha256 model tensor-info)))
@@ -1882,11 +2123,13 @@ Write a haiku about a hacker drinking coffee.<turn|>
     (model tensor-name &optional (cache-directory
                                   (default-npu-cache-directory))
                               (generator-path
-                                (default-npu-model-generator-pathname)))
+                                (default-npu-model-generator-pathname))
+     &key (weight-format :bfloat16))
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
          (cache-key
            (model-npu-projection-cache-key
-            model tensor-info generator-path))
+            model tensor-info generator-path
+            :weight-format weight-format))
          (root (uiop:ensure-directory-pathname cache-directory))
          (projection-directory
            (merge-pathnames
@@ -1944,11 +2187,66 @@ Write a haiku about a hacker drinking coffee.<turn|>
         (dolist (tensor-name added-tensor-names)
           (unregister-model-npu-projection model tensor-name))))))
 
+(defun ensure-model-gpu-projection
+    (model tensor-name
+     &key
+       (cache-directory (default-gpu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (when (gethash tensor-name (gguf-model-gpu-projections model))
+    (return-from ensure-model-gpu-projection (values model nil t)))
+  (multiple-value-bind (onnx-path provider-cache-directory cache-key)
+      (model-npu-projection-cache-pathnames
+       model tensor-name cache-directory generator-path
+       :weight-format :float32)
+    (declare (ignore provider-cache-directory cache-key))
+    (let ((reused-p (not (null (probe-file onnx-path)))))
+      (unless reused-p
+        (export-model-gpu-projection
+          model tensor-name onnx-path
+          :python-command python-command
+          :generator-path generator-path))
+      (register-model-gpu-projection model tensor-name onnx-path)
+      (values model onnx-path reused-p))))
+
+(defun enable-model-gpu-projections
+    (model tensor-names
+     &key
+       (cache-directory (default-gpu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (let ((added-tensor-names '())
+        (completed-p nil))
+    (unwind-protect
+        (progn
+           (dolist (tensor-name tensor-names)
+             (unless (gethash tensor-name
+                              (gguf-model-gpu-projections model))
+               (ensure-model-gpu-projection
+                model tensor-name
+                :cache-directory cache-directory
+                :python-command python-command
+                :generator-path generator-path)
+               (push tensor-name added-tensor-names)))
+           (setf completed-p t)
+           model)
+      (unless completed-p
+        (dolist (tensor-name added-tensor-names)
+           (unregister-model-gpu-projection model tensor-name))))))
+
 (defun call-with-npu-setup-fallback (setup-function)
   (handler-case
       (funcall setup-function)
     (error (condition)
       (warn "NPU setup failed; continuing on the CPU: ~a" condition)
+      nil)))
+
+(defun call-with-gpu-setup-fallback (setup-function)
+  (handler-case
+      (funcall setup-function)
+    (error (condition)
+      (warn "GPU setup failed; continuing without GPU acceleration: ~a"
+            condition)
       nil)))
 
 (defun try-enable-model-npu-projections
@@ -1990,6 +2288,47 @@ Write a haiku about a hacker drinking coffee.<turn|>
       :cache-directory cache-directory
       :python-command python-command
       :generator-path generator-path)
+       t))))
+
+(defun try-enable-model-gpu-projections
+    (model tensor-names
+     &key
+       layer-indices
+       (projection-roles
+         '(:attention-query
+           :attention-key
+           :attention-value
+           :attention-output
+           :ffn-gate
+           :ffn-up
+           :ffn-down))
+       (cache-directory (default-gpu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (call-with-gpu-setup-fallback
+   (lambda ()
+     (let ((resolved-tensor-names
+             (remove-duplicates
+              (append tensor-names
+                      (when layer-indices
+                        (model-npu-layer-projection-names
+                         model
+                         layer-indices
+                         :roles projection-roles)))
+              :test #'equal)))
+       (unless resolved-tensor-names
+         (gpu-backend-error
+          "GPU acceleration was requested without any projections."))
+       (unless *gpu-library*
+         (load-gpu-backend))
+       (unless (gpu-backend-available-p)
+         (gpu-backend-error "GPU acceleration is unavailable."))
+       (enable-model-gpu-projections
+        model
+        resolved-tensor-names
+        :cache-directory cache-directory
+        :python-command python-command
+        :generator-path generator-path)
        t))))
 
 (defparameter +npu-projection-role-suffixes+
@@ -2048,6 +2387,31 @@ Write a haiku about a hacker drinking coffee.<turn|>
   (enable-model-npu-projections
    model
    (model-npu-layer-projection-names model layer-indices :roles roles)
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
+
+(defun model-gpu-layer-projection-names (model layer-indices &key roles)
+  (if roles
+      (model-npu-layer-projection-names model layer-indices :roles roles)
+      (model-npu-layer-projection-names model layer-indices)))
+
+(defun enable-model-gpu-layer-projections
+    (model layer-indices
+     &key
+       (roles '(:attention-query
+                :attention-key
+                :attention-value
+                :attention-output
+                :ffn-gate
+                :ffn-up
+                :ffn-down))
+       (cache-directory (default-gpu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (enable-model-gpu-projections
+   model
+   (model-gpu-layer-projection-names model layer-indices :roles roles)
    :cache-directory cache-directory
    :python-command python-command
    :generator-path generator-path))
@@ -3316,7 +3680,18 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (funcall npu-function)
     (npu-backend-error (condition)
       (funcall disable-function)
-      (warn "NPU projection ~s failed and was disabled; recomputing on the CPU: ~a"
+      (warn "NPU projection ~s failed and was disabled; using the next available backend: ~a"
+            tensor-name
+            condition)
+      (funcall cpu-function))))
+
+(defun call-with-gpu-runtime-fallback
+    (gpu-function cpu-function disable-function tensor-name)
+  (handler-case
+      (funcall gpu-function)
+    (gpu-backend-error (condition)
+      (funcall disable-function)
+      (warn "GPU projection ~s failed and was disabled; recomputing on the CPU: ~a"
             tensor-name
             condition)
       (funcall cpu-function))))
@@ -3335,17 +3710,30 @@ It extracts the underlying simple arrays once before entering the loop to elimin
               vector
               0
               row-count))))
-    (let ((npu-session
-            (gethash tensor-name (gguf-model-npu-projections model))))
-      (if npu-session
-          (call-with-npu-runtime-fallback
-           (lambda ()
-             (run-npu-session-into dest npu-session vector))
-           #'run-on-cpu
-           (lambda ()
-             (unregister-model-npu-projection model tensor-name))
-           tensor-name)
-          (run-on-cpu)))))
+    (labels ((run-on-gpu-or-cpu ()
+               (let ((gpu-session
+                       (gethash tensor-name
+                                (gguf-model-gpu-projections model))))
+                 (if gpu-session
+                     (call-with-gpu-runtime-fallback
+                      (lambda ()
+                        (run-gpu-session-into dest gpu-session vector))
+                      #'run-on-cpu
+                      (lambda ()
+                        (unregister-model-gpu-projection model tensor-name))
+                      tensor-name)
+                     (run-on-cpu)))))
+      (let ((npu-session
+              (gethash tensor-name (gguf-model-npu-projections model))))
+        (if npu-session
+            (call-with-npu-runtime-fallback
+             (lambda ()
+               (run-npu-session-into dest npu-session vector))
+             #'run-on-gpu-or-cpu
+             (lambda ()
+               (unregister-model-npu-projection model tensor-name))
+             tensor-name)
+            (run-on-gpu-or-cpu))))))
 
 (defun gguf-model-matrix-vector-multiply (model tensor-name vector)
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
@@ -3355,6 +3743,205 @@ It extracts the underlying simple arrays once before entering the loop to elimin
      model
      tensor-name
      vector)))
+
+(defun max-absolute-vector-difference (left right)
+  (unless (= (length left) (length right))
+    (error "Cannot compare vectors with lengths ~d and ~d."
+           (length left)
+           (length right)))
+  (let ((maximum 0.0f0))
+    (dotimes (index (length left) maximum)
+      (setf maximum
+            (max maximum
+                 (abs (- (aref left index) (aref right index))))))))
+
+(defun benchmark-matrix-vector-function
+    (backend function output baseline row-count column-count
+     warmup-runs timed-runs)
+  (dotimes (run warmup-runs)
+    (declare (ignore run))
+    (funcall function))
+  (let* ((start (get-internal-real-time))
+         (operations (* 2 row-count column-count)))
+    (dotimes (run timed-runs)
+      (declare (ignore run))
+      (funcall function))
+    (let* ((ticks (- (get-internal-real-time) start))
+           (seconds (max (/ (coerce ticks 'double-float)
+                            internal-time-units-per-second)
+                         (/ 1.0d0 internal-time-units-per-second)))
+           (seconds-per-run (/ seconds timed-runs)))
+      (list :backend backend
+            :available-p t
+            :milliseconds-per-run (* 1000.0d0 seconds-per-run)
+            :gflops (/ operations seconds-per-run 1.0d9)
+            :speedup-vs-cpu nil
+            :max-absolute-error
+            (if baseline
+                (max-absolute-vector-difference output baseline)
+                0.0f0)))))
+
+(defun print-projection-benchmark-results
+    (stream tensor-name row-count column-count warmup-runs timed-runs results)
+  (let* ((cpu-result
+           (find :cpu results :key (lambda (result)
+                                     (getf result :backend))))
+         (cpu-milliseconds
+           (and cpu-result
+                (getf cpu-result :milliseconds-per-run))))
+    (format stream
+            "~&Projection ~s (~d x ~d), ~d warmup and ~d timed runs~%"
+            tensor-name row-count column-count warmup-runs timed-runs)
+    (format stream "~12a ~12a ~12a ~10a ~14a~%"
+            "Backend" "ms/run" "GFLOP/s" "speedup" "max abs error")
+    (dolist (result results)
+      (if (getf result :available-p)
+          (let ((speedup
+                  (and cpu-milliseconds
+                       (/ cpu-milliseconds
+                          (getf result :milliseconds-per-run)))))
+            (when speedup
+              (setf (getf result :speedup-vs-cpu) speedup))
+            (format stream "~12a ~12,3f ~12,3f ~9,2fx ~14,6g~%"
+                    (string-upcase (symbol-name (getf result :backend)))
+                    (getf result :milliseconds-per-run)
+                    (getf result :gflops)
+                    (or speedup 0.0d0)
+                    (getf result :max-absolute-error)))
+          (format stream "~12a ~12a ~12a ~10a ~14a~%"
+                  (string-upcase (symbol-name (getf result :backend)))
+                  "unavailable"
+                  "-"
+                  "-"
+                  "-"))))
+  (finish-output stream)
+  results)
+
+(defun benchmark-gguf-projection-backends
+    (pathname tensor-name
+     &key
+       (warmup-runs 3)
+       (timed-runs 20)
+       (use-npu t)
+       (use-gpu t)
+       (npu-cache-directory (default-npu-cache-directory))
+       (gpu-cache-directory (default-gpu-cache-directory))
+       (npu-python-command '("python"))
+       (gpu-python-command '("python"))
+       (stream *standard-output*))
+  (unless (and (integerp warmup-runs) (not (minusp warmup-runs)))
+    (error "WARMUP-RUNS must be a nonnegative integer, not ~s." warmup-runs))
+  (unless (and (integerp timed-runs) (plusp timed-runs))
+    (error "TIMED-RUNS must be a positive integer, not ~s." timed-runs))
+  (call-with-file
+   pathname
+   (lambda (handle)
+     (with-mapped-file (mapping handle)
+       (let* ((header (read-gguf-header mapping))
+              (kv-pairs (read-gguf-kv-pairs mapping))
+              (tensor-infos (read-gguf-tensor-infos mapping))
+              (model (make-gguf-model
+                      :mapping mapping
+                      :kv-pairs kv-pairs
+                      :tensor-infos tensor-infos
+                      :tensor-info-table (make-tensor-info-table tensor-infos)))
+              (tensor-info (gguf-model-tensor-info model tensor-name t))
+              (dimensions (getf tensor-info :dimensions)))
+         (declare (ignore header))
+         (unless (= 2 (length dimensions))
+           (error "Projection benchmark requires a two-dimensional tensor, not ~s."
+                  dimensions))
+         (let* ((column-count (tensor-column-count tensor-info))
+                (row-count (tensor-row-count tensor-info))
+                (input (make-array column-count :element-type 'single-float))
+                (cpu-output
+                  (make-array row-count :element-type 'single-float))
+                (npu-output
+                  (make-array row-count :element-type 'single-float))
+                (gpu-output
+                  (make-array row-count :element-type 'single-float))
+                (npu-active-p nil)
+                (gpu-active-p nil))
+           (dotimes (index column-count)
+             (setf (aref input index)
+                   (coerce (- (/ (mod (+ (* index 17) 11) 257) 128.0)
+                              1.0)
+                           'single-float)))
+           (when use-npu
+             (setf npu-active-p
+                   (try-enable-model-npu-projections
+                    model
+                    (list tensor-name)
+                    :cache-directory npu-cache-directory
+                    :python-command npu-python-command)))
+           (when use-gpu
+             (setf gpu-active-p
+                   (try-enable-model-gpu-projections
+                    model
+                    (list tensor-name)
+                    :cache-directory gpu-cache-directory
+                    :python-command gpu-python-command)))
+           (unwind-protect
+               (let* ((cpu-result
+                        (benchmark-matrix-vector-function
+                         :cpu
+                         (lambda ()
+                           (%gguf-model-matrix-vector-multiply-into
+                            cpu-output mapping tensor-info input 0 row-count))
+                         cpu-output nil row-count column-count
+                         warmup-runs timed-runs))
+                      (results (list cpu-result)))
+                 (when use-npu
+                   (let ((session
+                           (gethash tensor-name
+                                    (gguf-model-npu-projections model))))
+                     (push
+                      (if session
+                          (handler-case
+                              (benchmark-matrix-vector-function
+                               :npu
+                               (lambda ()
+                                 (run-npu-session-into
+                                  npu-output session input))
+                               npu-output cpu-output row-count column-count
+                               warmup-runs timed-runs)
+                            (npu-backend-error (condition)
+                              (unregister-model-npu-projection
+                               model tensor-name)
+                              (list :backend :npu
+                                    :available-p nil
+                                    :error (princ-to-string condition))))
+                          (list :backend :npu :available-p nil))
+                      results)))
+                 (when use-gpu
+                   (let ((session
+                           (gethash tensor-name
+                                    (gguf-model-gpu-projections model))))
+                     (push
+                      (if session
+                          (handler-case
+                              (benchmark-matrix-vector-function
+                               :gpu
+                               (lambda ()
+                                 (run-gpu-session-into
+                                  gpu-output session input))
+                               gpu-output cpu-output row-count column-count
+                               warmup-runs timed-runs)
+                            (gpu-backend-error (condition)
+                              (unregister-model-gpu-projection
+                               model tensor-name)
+                              (list :backend :gpu
+                                    :available-p nil
+                                    :error (princ-to-string condition))))
+                          (list :backend :gpu :available-p nil))
+                      results)))
+                 (print-projection-benchmark-results
+                  stream tensor-name row-count column-count
+                  warmup-runs timed-runs (nreverse results)))
+             (when gpu-active-p
+               (clear-model-gpu-projections model))
+             (when npu-active-p
+               (clear-model-npu-projections model)))))))))
 
 (defun gguf-model-expert-matrix-vector-multiply-into (dest model tensor-name expert-index vector)
   (declare (optimize (speed 3) (safety 0))

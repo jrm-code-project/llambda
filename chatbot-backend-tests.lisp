@@ -39,7 +39,8 @@
              :conversation conversation
              :callback (lambda (text)
                          (setf callback-text text))
-             :effective-generation-config '(:temperature 0.25f0 :top-p 0.8f0))))
+             :effective-generation-config
+             '(:temperature 0.25f0 :top-p 0.8f0 :top-k 12))))
       (is (string= "D:/models/local.gguf" captured-model))
       (is (search "System: Be concise." (getf captured-arguments :prompt)))
       (is (search "User: Earlier question" (getf captured-arguments :prompt)))
@@ -47,6 +48,7 @@
       (is (search "User: New question" (getf captured-arguments :prompt)))
       (is (= 0.25f0 (getf captured-arguments :temperature)))
       (is (= 0.8f0 (getf captured-arguments :top-p)))
+      (is (= 12 (getf captured-arguments :top-k)))
       (is (string= "local response" callback-text))
       (is (string= "local response" (chatbot::chat-turn-result-text result)))
       (is (equal "assistant"
@@ -69,9 +71,10 @@
      "prompt"
      :bot bot
      :conversation conversation
-     :effective-generation-config '(:temperature nil :top-p nil))
+     :effective-generation-config '(:temperature nil :top-p nil :top-k nil))
     (is (= 1.0f0 (getf captured-arguments :temperature)))
-    (is (= 0.90f0 (getf captured-arguments :top-p)))))
+    (is (= 0.95f0 (getf captured-arguments :top-p)))
+    (is (= 40 (getf captured-arguments :top-k)))))
 
 (test backend-rejects-attachments
   (let* ((bot (make-instance 'chatbot::chatbot

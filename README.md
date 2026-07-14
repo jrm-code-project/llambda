@@ -10,8 +10,8 @@ directly from `.gguf` files.
   The default CPU path does not wrap `llama.cpp` or call an external inference
 runtime. It reads the raw weights, unpacks the 4-bit/6-bit nibbles, constructs
 the transformer architecture, and executes the forward pass natively within
-SBCL. An experimental, opt-in NPU path uses a small C++ bridge to ONNX Runtime
-and AMD's VitisAI execution provider.
+SBCL. Experimental, opt-in accelerator paths use a small C++ bridge to ONNX
+Runtime with DirectML for GPUs and AMD's VitisAI execution provider for NPUs.
 
   ## Why?
 
@@ -29,6 +29,7 @@ Lisp.
 *   **Zero-Drift KV Cache:** Safe, shared-KV reuse and perfectly aligned RoPE scaling. Exact-logit replay tests against fresh un-cached generations yield a `max_diff` of `0.0`.
 *   **Advanced Sampling:** Built-in Top-K, Top-P (Nucleus), and repetition penalties executing in-place with zero heap allocation in the hot path.
 *   **Experimental Ryzen AI NPU backend:** Fixed-shape ONNX projections can replace selected CPU matrix-vector operations through an optional CFFI bridge. The CPU implementation remains the mandatory default and fallback.
+*   **Experimental DirectML GPU backend:** Selected projections can run on DirectML-capable AMD, Intel, or NVIDIA GPUs. Routing is always NPU, then GPU, then CPU.
 
 ### Supported architectures
 
@@ -48,6 +49,50 @@ Architecture selection uses the GGUF `general.architecture` metadata value.
 *   **Operating System:** The current file-mapping layer requires Windows and uses `CreateFileMappingW`/`MapViewOfFile`. Porting it to Unix should be straightforward by replacing the small Windows-specific file and mapping layer with `open`/`mmap` equivalents.
 *   **Hardware:** An x86_64 CPU with AVX2 instruction set support. Multi-core processors heavily recommended to prevent memory-bus starvation.
 *   **Dependencies:** `sb-simd`, `lparallel`.
+
+### Optional DirectML GPU backend
+
+The GPU backend uses ONNX Runtime's DirectML execution provider on Windows.
+Build the native bridge against an ONNX Runtime distribution that includes
+DirectML. `ORT_ROOT` may be passed directly to CMake; the Ryzen AI installation
+remains the default when it is not specified:
+
+```powershell
+.\native\build-npu.ps1 `
+  -Backend GPU `
+  -OrtRoot "C:\path\to\onnxruntime-directml"
+```
+
+GPU builds are written to `native\build-gpu` so they cannot overwrite the
+Ryzen AI build in `native\build`.
+
+Load and probe DirectML from Lisp with:
+
+```lisp
+(llambda:load-gpu-backend)
+(llambda:gpu-backend-available-p)
+(llambda:gpu-backend-runtime-version)
+```
+
+GPU acceleration is strictly opt-in. The high-level inference API accepts
+`:use-gpu t` together with either `:gpu-tensor-names` or bounded
+`:gpu-layer-indices` and `:gpu-projection-roles`. Both accelerator paths share
+the content-addressed cache machinery, with BF16 graphs for VitisAI and
+float32 graphs for DirectML.
+
+```lisp
+(llambda:test-gguf-file-response
+  #P"D:/path/to/model.gguf"
+  :use-gpu t
+  :gpu-layer-indices '(0)
+  :gpu-projection-roles '(:attention-key))
+```
+
+If DirectML, a compatible GPU, graph conversion, or session setup is
+unavailable, llambda warns and continues on the CPU. A runtime GPU failure
+disables only that tensor's GPU session and recomputes it on the CPU. When both
+accelerators are enabled for a tensor, llambda tries the NPU first, then the
+GPU, and finally the CPU.
 
 ### Optional AMD Ryzen AI NPU backend
 
@@ -107,6 +152,10 @@ during inference, llambda removes that session, recomputes the operation on the
 CPU, and leaves the remaining model usable. Low-level setup APIs remain
 fail-fast so callers can diagnose configuration problems.
 
+NPU and GPU setup are independent. Enabling both preserves working GPU
+sessions if NPU setup fails and vice versa. Runtime NPU failures fall through
+to an enabled GPU session before using the CPU.
+
 ```lisp
 (llambda:test-gguf-file-response
   #P"D:/path/to/model.gguf"
@@ -120,6 +169,29 @@ session even when the ONNX conversion cache is reused. llambda therefore keeps
 registered sessions alive across token steps; clearing and recreating sessions
 incurs that compilation cost again.
 
+### CPU, NPU, and GPU projection benchmark
+
+`benchmark-gguf-projection-backends` compares the native quantized CPU GEMV
+with NPU and DirectML sessions for one two-dimensional GGUF tensor. Graph
+export and session compilation happen before timing. The report includes
+milliseconds per run, effective GFLOP/s, speedup over CPU, and maximum absolute
+output drift from the CPU result.
+
+```lisp
+(llambda:benchmark-gguf-projection-backends
+  #P"D:/path/to/model.gguf"
+  "blk.0.attn_k.weight"
+  :warmup-runs 3
+  :timed-runs 20
+  :npu-python-command '("conda" "run" "-n" "ryzen-ai-dunce" "python")
+  :gpu-python-command '("conda" "run" "-n" "ryzen-ai-dunce" "python"))
+```
+
+The benchmark requests both accelerators explicitly, prepares the NPU first,
+and reports an unavailable backend without preventing the remaining
+measurements. Pass `:use-npu nil` or `:use-gpu nil` to benchmark a subset.
+Cached projection graphs make subsequent runs skip export.
+
   ## Quickstart
 
 ```lisp
@@ -130,7 +202,7 @@ incurs that compilation cost again.
   "D:/path/to/your/model/gemma-4-E4B-it-Q4_K_M.gguf" 
   "Write a haiku about a hacker drinking coffee."
   :top-k 40 
-  :top-p 0.90 
+  :top-p 0.95
   :repetition-penalty 1.15)
 ```
 
@@ -170,6 +242,7 @@ vectors on the heap, performance will catastrophically collapse.
 *   [x] Qwen2, Qwen3Next, and Nemotron-H MoE inference
 *   [x] Llama 3.1 architecture and instruct tokenization
 *   [x] Optional VitisAI CFFI bridge and per-projection NPU routing
+*   [x] Optional DirectML GPU bridge with NPU-to-GPU-to-CPU routing
 *   [x] Per-tensor GGUF-to-BF16 ONNX export
 *   [x] Automatic content-addressed NPU projection cache
 *   [x] Architecture-aware projection selection and end-to-end NPU inference

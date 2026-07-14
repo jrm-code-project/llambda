@@ -15,10 +15,9 @@ def bfloat16_raw(values: np.ndarray) -> bytes:
 def make_model(rows: int, columns: int, dtype: str,
                weights_path: Path | None) -> onnx.ModelProto:
     if weights_path:
-        if dtype != "bfloat16":
-            raise ValueError("external weights currently require bfloat16")
         raw_weights = weights_path.read_bytes()
-        expected_size = rows * columns * 2
+        element_size = 2 if dtype == "bfloat16" else 4
+        expected_size = rows * columns * element_size
         if len(raw_weights) != expected_size:
             raise ValueError(
                 f"{weights_path} has {len(raw_weights)} bytes; "
@@ -30,7 +29,8 @@ def make_model(rows: int, columns: int, dtype: str,
         weights = rng.standard_normal((rows, columns), dtype=np.float32)
         weights /= np.sqrt(np.float32(columns))
         weights_shape = weights.shape
-        raw_weights = bfloat16_raw(weights)
+        raw_weights = (bfloat16_raw(weights) if dtype == "bfloat16"
+                       else weights.tobytes())
 
     nodes = []
     if dtype == "bfloat16":
@@ -56,7 +56,7 @@ def make_model(rows: int, columns: int, dtype: str,
             "weights",
             TensorProto.FLOAT,
             weights_shape,
-            weights.tobytes(),
+            raw_weights,
             raw=True,
         )
         nodes.append(helper.make_node("Gemm", ["input", "weights"],
@@ -83,7 +83,7 @@ def make_model(rows: int, columns: int, dtype: str,
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate a fixed-shape ONNX projection for NPU benchmarks."
+        description="Generate a fixed-shape ONNX accelerator projection."
     )
     parser.add_argument("output", type=Path)
     parser.add_argument("--rows", type=int, required=True)
@@ -94,7 +94,7 @@ def main() -> None:
     parser.add_argument(
         "--weights",
         type=Path,
-        help="Raw row-major BF16 weights with shape [rows, columns].",
+        help="Raw row-major weights with shape [rows, columns] and --dtype.",
     )
     args = parser.parse_args()
     if args.rows <= 0 or args.columns <= 0:

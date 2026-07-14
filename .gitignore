@@ -16,4 +16,5 @@
 *.wx64fsl
 *.wx32fsl
 native/build/
+native/build-gpu/
 *~

@@ -17,6 +17,7 @@
            #:apply-temperature
            #:apply-rope
            #:apply-silu
+           #:benchmark-gguf-projection-backends
            #:close-handle
            #:create-file
            #:dequantize-q4-k-m
@@ -24,11 +25,16 @@
            #:detokenize-token-id
            #:detokenize-token-ids
            #:decode-next-token
+           #:default-gpu-cache-directory
            #:default-npu-cache-directory
+           #:enable-model-gpu-projections
+           #:enable-model-gpu-layer-projections
            #:enable-model-npu-projections
            #:enable-model-npu-layer-projections
+           #:ensure-model-gpu-projection
            #:ensure-model-npu-projection
            #:evaluate-prompt
+           #:export-model-gpu-projection
            #:export-model-npu-projection
            #:generate-from-prompt
            #:generate-gguf-response
@@ -36,6 +42,7 @@
            #:hello-message
            #:find-gguf-tensor-info
            #:load-gemma4-model
+           #:load-gpu-backend
            #:load-llama-model
            #:load-npu-backend
            #:load-qwen2-model
@@ -44,11 +51,17 @@
            #:make-gemma4-step-function
            #:make-llama-step-function
            #:make-qwen2-step-function
+           #:model-gpu-layer-projection-names
            #:model-npu-layer-projection-names
+           #:gpu-backend-available-p
+           #:gpu-backend-runtime-version
            #:npu-backend-available-p
            #:npu-backend-runtime-version
+           #:register-model-gpu-projection
            #:register-model-npu-projection
+           #:clear-model-gpu-projections
            #:clear-model-npu-projections
+           #:unregister-model-gpu-projection
            #:unregister-model-npu-projection
            #:map-view-of-file
            #:main

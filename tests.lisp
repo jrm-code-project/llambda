@@ -8,6 +8,7 @@
                           #:apply-temperature
                           #:apply-rope
                           #:apply-silu
+                          #:benchmark-gguf-projection-backends
                           #:close-handle
                           #:create-file
                           #:dequantize-q4-k-m
@@ -15,11 +16,16 @@
                           #:detokenize-token-id
                           #:detokenize-token-ids
                           #:decode-next-token
+                          #:default-gpu-cache-directory
                           #:default-npu-cache-directory
+                          #:enable-model-gpu-projections
+                          #:enable-model-gpu-layer-projections
                           #:enable-model-npu-projections
                           #:enable-model-npu-layer-projections
+                          #:ensure-model-gpu-projection
                           #:ensure-model-npu-projection
                           #:evaluate-prompt
+                          #:export-model-gpu-projection
                           #:export-model-npu-projection
                           #:find-gguf-tensor-info
                           #:generate-from-prompt
@@ -27,6 +33,7 @@
                           #:generate-token-loop
                           #:hello-message
                           #:load-gemma4-model
+                          #:load-gpu-backend
                           #:load-llama-model
                           #:load-npu-backend
                           #:load-qwen2-model
@@ -35,11 +42,17 @@
                           #:make-gemma4-step-function
                           #:make-llama-step-function
                           #:make-qwen2-step-function
+                          #:model-gpu-layer-projection-names
                           #:model-npu-layer-projection-names
+                          #:gpu-backend-available-p
+                          #:gpu-backend-runtime-version
                           #:npu-backend-available-p
                           #:npu-backend-runtime-version
+                          #:register-model-gpu-projection
                           #:register-model-npu-projection
+                          #:clear-model-gpu-projections
                           #:clear-model-npu-projections
+                          #:unregister-model-gpu-projection
                           #:unregister-model-npu-projection
                           #:map-view-of-file
                           #:print-gguf-file
@@ -83,6 +96,7 @@
   (is (fboundp 'apply-temperature))
   (is (fboundp 'apply-rope))
   (is (fboundp 'apply-silu))
+  (is (fboundp 'benchmark-gguf-projection-backends))
   (is (fboundp 'create-file))
   (is (fboundp 'close-handle))
   (is (fboundp 'dequantize-q4-k-m))
@@ -90,11 +104,16 @@
   (is (fboundp 'detokenize-token-id))
   (is (fboundp 'detokenize-token-ids))
   (is (fboundp 'decode-next-token))
+  (is (fboundp 'default-gpu-cache-directory))
   (is (fboundp 'default-npu-cache-directory))
+  (is (fboundp 'enable-model-gpu-projections))
+  (is (fboundp 'enable-model-gpu-layer-projections))
   (is (fboundp 'enable-model-npu-projections))
   (is (fboundp 'enable-model-npu-layer-projections))
+  (is (fboundp 'ensure-model-gpu-projection))
   (is (fboundp 'ensure-model-npu-projection))
   (is (fboundp 'evaluate-prompt))
+  (is (fboundp 'export-model-gpu-projection))
   (is (fboundp 'export-model-npu-projection))
   (is (fboundp 'find-gguf-tensor-info))
   (is (fboundp 'generate-from-prompt))
@@ -102,6 +121,7 @@
   (is (fboundp 'generate-token-loop))
   (is (fboundp 'hello-message))
   (is (fboundp 'load-gemma4-model))
+  (is (fboundp 'load-gpu-backend))
   (is (fboundp 'load-llama-model))
   (is (fboundp 'load-npu-backend))
   (is (fboundp 'load-qwen2-model))
@@ -110,11 +130,17 @@
   (is (fboundp 'make-gemma4-step-function))
   (is (fboundp 'make-llama-step-function))
   (is (fboundp 'make-qwen2-step-function))
+  (is (fboundp 'model-gpu-layer-projection-names))
   (is (fboundp 'model-npu-layer-projection-names))
+  (is (fboundp 'gpu-backend-available-p))
+  (is (fboundp 'gpu-backend-runtime-version))
   (is (fboundp 'npu-backend-available-p))
   (is (fboundp 'npu-backend-runtime-version))
+  (is (fboundp 'register-model-gpu-projection))
   (is (fboundp 'register-model-npu-projection))
+  (is (fboundp 'clear-model-gpu-projections))
   (is (fboundp 'clear-model-npu-projections))
+  (is (fboundp 'unregister-model-gpu-projection))
   (is (fboundp 'unregister-model-npu-projection))
   (is (fboundp 'map-view-of-file))
   (is (fboundp 'print-gguf-file))
@@ -254,6 +280,7 @@
     (is (= 2 (llambda::gguf-model-kv-head-count model)))
     (is (= 32 (llambda::gguf-model-ffn-size model)))
     (is (hash-table-p (llambda::gguf-model-npu-projections model)))
+    (is (hash-table-p (llambda::gguf-model-gpu-projections model)))
     (is (string= "output.weight"
                  (llambda::gguf-model-output-tensor-name model))))
   (let* ((kv-pairs '(("general.architecture" . "llama")
@@ -302,6 +329,25 @@
   (is (= #xc000 (llambda::single-float-to-bf16-bits -2.0f0)))
   (is (= #x3f80 (llambda::single-float-to-bf16-bits 1.001f0))))
 
+(test gpu-f32-export-primitives
+  (let ((path (merge-pathnames
+               #P"llambda-gpu-f32-export.bin"
+               (uiop:temporary-directory))))
+    (unwind-protect
+        (progn
+          (with-open-file (stream path
+                                  :direction :output
+                                  :if-exists :supersede
+                                  :element-type '(unsigned-byte 8))
+            (llambda::write-f32-le stream 1.0f0)
+            (llambda::write-f32-le stream -2.0f0))
+          (with-open-file (stream path :element-type '(unsigned-byte 8))
+            (let ((bytes (make-array 8 :element-type '(unsigned-byte 8))))
+              (is (= 8 (read-sequence bytes stream)))
+              (is (equalp #(0 0 128 63 0 0 0 192) bytes)))))
+      (when (probe-file path)
+        (delete-file path)))))
+
 (test npu-soft-fallback
   (let ((disabled-p nil))
     (handler-bind ((warning #'muffle-warning))
@@ -326,7 +372,102 @@
               model
               nil
               :layer-indices '(0)
+              :projection-roles '(:attention-key))))
+        (is (null
+             (llambda::try-enable-model-gpu-projections
+              model
+              nil
+              :layer-indices '(0)
               :projection-roles '(:attention-key))))))))
+
+(test accelerator-priority-and-soft-fallback
+  (let ((npu-disabled-p nil)
+        (gpu-disabled-p nil)
+        (gpu-called-p nil)
+        (cpu-called-p nil))
+    (is (eq :npu
+            (llambda::call-with-npu-runtime-fallback
+             (lambda () :npu)
+             (lambda ()
+              (setf gpu-called-p t)
+              :gpu)
+             (lambda () (setf npu-disabled-p t))
+             "test.weight")))
+    (is (not gpu-called-p))
+    (handler-bind ((warning #'muffle-warning))
+      (is (eq :gpu
+              (llambda::call-with-npu-runtime-fallback
+              (lambda ()
+                (llambda::npu-backend-error "simulated NPU failure"))
+              (lambda ()
+                (llambda::call-with-gpu-runtime-fallback
+                 (lambda () :gpu)
+                 (lambda ()
+                   (setf cpu-called-p t)
+                   :cpu)
+                 (lambda () (setf gpu-disabled-p t))
+                 "test.weight"))
+              (lambda () (setf npu-disabled-p t))
+              "test.weight")))
+      (is (not (null npu-disabled-p)))
+      (is (not gpu-disabled-p))
+      (is (not cpu-called-p))
+      (setf npu-disabled-p nil
+            gpu-disabled-p nil)
+      (is (eq :cpu
+              (llambda::call-with-npu-runtime-fallback
+              (lambda ()
+                (llambda::npu-backend-error "simulated NPU failure"))
+              (lambda ()
+                (llambda::call-with-gpu-runtime-fallback
+                 (lambda ()
+                   (llambda::gpu-backend-error "simulated GPU failure"))
+                 (lambda () :cpu)
+                 (lambda () (setf gpu-disabled-p t))
+                 "test.weight"))
+              (lambda () (setf npu-disabled-p t))
+              "test.weight")))
+      (is (not (null npu-disabled-p)))
+      (is (not (null gpu-disabled-p)))
+      (is (null
+           (llambda::call-with-gpu-setup-fallback
+            (lambda () (error "simulated missing GPU bridge"))))))))
+
+(test projection-benchmark-primitives
+  (is (= 0.5f0
+         (llambda::max-absolute-vector-difference
+          #(1.0f0 -2.0f0 3.0f0)
+          #(0.5f0 -2.25f0 3.0f0))))
+  (signals error
+    (llambda::max-absolute-vector-difference #(1.0f0) #(1.0f0 2.0f0)))
+  (let* ((output (make-array 2
+                             :element-type 'single-float
+                             :initial-element 0.0f0))
+         (baseline (make-array 2
+                               :element-type 'single-float
+                               :initial-contents '(2.0f0 4.0f0)))
+         (result
+           (llambda::benchmark-matrix-vector-function
+            :cpu
+            (lambda ()
+              (setf (aref output 0) 2.0f0
+                    (aref output 1) 4.0f0))
+            output baseline 2 2 1 2)))
+    (is (eq :cpu (getf result :backend)))
+    (is (not (null (getf result :available-p))))
+    (is (plusp (getf result :milliseconds-per-run)))
+    (is (plusp (getf result :gflops)))
+    (is (zerop (getf result :max-absolute-error)))
+    (let ((text
+            (with-output-to-string (stream)
+              (llambda::print-projection-benchmark-results
+               stream "test.weight" 2 2 1 2
+               (list result
+                     '(:backend :missing :available-p nil))))))
+      (is (search "CPU" text))
+      (is (search "MISSING" text))
+      (is (search "unavailable" text))
+      (is (= 1.0d0 (getf result :speedup-vs-cpu))))))
 
 (test sampling-primitives
   (flet ((approx= (left right &optional (epsilon 1.0e-5))
@@ -380,12 +521,55 @@
                                             :top-p 1.0f0
                                             :temperature 1.0f0
                                             :random-value 0.9f0))))
+    (labels ((make-default-top-k-logits ()
+               (make-array 50
+                           :element-type 'single-float
+                           :initial-contents
+                           (loop for value from 50 downto 1
+                                 collect (coerce value 'single-float)))))
+      (is (= (sample-token-id-from-logits
+              (make-default-top-k-logits)
+              :top-k nil
+              :top-p 1.0f0
+              :temperature 1.0f0
+              :random-value 0.9f0)
+             (sample-token-id-from-logits
+              (make-default-top-k-logits)
+              :top-k 40
+              :top-p 1.0f0
+              :temperature 1.0f0
+              :random-value 0.9f0))))
+    (multiple-value-bind (token-ids text logits)
+        (generate-token-loop nil
+                             #(1.0f0 0.0f0)
+                             (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (error "Step function should not run."))
+                             (make-hash-table)
+                             :top-k nil
+                             :max-tokens 0
+                             :stream (make-broadcast-stream))
+      (is (null token-ids))
+      (is (string= "" text))
+      (is (equalp #(1.0f0 0.0f0) logits)))
     (let ((top-p-logits #(3.0f0 2.0f0 1.0f0)))
       (is (= 0 (sample-token-id-from-logits top-p-logits
                                             :top-k 0
                                             :top-p 0.60f0
                                             :temperature 1.0f0
                                             :random-value 0.95f0))))
+    (is (= (sample-token-id-from-logits
+            #(3.0f0 2.0f0 1.0f0)
+            :top-k 0
+            :top-p nil
+            :temperature 1.0f0
+            :random-value 0.9f0)
+           (sample-token-id-from-logits
+            #(3.0f0 2.0f0 1.0f0)
+            :top-k 0
+            :top-p 0.95f0
+            :temperature 1.0f0
+            :random-value 0.9f0)))
     (let ((probs (softmax #(2.0f0 1.0f0 0.0f0))))
       (is (approx= 1.0f0 (loop for p across probs sum p)))
       (is (> (aref probs 0) (aref probs 1) (aref probs 2))))
@@ -1716,6 +1900,9 @@ Hello<turn|>
                                                            :kv-cache (make-hash-table)
                                                            :use-npu nil
                                                            :npu-tensor-names
+                                                           '("missing.weight")
+                                                           :use-gpu nil
+                                                           :gpu-tensor-names
                                                            '("missing.weight")
                                                            :max-tokens 1
                                                            :random-values '(0.1f0)

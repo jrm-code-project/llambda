@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 typedef struct llambda_npu_session llambda_npu_session;
+typedef struct llambda_gpu_session llambda_gpu_session;
 
 LLAMBDA_NPU_API int llambda_npu_probe(void);
 LLAMBDA_NPU_API const char* llambda_npu_bridge_version(void);
@@ -41,6 +42,22 @@ LLAMBDA_NPU_API size_t llambda_npu_session_output_element_count(
     const llambda_npu_session* session);
 LLAMBDA_NPU_API int llambda_npu_session_run(
     llambda_npu_session* session,
+    const float* input,
+    size_t input_element_count,
+    float* output,
+    size_t output_element_count);
+
+LLAMBDA_NPU_API int llambda_gpu_probe(void);
+LLAMBDA_NPU_API int llambda_gpu_session_create(
+    const char* model_path,
+    llambda_gpu_session** result);
+LLAMBDA_NPU_API void llambda_gpu_session_destroy(llambda_gpu_session* session);
+LLAMBDA_NPU_API size_t llambda_gpu_session_input_element_count(
+    const llambda_gpu_session* session);
+LLAMBDA_NPU_API size_t llambda_gpu_session_output_element_count(
+    const llambda_gpu_session* session);
+LLAMBDA_NPU_API int llambda_gpu_session_run(
+    llambda_gpu_session* session,
     const float* input,
     size_t input_element_count,
     float* output,

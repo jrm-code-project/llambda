@@ -1421,6 +1421,20 @@ The caller must ensure that no inference request is using the kernel."
 (defun qwen2-chat-prompt-p (prompt)
   (search "<|im_start|>" prompt))
 
+(defun tokenizer-policy-for-kv-pairs (kv-pairs)
+  (let ((descriptor (architecture-descriptor-for-kv-pairs kv-pairs)))
+    (if descriptor
+        (architecture-descriptor-tokenizer-policy descriptor)
+        (cond
+          ((string= (or (tokenizer-model kv-pairs) "") "gemma4")
+           :gemma4)
+          ((llama3-tokenizer-p kv-pairs)
+           :llama)
+          ((qwen2-tokenizer-p kv-pairs)
+           :qwen)
+          (t
+           :generic)))))
+
 (defun gemma4-chat-template-uses-channel-p (chat-template)
   (when chat-template
     (let* ((model-turn-index (search "<|turn>model" chat-template :from-end t))
@@ -1436,9 +1450,11 @@ The caller must ensure that no inference request is using the kernel."
 (defun maybe-prepare-prompt-for-generation (kv-pairs prompt add-bos
                                           &key
                                             use-thought-channel)
-  (let ((chat-template (gguf-kv-value-or-nil kv-pairs "tokenizer.chat_template")))
+  (let ((chat-template
+          (gguf-kv-value-or-nil kv-pairs "tokenizer.chat_template"))
+        (tokenizer-policy (tokenizer-policy-for-kv-pairs kv-pairs)))
     (cond
-      ((and (string= (or (tokenizer-model kv-pairs) "") "gemma4")
+      ((and (eq tokenizer-policy :gemma4)
             chat-template
             (not (gemma4-chat-prompt-p prompt)))
        (values (if (and use-thought-channel
@@ -1448,24 +1464,24 @@ The caller must ensure that no inference request is using the kernel."
                    (format nil "<bos><|turn>user~%~a<turn|>~%<|turn>model~%"
                            prompt))
               nil))
-      ((and (llama3-tokenizer-p kv-pairs)
+      ((and (eq tokenizer-policy :llama)
             chat-template
             (not (llama3-chat-prompt-p prompt)))
        (values (format nil
                       "<|begin_of_text|><|start_header_id|>user<|end_header_id|>~%~%~a<|eot_id|><|start_header_id|>assistant<|end_header_id|>~%~%"
                       prompt)
               nil))
-      ((and (llama3-tokenizer-p kv-pairs)
+      ((and (eq tokenizer-policy :llama)
             (search "<|begin_of_text|>" prompt))
        (values prompt nil))
-      ((and (qwen2-tokenizer-p kv-pairs)
+      ((and (eq tokenizer-policy :qwen)
             chat-template
             (not (qwen2-chat-prompt-p prompt)))
        (values (format nil
                        "<|im_start|>system~%You are a helpful assistant.<|im_end|>~%<|im_start|>user~%~a<|im_end|>~%<|im_start|>assistant~%"
                        prompt)
                nil))
-      ((qwen2-tokenizer-p kv-pairs)
+      ((eq tokenizer-policy :qwen)
        (values prompt nil))
       (t
        (values prompt add-bos)))))
@@ -1514,21 +1530,21 @@ The caller must ensure that no inference request is using the kernel."
       (gguf-kv-value-or-nil kv-pairs "general.eos_token_id")))
 
 (defun resolve-stop-token-ids (kv-pairs &optional eos-token-id)
-  (let ((stop-token-ids (remove nil (list eos-token-id))))
-    (when (and (string= (or (tokenizer-model kv-pairs) "")
-                        "gemma4")
+  (let ((stop-token-ids (remove nil (list eos-token-id)))
+        (tokenizer-policy (tokenizer-policy-for-kv-pairs kv-pairs)))
+    (when (and (eq tokenizer-policy :gemma4)
                (gguf-kv-value-or-nil kv-pairs "tokenizer.chat_template"))
       (let ((turn-end-token-id (gethash "<turn|>" (tokenizer-token-id-table kv-pairs))))
         (when turn-end-token-id
           (push turn-end-token-id stop-token-ids))))
-    (when (llama3-tokenizer-p kv-pairs)
+    (when (eq tokenizer-policy :llama)
       (let ((token-id-table (tokenizer-token-id-table kv-pairs)))
         (dolist (token '("<|eot_id|>" "<|end_of_text|>"))
           (multiple-value-bind (token-id presentp)
               (gethash token token-id-table)
             (when presentp
               (push token-id stop-token-ids))))))
-    (when (qwen2-tokenizer-p kv-pairs)
+    (when (eq tokenizer-policy :qwen)
       (let ((token-types (gguf-kv-value-or-nil kv-pairs "tokenizer.ggml.token_type"))
             (token-id 0))
         (when token-types
@@ -1593,19 +1609,17 @@ The caller must ensure that no inference request is using the kernel."
                              (architecture
                               (or (gguf-kv-value-or-nil kv-pairs "general.architecture")
                                   "unknown"))
+                             (architecture-descriptor
+                              (find-architecture-descriptor
+                               architecture
+                               (null step-function)))
                              (model (and (null step-function)
-                                         (cond
-                                           ((string= architecture "gemma4")
-                                            (load-gemma4-model mapping kv-pairs tensor-infos))
-                                           ((string= architecture "nemotron_h_moe")
-                                            (load-nemotron-h-moe-model mapping kv-pairs tensor-infos))
-                                           ((string= architecture "qwen3next")
-                                            (load-qwen3next-model mapping kv-pairs tensor-infos))
-                                           ((string= architecture "llama")
-                                            (load-llama-model mapping kv-pairs tensor-infos))
-                                           ((string= architecture "qwen2")
-                                            (load-qwen2-model mapping kv-pairs tensor-infos))
-                                           (t nil))))
+                                        architecture-descriptor
+                                        (load-architecture-model
+                                         architecture-descriptor
+                                         mapping
+                                         kv-pairs
+                                         tensor-infos)))
                              (npu-requested-p
                                (and use-npu
                                     (or npu-tensor-names
@@ -1614,16 +1628,12 @@ The caller must ensure that no inference request is using the kernel."
                                (and use-gpu
                                     (or gpu-tensor-names
                                         gpu-layer-indices)))
-                             (effective-step-function (or step-function
-                                                          (and model
-                                                               (case (intern (string-upcase architecture)
-                                                                             :keyword)
-                                                                 (:GEMMA4 (make-gemma4-step-function model))
-                                                                 (:NEMOTRON_H_MOE (make-nemotron-h-moe-step-function model))
-                                                                 (:QWEN3NEXT (make-qwen3next-step-function model))
-                                                                 (:LLAMA (make-llama-step-function model))
-                                                                 (:QWEN2 (make-qwen2-step-function model))
-                                                                 (otherwise nil)))))
+                             (effective-step-function
+                               (or step-function
+                                   (and model
+                                        (make-architecture-step-function
+                                         architecture-descriptor
+                                         model))))
                              (effective-kv-cache (or kv-cache (make-hash-table)))
                              (effective-eos-token-id
                               (or eos-token-id (resolve-eos-token-id kv-pairs))))
@@ -6861,7 +6871,7 @@ and copy all tensors into 64KB-aligned chunks, offset by 16 bytes for an SBCL ar
                                            (setf (cffi:mem-ref temp-view :uint64 0) widetag)
                                            ;; Word 1: Length (as fixnum: length * 2)
                                            (setf (cffi:mem-ref temp-view :uint64 8) (* array-length 2)))
-                                         
+
                                          ;; B. Copy the tensor data from the mapped GGUF file
                                          (let ((gguf-tensor-ptr (cffi:inc-pointer gguf-mapping
                                                                                    (getf info :data-offset)))

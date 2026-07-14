@@ -8,6 +8,10 @@
                           #:aligned-tensor-view-length
                           #:aligned-tensor-view-p
                           #:aligned-tensor-view-ref
+                          #:architecture-descriptor-for-kv-pairs
+                          #:architecture-descriptor-name
+                          #:architecture-descriptor-p
+                          #:architecture-descriptor-tokenizer-policy
                           #:call-with-aligned-tensor-mapping
                           #:call-with-file
                           #:call-with-mapped-file
@@ -40,11 +44,13 @@
                           #:export-model-gpu-projection
                           #:export-model-npu-projection
                           #:find-gguf-tensor-info
+                          #:find-architecture-descriptor
                           #:generate-from-prompt
                           #:generate-gguf-response
                           #:generate-token-loop
                           #:hello-message
                           #:load-gemma4-model
+                          #:load-architecture-model
                           #:load-gpu-backend
                           #:load-llama-model
                           #:load-npu-backend
@@ -52,6 +58,7 @@
                           #:load-gguf-tensor
                           #:load-gguf-tensor-by-name
                           #:make-gemma4-step-function
+                          #:make-architecture-step-function
                           #:make-llama-step-function
                           #:make-qwen2-step-function
                           #:model-gpu-layer-projection-names
@@ -62,6 +69,7 @@
                           #:npu-backend-runtime-version
                           #:register-model-gpu-projection
                           #:register-model-npu-projection
+                          #:register-architecture
                           #:clear-model-gpu-projections
                           #:clear-model-npu-projections
                           #:unregister-model-gpu-projection
@@ -80,6 +88,7 @@
                           #:sample-token-id-from-logits
                           #:silu
                           #:softmax
+                          #:supported-architecture-names
                           #:test-gguf-file-response
                           #:test-llm-response
                           #:tokenize-prompt
@@ -109,6 +118,10 @@
   (is (fboundp 'aligned-tensor-view-length))
   (is (fboundp 'aligned-tensor-view-p))
   (is (fboundp 'aligned-tensor-view-ref))
+  (is (fboundp 'architecture-descriptor-for-kv-pairs))
+  (is (fboundp 'architecture-descriptor-name))
+  (is (fboundp 'architecture-descriptor-p))
+  (is (fboundp 'architecture-descriptor-tokenizer-policy))
   (is (fboundp 'call-with-aligned-tensor-mapping))
   (is (fboundp 'call-with-file))
   (is (fboundp 'call-with-mapped-file))
@@ -141,11 +154,13 @@
   (is (fboundp 'export-model-gpu-projection))
   (is (fboundp 'export-model-npu-projection))
   (is (fboundp 'find-gguf-tensor-info))
+  (is (fboundp 'find-architecture-descriptor))
   (is (fboundp 'generate-from-prompt))
   (is (fboundp 'generate-gguf-response))
   (is (fboundp 'generate-token-loop))
   (is (fboundp 'hello-message))
   (is (fboundp 'load-gemma4-model))
+  (is (fboundp 'load-architecture-model))
   (is (fboundp 'load-gpu-backend))
   (is (fboundp 'load-llama-model))
   (is (fboundp 'load-npu-backend))
@@ -153,6 +168,7 @@
   (is (fboundp 'load-gguf-tensor))
   (is (fboundp 'load-gguf-tensor-by-name))
   (is (fboundp 'make-gemma4-step-function))
+  (is (fboundp 'make-architecture-step-function))
   (is (fboundp 'make-llama-step-function))
   (is (fboundp 'make-qwen2-step-function))
   (is (fboundp 'model-gpu-layer-projection-names))
@@ -163,6 +179,7 @@
   (is (fboundp 'npu-backend-runtime-version))
   (is (fboundp 'register-model-gpu-projection))
   (is (fboundp 'register-model-npu-projection))
+  (is (fboundp 'register-architecture))
   (is (fboundp 'clear-model-gpu-projections))
   (is (fboundp 'clear-model-npu-projections))
   (is (fboundp 'unregister-model-gpu-projection))
@@ -177,6 +194,7 @@
   (is (fboundp 'sample-token-id-from-logits))
   (is (fboundp 'silu))
   (is (fboundp 'softmax))
+  (is (fboundp 'supported-architecture-names))
   (is (fboundp 'test-gguf-file-response))
   (is (fboundp 'test-llm-response))
   (is (fboundp 'tokenize-prompt))
@@ -349,6 +367,84 @@
                 :roles '(:attention-key :attention-output))))
     (is (string= "output.weight"
                  (llambda::gguf-model-output-tensor-name model)))))
+
+(test architecture-descriptor-registry
+  (is (equal '("gemma4" "llama" "nemotron_h_moe" "qwen2" "qwen3next")
+             (supported-architecture-names)))
+  (dolist (entry '(("gemma4" . :gemma4)
+                  ("llama" . :llama)
+                  ("nemotron_h_moe" . :qwen)
+                  ("qwen2" . :qwen)
+                  ("qwen3next" . :qwen)))
+    (let ((descriptor (find-architecture-descriptor (car entry) t)))
+      (is (architecture-descriptor-p descriptor))
+      (is (string= (car entry)
+                  (architecture-descriptor-name descriptor)))
+      (is (eq (cdr entry)
+              (architecture-descriptor-tokenizer-policy descriptor)))
+      (is (eq descriptor
+              (architecture-descriptor-for-kv-pairs
+               `(("general.architecture" . ,(car entry)))
+               t)))))
+  (signals error
+    (find-architecture-descriptor "unsupported-test-architecture" t))
+  (is (member "nemotron_h_moe.ssm.conv_kernel"
+              (llambda::architecture-descriptor-required-metadata-keys
+               (find-architecture-descriptor "nemotron_h_moe" t))
+              :test #'string=))
+  (let ((loader-called-p nil)
+        (validator-called-p nil)
+        (step-called-p nil))
+    (unwind-protect
+        (let* ((descriptor
+                 (register-architecture
+                 "test-descriptor"
+                 (lambda (mapping kv-pairs tensor-infos)
+                   (declare (ignore mapping kv-pairs tensor-infos))
+                   (setf loader-called-p t)
+                   :model)
+                 (lambda (model)
+                   (is (eq :model model))
+                   (setf step-called-p t)
+                   :step)
+                 :validator
+                 (lambda (kv-pairs tensor-infos)
+                   (declare (ignore kv-pairs tensor-infos))
+                   (setf validator-called-p t))
+                 :tokenizer-policy :test
+                 :required-metadata-keys '("test.required")
+                 :required-tensor-groups '(("test.weight"))))
+               (kv-pairs '(("general.architecture" . "test-descriptor")
+                          ("test.required" . 1)))
+               (tensor-infos '((:name "test.weight")))
+               (model
+                 (load-architecture-model
+                 descriptor nil kv-pairs tensor-infos)))
+          (is (not (null loader-called-p)))
+          (is (not (null validator-called-p)))
+          (is (eq :model model))
+          (is (eq :step
+                 (make-architecture-step-function descriptor model)))
+          (is (not (null step-called-p)))
+          (signals error
+            (register-architecture
+             "test-descriptor" #'identity #'identity))
+          (let ((replacement
+                  (register-architecture
+                   "test-descriptor" #'identity #'identity :replace t)))
+            (is (eq replacement
+                    (find-architecture-descriptor "test-descriptor" t))))
+          (signals error
+            (load-architecture-model
+             descriptor nil
+             '(("general.architecture" . "test-descriptor"))
+             tensor-infos))
+          (signals error
+            (load-architecture-model
+             descriptor nil
+             kv-pairs
+             '((:name "other.weight")))))
+      (remhash "test-descriptor" llambda::*architecture-descriptors*))))
 
 (test native-runtime-close-lifecycle
   (let* ((tensor-cache (make-hash-table :test #'equal))
@@ -1103,7 +1199,7 @@
               (write-padding-to-alignment stream 32)
               ;; data bytes
               (loop repeat 256 do (write-byte 0 stream)))
-            
+
             (let ((output (with-output-to-string (stream)
                             (print-gguf-floating-point-tables temp-path stream))))
               ;; Check that it prints details for f32 and f16 tensors

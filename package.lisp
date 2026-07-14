@@ -17,6 +17,10 @@
            #:aligned-tensor-view-length
            #:aligned-tensor-view-p
            #:aligned-tensor-view-ref
+           #:architecture-descriptor-for-kv-pairs
+           #:architecture-descriptor-name
+           #:architecture-descriptor-p
+           #:architecture-descriptor-tokenizer-policy
            #:call-with-aligned-tensor-mapping
            #:call-with-file
            #:call-with-mapped-file
@@ -53,7 +57,9 @@
            #:generate-token-loop
            #:hello-message
            #:find-gguf-tensor-info
+           #:find-architecture-descriptor
            #:load-gemma4-model
+           #:load-architecture-model
            #:load-gpu-backend
            #:load-llama-model
            #:load-npu-backend
@@ -61,6 +67,7 @@
            #:load-gguf-tensor
            #:load-gguf-tensor-by-name
            #:make-gemma4-step-function
+           #:make-architecture-step-function
            #:make-llama-step-function
            #:make-qwen2-step-function
            #:model-gpu-layer-projection-names
@@ -71,6 +78,7 @@
            #:npu-backend-runtime-version
            #:register-model-gpu-projection
            #:register-model-npu-projection
+           #:register-architecture
            #:clear-model-gpu-projections
            #:clear-model-npu-projections
            #:unregister-model-gpu-projection
@@ -90,6 +98,7 @@
            #:sample-token-id-from-logits
            #:silu
            #:softmax
+           #:supported-architecture-names
            #:test-gemma4-e2b-it-response
            #:test-gguf-file-response
            #:test-llm-response

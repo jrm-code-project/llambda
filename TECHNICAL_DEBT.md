@@ -27,7 +27,7 @@ Priority meanings:
 | ---: | :---: | --- | --- |
 | 1 | P0 | GGUF reads were not bounded by the mapped file size (**addressed 2026-07-14**) | Malformed input could drive out-of-bounds native reads or excessive allocation |
 | 2 | P0 | Native resource ownership and forged arrays lacked a safe lifecycle (**addressed 2026-07-14**) | Dangling arrays, leaked views/handles/sessions, and SBCL-version fragility |
-| 3 | P1 | Architecture support is centralized in a superset model and large forward passes | Adding or changing a model family touches multiple coupled dispatch sites |
+| 3 | P1 | Architecture dispatch was centralized (**addressed 2026-07-14**) | Adding or changing a model family required edits to multiple coupled dispatch sites |
 | 4 | P1 | Accelerator implementations are duplicated and coupled through NPU-named state | Backend behavior can drift and another provider would multiply code paths |
 | 5 | P1 | Inference state is implicit and step functions are non-reentrant | Concurrent or interleaved use can corrupt scratch or architecture-specific state |
 | 6 | P1 | GGML type behavior is spread across several independent dispatch tables | New formats are easy to implement partially or inconsistently |
@@ -126,18 +126,29 @@ surrounding `with-mapped-file` scope and are invalidated by `close-model`.
 
 ## 3. Replace central architecture dispatch with descriptors
 
+**Status: Addressed on 2026-07-14.** Architecture selection now uses an
+immutable descriptor registered by a dedicated ASDF architecture component.
+Each descriptor owns its loader, step constructor, tokenizer policy, required
+metadata, required tensor alternatives, and optional validator. Model setup
+performs one registry lookup and validates the descriptor contract before
+loading; token and layer hot paths contain no registry lookup or generic
+dispatch.
+
 **Evidence**
 
-- `gguf-model` is a superset structure containing generic and
-  architecture-specific fields (`llambda.lisp:1958-1982`).
-- Model loading and step construction use separate central dispatch blocks
-  (`llambda.lisp:1503-1533`).
-- Loaders repeat metadata extraction and model construction
-  (`llambda.lisp:4418-4441`, `5115-5138`, `5221-5272`, `5434-5467`).
-- Forward passes are large architecture-specific closures
-  (`llambda.lisp:4443-4740`, `5140-5220`, `5274-5426`, `5503-5737`).
+- The descriptor protocol, registry, and pre-load contract validation are in
+  `architecture.lisp`.
+- Built-in registrations are isolated under `architectures/` and loaded as
+  separate ASDF components by `llambda.asd`.
+- `generate-gguf-response` resolves a descriptor once and uses its loader and
+  step constructor (`llambda.lisp:1558-1695`).
+- Prompt and stop-token behavior consume the registered tokenizer policy
+  (`llambda.lisp:1424-1556`).
+- Registry, duplicate registration, required metadata, required tensor, loader,
+  validator, and step-constructor behavior are covered in
+  `tests.lisp:371-438`.
 
-**Why this is debt**
+**Original debt**
 
 Adding an architecture requires synchronized edits to loader dispatch, step
 dispatch, metadata extraction, tensor naming, tokenizer/chat behavior, and a
@@ -145,18 +156,26 @@ shared structure. The loader and step registries can diverge. Common dense
 attention, FFN, normalization, and cache behavior is embedded inside large
 functions instead of being composed from validated components.
 
-**Remediation**
+**Implemented remediation**
 
 1. Define an architecture descriptor containing metadata schema, loader,
-   tensor naming, tokenizer/chat policy, validator, and step constructor.
-2. Move each architecture into its own ASDF component.
-3. Extract reusable dense-attention, SwiGLU, MoE, and recurrent block
-   components with explicit shape contracts.
-4. Add descriptor tests that validate required metadata and tensors before
-   running a forward pass.
+   tokenizer/chat policy, validator, and step constructor.
+2. Isolated each built-in registration in its own ASDF architecture component.
+3. Centralized descriptor contract validation before loader execution.
+4. Routed prompt preparation and stop-token selection through the descriptor's
+   tokenizer policy.
+5. Added focused descriptor registration and validation tests.
 
-**Exit criterion:** adding an architecture registers one descriptor and module
-without editing the central generation function.
+The specialized forward-pass implementations and shared `gguf-model` remain in
+`llambda.lisp`. Moving those large forms or adding abstraction inside their hot
+paths was intentionally excluded because it would not improve the exit
+criterion and would create unnecessary performance risk. Existing shared
+attention, MoE selection, normalization, and compute-buffer helpers continue to
+be reused directly.
+
+**Exit criterion met:** adding an architecture requires one registration module
+and ASDF component, without editing `generate-gguf-response` or adding dispatch
+inside inference hot paths.
 
 ## 4. Introduce one accelerator backend protocol
 

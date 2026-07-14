@@ -6,7 +6,15 @@
   :depends-on (#:cffi #:sb-simd #:lparallel)
   :in-order-to ((test-op (test-op "llambda/tests")))
   :components ((:file "package")
-               (:file "llambda")))
+               (:file "architecture")
+               (:file "llambda")
+               (:module "architectures"
+                :serial t
+                :components ((:file "qwen3next")
+                             (:file "nemotron-h-moe")
+                             (:file "llama")
+                             (:file "qwen2")
+                             (:file "gemma4")))))
 
 (asdf:defsystem #:llambda/tests
   :depends-on (#:llambda #:fiveam)

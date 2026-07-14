@@ -28,7 +28,7 @@ Priority meanings:
 | 1 | P0 | GGUF reads were not bounded by the mapped file size (**addressed 2026-07-14**) | Malformed input could drive out-of-bounds native reads or excessive allocation |
 | 2 | P0 | Native resource ownership and forged arrays lacked a safe lifecycle (**addressed 2026-07-14**) | Dangling arrays, leaked views/handles/sessions, and SBCL-version fragility |
 | 3 | P1 | Architecture dispatch was centralized (**addressed 2026-07-14**) | Adding or changing a model family required edits to multiple coupled dispatch sites |
-| 4 | P1 | Accelerator implementations are duplicated and coupled through NPU-named state | Backend behavior can drift and another provider would multiply code paths |
+| 4 | P1 | Accelerator lifecycle was duplicated (**addressed 2026-07-14**) | Backend behavior could drift and another provider would multiply code paths |
 | 5 | P1 | Inference state is implicit and step functions are non-reentrant | Concurrent or interleaved use can corrupt scratch or architecture-specific state |
 | 6 | P1 | GGML type behavior is spread across several independent dispatch tables | New formats are easy to implement partially or inconsistently |
 | 7 | P1 | Chat templates are detected but not interpreted | Valid model templates can silently receive the wrong conversation format |
@@ -179,37 +179,55 @@ inside inference hot paths.
 
 ## 4. Introduce one accelerator backend protocol
 
+**Status: Addressed on 2026-07-14.** Accelerator providers now register
+immutable descriptors that own loading, capability probes, session operations,
+error translation, cache representation, export behavior, hashing, and separate
+initialization/execution priorities. DirectML and VitisAI are thin adapters over
+the shared native bridge.
+
 **Evidence**
 
-- NPU and GPU duplicate FFI declarations, session structures, conditions, and
-  execution wrappers (`llambda.lisp:54-122`, `232-330`).
-- GPU loading aliases NPU library state, and shared bridge operations retain
-  NPU names (`llambda.lisp:124-230`).
-- Projection registration, rollback, setup, and cleanup are duplicated
-  (`llambda.lisp:1984-2057`, `2142-2332`).
-- GPU cache generation calls helpers named for NPU
-  (`llambda.lisp:2092-2209`).
+- The descriptor protocol and reload-safe registry are in `accelerator.lisp`.
+- DirectML and VitisAI registrations are isolated in
+  `accelerators/directml.lisp` and `accelerators/vitisai.lisp`.
+- Model-owned bindings use one tensor-indexed, priority-ordered projection
+  store (`llambda.lisp:2217-2429`).
+- Registration, rollback, caching, enablement, setup fallback, runtime fallback,
+  and cleanup are provider-neutral (`llambda.lisp:2276-2849`,
+  `4185-4267`).
+- Fake descriptors exercise capability failure, cache independence, priority,
+  runtime fallback, descriptor replacement, per-binding disablement, and
+  cleanup (`tests.lisp:523-673`).
 
-**Why this is debt**
+**Original debt**
 
 The two backends implement the same lifecycle independently, so fixes to
 validation, fallback, cleanup, or cache identity can land in only one path.
 The shared DLL/runtime is hidden behind two global variables, making adapter
 selection and multi-device support difficult to reason about or test.
 
-**Remediation**
+**Implemented remediation**
 
-1. Define an accelerator descriptor/protocol for load, probe, create, run,
-   close, cache representation, and condition translation.
-2. Store model projections in one table keyed by `(backend, tensor-name)`.
-3. Express GPU/NPU preference as ordered backend data rather than nested
-   conditionals.
-4. Inject fake descriptors in capability/fallback tests.
-5. Rename shared bridge, hashing, generator, and cache helpers to
-   provider-neutral terms while retaining compatibility aliases.
+1. Defined a descriptor and registry for provider operations and policy.
+2. Replaced separate GPU/NPU tables with one tensor-to-binding-vector store,
+   avoiding tuple allocation and reducing the CPU path to one hash lookup.
+3. Made execution priority data-driven as GPU, NPU, CPU. Initialization uses a
+   separate NPU-before-GPU priority because both providers share one DLL and the
+   NPU-capable build also exposes DirectML.
+4. Consolidated projection registration, cache identity, export, rollback,
+   setup, runtime fallback, and cleanup.
+5. Moved SHA-256 operations behind descriptors so custom backends do not depend
+   on the NPU bridge.
+6. Retained all exported GPU- and NPU-named APIs as compatibility wrappers.
+7. Added fake-provider tests plus real DirectML/VitisAI capability and
+   projection benchmarks.
 
-**Exit criterion:** adding a backend requires a descriptor and native adapter,
-not another copy of projection lifecycle code.
+Provider-specific CFFI declarations, native session wrappers, and conditions
+remain intentionally inside the native adapters. They represent actual ABI
+differences rather than duplicated model lifecycle.
+
+**Exit criterion met:** adding a backend requires a descriptor and native
+adapter, not another copy of projection lifecycle or inference-routing code.
 
 ## 5. Make inference state explicit and reentrant
 

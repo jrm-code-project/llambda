@@ -12,6 +12,10 @@
                           #:architecture-descriptor-name
                           #:architecture-descriptor-p
                           #:architecture-descriptor-tokenizer-policy
+                          #:accelerator-backend-name
+                          #:accelerator-backend-p
+                          #:accelerator-backend-priority
+                          #:accelerator-backend-initialization-priority
                           #:call-with-aligned-tensor-mapping
                           #:call-with-file
                           #:call-with-mapped-file
@@ -40,10 +44,12 @@
                           #:enable-model-npu-layer-projections
                           #:ensure-model-gpu-projection
                           #:ensure-model-npu-projection
+                          #:ensure-model-accelerator-projection
                           #:evaluate-prompt
                           #:export-model-gpu-projection
                           #:export-model-npu-projection
                           #:find-gguf-tensor-info
+                          #:find-accelerator-backend
                           #:find-architecture-descriptor
                           #:generate-from-prompt
                           #:generate-gguf-response
@@ -58,6 +64,7 @@
                           #:load-gguf-tensor
                           #:load-gguf-tensor-by-name
                           #:make-gemma4-step-function
+                          #:make-accelerator-backend
                           #:make-architecture-step-function
                           #:make-llama-step-function
                           #:make-qwen2-step-function
@@ -69,11 +76,15 @@
                           #:npu-backend-runtime-version
                           #:register-model-gpu-projection
                           #:register-model-npu-projection
+                          #:register-accelerator-backend
+                          #:register-model-accelerator-projection
                           #:register-architecture
                           #:clear-model-gpu-projections
                           #:clear-model-npu-projections
+                          #:clear-model-accelerator-projections
                           #:unregister-model-gpu-projection
                           #:unregister-model-npu-projection
+                          #:unregister-model-accelerator-projection
                           #:map-view-of-file
                           #:print-gguf-file
                           #:print-gguf-floating-point-tables
@@ -88,6 +99,7 @@
                           #:sample-token-id-from-logits
                           #:silu
                           #:softmax
+                          #:ordered-accelerator-backends
                           #:supported-architecture-names
                           #:test-gguf-file-response
                           #:test-llm-response
@@ -106,6 +118,53 @@
 
 (in-suite llambda-suite)
 
+(define-condition fake-accelerator-error (simple-error) ())
+
+(defun make-fake-accelerator-backend
+    (name priority run-function close-function
+     &key (available-p-function (constantly t))
+       (make-session-function
+         (lambda (model-path &key cache-directory cache-key)
+           (declare (ignore model-path cache-directory cache-key))
+           name)))
+  (make-accelerator-backend
+   :name name
+   :display-name (string-upcase (symbol-name name))
+   :priority priority
+   :initialization-priority priority
+   :load-function (constantly t)
+   :available-p-function available-p-function
+   :runtime-version-function (lambda () "test-runtime")
+   :bridge-version-function (lambda () "test-bridge")
+   :make-session-function make-session-function
+   :close-session-function close-function
+   :run-session-function run-function
+   :session-input-element-count-function (constantly 1)
+   :session-output-element-count-function (constantly 1)
+   :error-p-function
+   (lambda (condition)
+     (typep condition 'fake-accelerator-error))
+   :signal-error-function
+   (lambda (format-control &rest format-arguments)
+     (error 'fake-accelerator-error
+            :format-control format-control
+            :format-arguments format-arguments))
+   :default-cache-directory-function #'uiop:temporary-directory
+   :export-projection-function
+   (lambda (model tensor-name output-path
+            &key python-command generator-path)
+     (declare (ignore model tensor-name output-path
+                      python-command generator-path)))
+   :weight-format :float32
+   :foreign-data-sha256-function
+   (lambda (pointer byte-size)
+     (declare (ignore pointer byte-size))
+     "fake-foreign-sha256")
+   :byte-vector-sha256-function
+   (lambda (octets)
+     (declare (ignore octets))
+     "fake-byte-vector-sha256")))
+
 (test hello-message
   (is (string= "llambda ready." (hello-message))))
 
@@ -118,6 +177,10 @@
   (is (fboundp 'aligned-tensor-view-length))
   (is (fboundp 'aligned-tensor-view-p))
   (is (fboundp 'aligned-tensor-view-ref))
+  (is (fboundp 'accelerator-backend-name))
+  (is (fboundp 'accelerator-backend-p))
+  (is (fboundp 'accelerator-backend-priority))
+  (is (fboundp 'accelerator-backend-initialization-priority))
   (is (fboundp 'architecture-descriptor-for-kv-pairs))
   (is (fboundp 'architecture-descriptor-name))
   (is (fboundp 'architecture-descriptor-p))
@@ -150,10 +213,12 @@
   (is (fboundp 'enable-model-npu-layer-projections))
   (is (fboundp 'ensure-model-gpu-projection))
   (is (fboundp 'ensure-model-npu-projection))
+  (is (fboundp 'ensure-model-accelerator-projection))
   (is (fboundp 'evaluate-prompt))
   (is (fboundp 'export-model-gpu-projection))
   (is (fboundp 'export-model-npu-projection))
   (is (fboundp 'find-gguf-tensor-info))
+  (is (fboundp 'find-accelerator-backend))
   (is (fboundp 'find-architecture-descriptor))
   (is (fboundp 'generate-from-prompt))
   (is (fboundp 'generate-gguf-response))
@@ -168,6 +233,7 @@
   (is (fboundp 'load-gguf-tensor))
   (is (fboundp 'load-gguf-tensor-by-name))
   (is (fboundp 'make-gemma4-step-function))
+  (is (fboundp 'make-accelerator-backend))
   (is (fboundp 'make-architecture-step-function))
   (is (fboundp 'make-llama-step-function))
   (is (fboundp 'make-qwen2-step-function))
@@ -179,11 +245,15 @@
   (is (fboundp 'npu-backend-runtime-version))
   (is (fboundp 'register-model-gpu-projection))
   (is (fboundp 'register-model-npu-projection))
+  (is (fboundp 'register-accelerator-backend))
+  (is (fboundp 'register-model-accelerator-projection))
   (is (fboundp 'register-architecture))
   (is (fboundp 'clear-model-gpu-projections))
   (is (fboundp 'clear-model-npu-projections))
+  (is (fboundp 'clear-model-accelerator-projections))
   (is (fboundp 'unregister-model-gpu-projection))
   (is (fboundp 'unregister-model-npu-projection))
+  (is (fboundp 'unregister-model-accelerator-projection))
   (is (fboundp 'map-view-of-file))
   (is (fboundp 'print-gguf-file))
   (is (fboundp 'read-gguf-header))
@@ -194,6 +264,7 @@
   (is (fboundp 'sample-token-id-from-logits))
   (is (fboundp 'silu))
   (is (fboundp 'softmax))
+  (is (fboundp 'ordered-accelerator-backends))
   (is (fboundp 'supported-architecture-names))
   (is (fboundp 'test-gguf-file-response))
   (is (fboundp 'test-llm-response))
@@ -323,8 +394,11 @@
     (is (= 4 (llambda::gguf-model-head-count model)))
     (is (= 2 (llambda::gguf-model-kv-head-count model)))
     (is (= 32 (llambda::gguf-model-ffn-size model)))
-    (is (hash-table-p (llambda::gguf-model-npu-projections model)))
-    (is (hash-table-p (llambda::gguf-model-gpu-projections model)))
+    (is (hash-table-p
+         (llambda::gguf-model-accelerator-projections model)))
+    (is (zerop
+         (hash-table-count
+          (llambda::gguf-model-accelerator-projections model))))
     (is (string= "output.weight"
                  (llambda::gguf-model-output-tensor-name model))))
   (let* ((kv-pairs '(("general.architecture" . "llama")
@@ -446,14 +520,161 @@
              '((:name "other.weight")))))
       (remhash "test-descriptor" llambda::*architecture-descriptors*))))
 
+(test accelerator-backend-protocol
+  (is (equal '(:gpu :npu)
+             (mapcar #'accelerator-backend-name
+                     (ordered-accelerator-backends))))
+  (is (equal '(:npu :gpu)
+             (mapcar
+              #'accelerator-backend-name
+              (sort
+               (copy-list (ordered-accelerator-backends))
+               #'<
+               :key #'accelerator-backend-initialization-priority))))
+  (let ((gpu-fails-p nil)
+        (npu-fails-p nil)
+        (available-p t)
+        (gpu-run-count 0)
+        (npu-run-count 0)
+        (closed-sessions '()))
+    (labels ((close-session (session)
+               (push session closed-sessions))
+             (run-gpu (dest session input)
+               (declare (ignore session input))
+               (incf gpu-run-count)
+               (when gpu-fails-p
+                 (error 'fake-accelerator-error
+                        :format-control "simulated GPU failure"))
+               (setf (aref dest 0) 10.0f0)
+               dest)
+             (run-npu (dest session input)
+               (declare (ignore session input))
+               (incf npu-run-count)
+               (when npu-fails-p
+                 (error 'fake-accelerator-error
+                        :format-control "simulated NPU failure"))
+               (setf (aref dest 0) 20.0f0)
+               dest))
+      (let ((gpu-backend
+              (make-fake-accelerator-backend
+               :fake-gpu 1 #'run-gpu #'close-session
+               :available-p-function (lambda () available-p)))
+            (npu-backend
+              (make-fake-accelerator-backend
+               :fake-npu 2 #'run-npu #'close-session)))
+        (unwind-protect
+            (progn
+              (register-accelerator-backend gpu-backend)
+              (register-accelerator-backend npu-backend)
+              (signals error
+                (register-accelerator-backend gpu-backend))
+              (cffi:with-foreign-object (mapping :float)
+                (setf (cffi:mem-ref mapping :float) 3.0f0)
+                (let* ((tensor-info
+                         '(:name "test.weight"
+                           :dimensions (1 1)
+                           :type-tag 0
+                           :data-offset 0
+                           :byte-size 4))
+                       (tensor-info-table
+                         (make-hash-table :test #'equal))
+                       (model
+                         (llambda::make-gguf-model
+                          :mapping mapping
+                          :tensor-infos (list tensor-info)
+                          :tensor-info-table tensor-info-table))
+                       (input
+                         (make-array 1
+                                     :element-type 'single-float
+                                     :initial-element 2.0f0))
+                       (output
+                         (make-array 1
+                                     :element-type 'single-float
+                                     :initial-element 0.0f0)))
+                  (setf (gethash "test.weight" tensor-info-table)
+                        tensor-info)
+                  (register-model-accelerator-projection
+                   model npu-backend "test.weight" #P"fake-npu.onnx")
+                  (register-model-accelerator-projection
+                   model gpu-backend "test.weight" #P"fake-gpu.onnx")
+                  (register-accelerator-backend
+                   (make-fake-accelerator-backend
+                    :fake-gpu 1 #'run-gpu #'close-session)
+                   :replace t)
+                  (is (llambda::model-accelerator-projection
+                       model :fake-gpu "test.weight"))
+                  (let ((projections
+                          (gethash
+                           "test.weight"
+                           (llambda::gguf-model-accelerator-projections
+                            model))))
+                    (is (= 2 (length projections)))
+                    (is (eq gpu-backend
+                            (llambda::accelerator-projection-backend
+                             (aref projections 0))))
+                    (is (eq npu-backend
+                            (llambda::accelerator-projection-backend
+                             (aref projections 1)))))
+                  (llambda::gguf-model-matrix-vector-multiply-into
+                   output model "test.weight" input)
+                  (is (= 10.0f0 (aref output 0)))
+                  (is (= 1 gpu-run-count))
+                  (is (zerop npu-run-count))
+                  (setf gpu-fails-p t)
+                  (handler-bind ((warning #'muffle-warning))
+                    (llambda::gguf-model-matrix-vector-multiply-into
+                     output model "test.weight" input))
+                  (is (= 20.0f0 (aref output 0)))
+                  (is (= 2 gpu-run-count))
+                  (is (= 1 npu-run-count))
+                  (is (member :fake-gpu closed-sessions))
+                  (is (null
+                       (llambda::model-accelerator-projection
+                        model gpu-backend "test.weight")))
+                  (setf npu-fails-p t)
+                  (handler-bind ((warning #'muffle-warning))
+                    (llambda::gguf-model-matrix-vector-multiply-into
+                     output model "test.weight" input))
+                  (is (= 6.0f0 (aref output 0)))
+                  (is (= 2 npu-run-count))
+                  (is (member :fake-npu closed-sessions))
+                  (is (zerop
+                       (hash-table-count
+                        (llambda::gguf-model-accelerator-projections
+                         model))))
+                  (multiple-value-bind
+                        (ensured-model onnx-path reused-p)
+                      (ensure-model-accelerator-projection
+                       model
+                       gpu-backend
+                       "test.weight"
+                       :cache-directory (uiop:temporary-directory))
+                    (is (eq model ensured-model))
+                    (is (pathnamep onnx-path))
+                    (is (null reused-p)))
+                  (is (llambda::model-accelerator-projection
+                       model :fake-gpu "test.weight"))
+                  (unregister-model-accelerator-projection
+                   model :fake-gpu "test.weight")
+                  (setf available-p nil)
+                  (handler-bind ((warning #'muffle-warning))
+                    (is (null
+                         (llambda::try-enable-model-accelerator-projections
+                          model
+                          gpu-backend
+                          '("test.weight")))))
+                  (is (eq model
+                          (clear-model-accelerator-projections model)))
+                  (close-model model))))
+          (remhash :fake-gpu llambda::*accelerator-backends*)
+          (remhash :fake-npu llambda::*accelerator-backends*))))))
+
 (test native-runtime-close-lifecycle
   (let* ((tensor-cache (make-hash-table :test #'equal))
          (model
            (llambda::make-gguf-model
             :mapping (cffi:make-pointer 1)
-            :tensor-cache tensor-cache
-            :npu-projections (make-hash-table :test #'equal)
-            :gpu-projections (make-hash-table :test #'equal))))
+            :tensor-cache tensor-cache)))
     (setf (gethash "cached.weight" tensor-cache) #(1.0f0))
     (is (eq model (close-model model)))
     (is (llambda::gguf-model-closed-p model))

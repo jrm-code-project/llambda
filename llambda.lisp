@@ -354,10 +354,13 @@
   #-sbcl
   (error "Float32 projection export currently requires SBCL."))
 
-(defun default-npu-model-generator-pathname ()
+(defun default-accelerator-model-generator-pathname ()
   (asdf:system-relative-pathname
    :llambda
    #P"native/generate-matmul-model.py"))
+
+(defun default-npu-model-generator-pathname ()
+  (default-accelerator-model-generator-pathname))
 
 (defun replace-file-atomically (source destination)
   (cffi:with-foreign-string
@@ -374,7 +377,7 @@
     (model tensor-name onnx-path
      &key
        (python-command '("python"))
-       (generator-path (default-npu-model-generator-pathname))
+       (generator-path (default-accelerator-model-generator-pathname))
        (weight-format :bfloat16))
   (unless (member weight-format '(:bfloat16 :float32))
     (error "Unknown accelerator projection weight format ~s." weight-format))
@@ -1620,14 +1623,34 @@ The caller must ensure that no inference request is using the kernel."
                                          mapping
                                          kv-pairs
                                          tensor-infos)))
-                             (npu-requested-p
-                               (and use-npu
-                                    (or npu-tensor-names
-                                        npu-layer-indices)))
-                             (gpu-requested-p
-                               (and use-gpu
-                                    (or gpu-tensor-names
-                                        gpu-layer-indices)))
+                             (accelerator-requests
+                               (sort
+                                (remove
+                                 nil
+                                 (list
+                                  (when use-gpu
+                                    (list
+                                     :backend :gpu
+                                     :tensor-names gpu-tensor-names
+                                     :layer-indices gpu-layer-indices
+                                     :projection-roles gpu-projection-roles
+                                     :cache-directory gpu-cache-directory
+                                     :python-command gpu-python-command))
+                                  (when use-npu
+                                    (list
+                                     :backend :npu
+                                     :tensor-names npu-tensor-names
+                                     :layer-indices npu-layer-indices
+                                     :projection-roles npu-projection-roles
+                                     :cache-directory npu-cache-directory
+                                     :python-command npu-python-command))))
+                                #'<
+                                :key
+                                (lambda (request)
+                                  (accelerator-backend-initialization-priority
+                                   (find-accelerator-backend
+                                    (getf request :backend)
+                                    t)))))
                              (effective-step-function
                                (or step-function
                                    (and model
@@ -1639,30 +1662,40 @@ The caller must ensure that no inference request is using the kernel."
                               (or eos-token-id (resolve-eos-token-id kv-pairs))))
                         (unwind-protect
                             (progn
-                             (when (and use-npu (not npu-requested-p))
-                               (warn "NPU acceleration was requested without any usable projections; continuing on the CPU."))
-                             (when npu-requested-p
-                               (if model
-                                   (try-enable-model-npu-projections
-                                    model
-                                    npu-tensor-names
-                                    :layer-indices npu-layer-indices
-                                    :projection-roles npu-projection-roles
-                                    :cache-directory npu-cache-directory
-                                    :python-command npu-python-command)
-                                   (warn "NPU acceleration requires the built-in model loader; continuing on the CPU.")))
-                             (when (and use-gpu (not gpu-requested-p))
-                               (warn "GPU acceleration was requested without any usable projections; continuing without GPU acceleration."))
-                             (when gpu-requested-p
-                               (if model
-                                   (try-enable-model-gpu-projections
-                                    model
-                                    gpu-tensor-names
-                                    :layer-indices gpu-layer-indices
-                                    :projection-roles gpu-projection-roles
-                                    :cache-directory gpu-cache-directory
-                                    :python-command gpu-python-command)
-                                   (warn "GPU acceleration requires the built-in model loader; continuing without GPU acceleration.")))
+                             (dolist (request accelerator-requests)
+                               (let* ((backend-name
+                                        (getf request :backend))
+                                      (backend
+                                        (find-accelerator-backend
+                                         backend-name
+                                         t))
+                                      (tensor-names
+                                        (getf request :tensor-names))
+                                      (layer-indices
+                                        (getf request :layer-indices)))
+                                 (cond
+                                   ((not (or tensor-names layer-indices))
+                                    (warn
+                                     "~a acceleration was requested without any usable projections; continuing with the next available backend."
+                                     (accelerator-backend-display-name
+                                      backend)))
+                                   (model
+                                    (try-enable-model-accelerator-projections
+                                     model
+                                     backend
+                                     tensor-names
+                                     :layer-indices layer-indices
+                                     :projection-roles
+                                     (getf request :projection-roles)
+                                     :cache-directory
+                                     (getf request :cache-directory)
+                                     :python-command
+                                     (getf request :python-command)))
+                                   (t
+                                    (warn
+                                     "~a acceleration requires the built-in model loader; continuing with the next available backend."
+                                     (accelerator-backend-display-name
+                                      backend))))))
                              (when print-metadata
                                (format stream "Model: ~a~%" pathname)
                                (format stream "Architecture: ~a~%" architecture)
@@ -2181,6 +2214,13 @@ Write a haiku about a hacker drinking coffee.<turn|>
     (values (load-gguf-tensor mapped-file tensor-info)
             tensor-info)))
 
+(defstruct accelerator-projection
+  (backend (error "Accelerator projection backend is required.")
+           :type accelerator-backend
+           :read-only t)
+  (session (error "Accelerator projection session is required.")
+           :read-only t))
+
 (defstruct gguf-model
   mapping
   kv-pairs
@@ -2204,8 +2244,7 @@ Write a haiku about a hacker drinking coffee.<turn|>
   per-layer-embedding-size
   final-logit-softcap
   output-tensor-name
-  (npu-projections (make-hash-table :test #'equal))
-  (gpu-projections (make-hash-table :test #'equal))
+  (accelerator-projections (make-hash-table :test #'equal))
   (closed-p nil))
 
 (defun ensure-model-open (model operation)
@@ -2213,91 +2252,188 @@ Write a haiku about a hacker drinking coffee.<turn|>
     (error "~a cannot use a closed GGUF model." operation))
   model)
 
+(defun resolve-accelerator-backend (backend)
+  (etypecase backend
+    (accelerator-backend backend)
+    (symbol (find-accelerator-backend backend t))))
+
+(defun model-accelerator-projection (model backend tensor-name)
+  (let ((resolved-backend (resolve-accelerator-backend backend))
+        (projections
+          (gethash tensor-name (gguf-model-accelerator-projections model))))
+    (find (accelerator-backend-name resolved-backend)
+          projections
+          :key (lambda (projection)
+                 (accelerator-backend-name
+                  (accelerator-projection-backend projection)))
+          :test #'eq)))
+
+(defun model-accelerator-session (model backend tensor-name)
+  (let ((projection
+          (model-accelerator-projection model backend tensor-name)))
+    (and projection (accelerator-projection-session projection))))
+
+(defun register-model-accelerator-projection
+    (model backend tensor-name onnx-path &key cache-directory cache-key)
+  (ensure-model-open model "REGISTER-MODEL-ACCELERATOR-PROJECTION")
+  (let* ((resolved-backend (resolve-accelerator-backend backend))
+         (tensor-info (gguf-model-tensor-info model tensor-name t))
+         (projection-table (gguf-model-accelerator-projections model))
+         (projections (gethash tensor-name projection-table))
+         (display-name
+           (accelerator-backend-display-name resolved-backend)))
+    (when (find (accelerator-backend-name resolved-backend)
+                projections
+                :key (lambda (projection)
+                       (accelerator-backend-name
+                        (accelerator-projection-backend projection)))
+                :test #'eq)
+      (error "Tensor ~s already has a ~a projection."
+             tensor-name
+             display-name))
+    (let ((session
+            (funcall
+             (accelerator-backend-make-session-function resolved-backend)
+             onnx-path
+             :cache-directory cache-directory
+             :cache-key cache-key)))
+      (unwind-protect
+          (progn
+            (unless
+                (= (tensor-column-count tensor-info)
+                   (funcall
+                    (accelerator-backend-session-input-element-count-function
+                     resolved-backend)
+                    session))
+              (error "~a input size does not match tensor ~s."
+                     display-name
+                     tensor-name))
+            (unless
+                (= (tensor-row-count tensor-info)
+                   (funcall
+                    (accelerator-backend-session-output-element-count-function
+                     resolved-backend)
+                    session))
+              (error "~a output size does not match tensor ~s."
+                     display-name
+                     tensor-name))
+            (setf (gethash tensor-name projection-table)
+                  (sort
+                   (concatenate
+                    'vector
+                    projections
+                    (vector
+                     (make-accelerator-projection
+                      :backend resolved-backend
+                      :session session)))
+                   #'<
+                   :key
+                   (lambda (projection)
+                     (accelerator-backend-priority
+                      (accelerator-projection-backend projection)))))
+            (setf session nil))
+        (when session
+          (funcall
+           (accelerator-backend-close-session-function resolved-backend)
+           session)))))
+  model)
+
+(defun unregister-model-accelerator-projection (model backend tensor-name)
+  (let* ((resolved-backend (resolve-accelerator-backend backend))
+         (projection-table (gguf-model-accelerator-projections model))
+         (projections (gethash tensor-name projection-table))
+         (backend-name (accelerator-backend-name resolved-backend))
+         (projection
+           (find backend-name
+                 projections
+                 :key (lambda (candidate)
+                        (accelerator-backend-name
+                         (accelerator-projection-backend candidate)))
+                 :test #'eq)))
+    (when projection
+      (let* ((projection-backend
+               (accelerator-projection-backend projection))
+             (remaining
+              (remove backend-name
+                      projections
+                      :key (lambda (candidate)
+                             (accelerator-backend-name
+                              (accelerator-projection-backend candidate)))
+                      :test #'eq)))
+        (if (plusp (length remaining))
+            (setf (gethash tensor-name projection-table) remaining)
+            (remhash tensor-name projection-table))
+        (funcall
+         (accelerator-backend-close-session-function projection-backend)
+         (accelerator-projection-session projection))))
+  model))
+
+(defun clear-model-accelerator-projections (model &optional backend)
+  (let ((projection-table (gguf-model-accelerator-projections model)))
+    (if backend
+        (let ((resolved-backend (resolve-accelerator-backend backend))
+              (tensor-names '()))
+          (maphash
+           (lambda (tensor-name projections)
+             (when (find (accelerator-backend-name resolved-backend)
+                         projections
+                         :key (lambda (projection)
+                                (accelerator-backend-name
+                                 (accelerator-projection-backend
+                                  projection)))
+                         :test #'eq)
+               (push tensor-name tensor-names)))
+           projection-table)
+          (dolist (tensor-name tensor-names)
+            (unregister-model-accelerator-projection
+             model resolved-backend tensor-name)))
+        (progn
+          (maphash
+           (lambda (tensor-name projections)
+             (declare (ignore tensor-name))
+             (map nil
+                  (lambda (projection)
+                    (let ((projection-backend
+                            (accelerator-projection-backend projection)))
+                      (funcall
+                       (accelerator-backend-close-session-function
+                        projection-backend)
+                       (accelerator-projection-session projection))))
+                  projections))
+           projection-table)
+          (clrhash projection-table))))
+  model)
+
 (defun register-model-npu-projection
     (model tensor-name onnx-path &key cache-directory cache-key)
-  (ensure-model-open model "REGISTER-MODEL-NPU-PROJECTION")
-  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
-         (projections (gguf-model-npu-projections model)))
-    (when (gethash tensor-name projections)
-      (error "Tensor ~s already has an NPU projection." tensor-name))
-    (let ((session (make-npu-session onnx-path
-                                     :cache-directory cache-directory
-                                     :cache-key cache-key)))
-      (unwind-protect
-          (progn
-            (unless (= (tensor-column-count tensor-info)
-                       (npu-session-input-element-count session))
-              (error "NPU input size does not match tensor ~s." tensor-name))
-            (unless (= (tensor-row-count tensor-info)
-                       (npu-session-output-element-count session))
-              (error "NPU output size does not match tensor ~s." tensor-name))
-            (setf (gethash tensor-name projections) session)
-            (setf session nil))
-        (when session
-          (close-npu-session session)))))
-  model)
+  (register-model-accelerator-projection
+   model :npu tensor-name onnx-path
+   :cache-directory cache-directory
+   :cache-key cache-key))
 
 (defun unregister-model-npu-projection (model tensor-name)
-  (let* ((projections (gguf-model-npu-projections model))
-         (session (gethash tensor-name projections)))
-    (when session
-      (remhash tensor-name projections)
-      (close-npu-session session)))
-  model)
+  (unregister-model-accelerator-projection model :npu tensor-name))
 
 (defun clear-model-npu-projections (model)
-  (maphash (lambda (tensor-name session)
-             (declare (ignore tensor-name))
-             (close-npu-session session))
-           (gguf-model-npu-projections model))
-  (clrhash (gguf-model-npu-projections model))
-  model)
+  (clear-model-accelerator-projections model :npu))
 
 (defun register-model-gpu-projection (model tensor-name onnx-path)
-  (ensure-model-open model "REGISTER-MODEL-GPU-PROJECTION")
-  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
-         (projections (gguf-model-gpu-projections model)))
-    (when (gethash tensor-name projections)
-      (error "Tensor ~s already has a GPU projection." tensor-name))
-    (let ((session (make-gpu-session onnx-path)))
-      (unwind-protect
-          (progn
-            (unless (= (tensor-column-count tensor-info)
-                       (gpu-session-input-element-count session))
-              (error "GPU input size does not match tensor ~s." tensor-name))
-            (unless (= (tensor-row-count tensor-info)
-                       (gpu-session-output-element-count session))
-              (error "GPU output size does not match tensor ~s." tensor-name))
-            (setf (gethash tensor-name projections) session)
-            (setf session nil))
-        (when session
-          (close-gpu-session session)))))
-  model)
+  (register-model-accelerator-projection
+   model :gpu tensor-name onnx-path))
 
 (defun unregister-model-gpu-projection (model tensor-name)
-  (let* ((projections (gguf-model-gpu-projections model))
-         (session (gethash tensor-name projections)))
-    (when session
-      (remhash tensor-name projections)
-      (close-gpu-session session)))
-  model)
+  (unregister-model-accelerator-projection model :gpu tensor-name))
 
 (defun clear-model-gpu-projections (model)
-  (maphash (lambda (tensor-name session)
-             (declare (ignore tensor-name))
-             (close-gpu-session session))
-           (gguf-model-gpu-projections model))
-  (clrhash (gguf-model-gpu-projections model))
-  model)
+  (clear-model-accelerator-projections model :gpu))
 
 (defun close-model (model)
   "Release accelerator sessions and cached tensors owned by MODEL.
 
 The GGUF mapping is borrowed from the surrounding WITH-MAPPED-FILE scope and
 is invalidated here, but its handle remains owned by that scope."
-  (unless (gguf-model-closed-p model)
-    (clear-model-gpu-projections model)
-    (clear-model-npu-projections model)
+(unless (gguf-model-closed-p model)
+  (clear-model-accelerator-projections model)
     (let ((tensor-cache (gguf-model-tensor-cache model)))
       (when tensor-cache
         (clrhash tensor-cache)))
@@ -2305,22 +2441,23 @@ is invalidated here, but its handle remains owned by that scope."
           (gguf-model-closed-p model) t))
   model)
 
-(defun tensor-content-sha256 (model tensor-info)
+(defun foreign-data-sha256 (pointer byte-size)
   (require-npu-backend)
+  (cffi:with-foreign-object (output :char 65)
+    (check-npu-status
+     (%npu-sha256 pointer byte-size output 65)
+     "Foreign data SHA-256")
+    (cffi:foreign-string-to-lisp output :encoding :ascii)))
+
+(defun tensor-content-sha256 (model tensor-info)
   (let ((byte-size (getf tensor-info :byte-size))
         (data-offset (getf tensor-info :data-offset)))
     (unless (and byte-size data-offset)
       (error "Tensor ~s does not have mapped byte-size and offset metadata."
              (getf tensor-info :name)))
-    (cffi:with-foreign-object (output :char 65)
-      (check-npu-status
-       (%npu-sha256
-        (cffi:inc-pointer (gguf-model-mapping model) data-offset)
-        byte-size
-        output
-        65)
-       "Tensor SHA-256")
-      (cffi:foreign-string-to-lisp output :encoding :ascii))))
+    (foreign-data-sha256
+     (cffi:inc-pointer (gguf-model-mapping model) data-offset)
+     byte-size)))
 
 (defun byte-vector-sha256 (octets)
   (cffi:with-foreign-object (output :char 65)
@@ -2338,6 +2475,32 @@ is invalidated here, but its handle remains owned by that scope."
         (error "Unable to read all bytes from ~a." pathname))
       (byte-vector-sha256 octets))))
 
+(defun accelerator-tensor-content-sha256 (backend model tensor-info)
+  (let ((byte-size (getf tensor-info :byte-size))
+        (data-offset (getf tensor-info :data-offset))
+        (resolved-backend (resolve-accelerator-backend backend)))
+    (unless (and byte-size data-offset)
+      (error "Tensor ~s does not have mapped byte-size and offset metadata."
+             (getf tensor-info :name)))
+    (funcall
+     (accelerator-backend-foreign-data-sha256-function
+      resolved-backend)
+     (cffi:inc-pointer (gguf-model-mapping model) data-offset)
+     byte-size)))
+
+(defun accelerator-file-sha256 (backend pathname)
+  (let ((resolved-backend (resolve-accelerator-backend backend)))
+    (with-open-file (stream pathname :element-type '(unsigned-byte 8))
+      (let* ((length (file-length stream))
+             (octets
+               (make-array length :element-type '(unsigned-byte 8))))
+        (unless (= length (read-sequence octets stream))
+          (error "Unable to read all bytes from ~a." pathname))
+        (funcall
+         (accelerator-backend-byte-vector-sha256-function
+          resolved-backend)
+         octets)))))
+
 (defun default-npu-cache-directory ()
   (let ((base (or (uiop:getenv "LOCALAPPDATA")
                   (uiop:native-namestring (uiop:temporary-directory)))))
@@ -2347,7 +2510,7 @@ is invalidated here, but its handle remains owned by that scope."
 (defun default-gpu-cache-directory ()
   (default-npu-cache-directory))
 
-(defun npu-cache-component (value)
+(defun accelerator-cache-component (value)
   (map 'string
        (lambda (character)
          (if (or (alphanumericp character)
@@ -2357,16 +2520,58 @@ is invalidated here, but its handle remains owned by that scope."
              #\-))
        value))
 
-(defun model-npu-projection-cache-key
-    (model tensor-info generator-path &key (weight-format :bfloat16))
+(defun npu-cache-component (value)
+  (accelerator-cache-component value))
+
+(defun model-accelerator-projection-cache-key
+    (model backend tensor-info generator-path)
+  (let ((resolved-backend (resolve-accelerator-backend backend)))
   (format nil "bridge-~a-generator-~a-ort-~a-weights-~(~a~)-ggml-~d-~{~d~^-~}-~a"
-          (npu-cache-component (npu-bridge-version))
-          (file-sha256 generator-path)
-          (npu-cache-component (npu-backend-runtime-version))
-          weight-format
+            (accelerator-cache-component
+             (funcall
+              (accelerator-backend-bridge-version-function
+               resolved-backend)))
+            (accelerator-file-sha256 resolved-backend generator-path)
+            (accelerator-cache-component
+             (funcall
+              (accelerator-backend-runtime-version-function
+               resolved-backend)))
+            (accelerator-backend-weight-format resolved-backend)
           (getf tensor-info :type-tag)
           (getf tensor-info :dimensions)
-          (tensor-content-sha256 model tensor-info)))
+            (accelerator-tensor-content-sha256
+             resolved-backend model tensor-info))))
+
+(defun model-npu-projection-cache-key
+    (model tensor-info generator-path &key (weight-format :bfloat16))
+  (model-accelerator-projection-cache-key
+   model
+   (if (eq weight-format :float32) :gpu :npu)
+   tensor-info
+   generator-path))
+
+(defun model-accelerator-projection-cache-pathnames
+    (model backend tensor-name
+     &optional cache-directory
+      (generator-path (default-accelerator-model-generator-pathname)))
+  (let ((resolved-backend (resolve-accelerator-backend backend)))
+  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
+         (cache-key
+             (model-accelerator-projection-cache-key
+              model resolved-backend tensor-info generator-path))
+           (root
+             (uiop:ensure-directory-pathname
+              (or cache-directory
+                  (funcall
+                   (accelerator-backend-default-cache-directory-function
+                    resolved-backend)))))
+         (projection-directory
+           (merge-pathnames
+            (make-pathname :directory `(:relative ,cache-key))
+            root)))
+    (values (merge-pathnames #P"projection.onnx" projection-directory)
+            root
+              cache-key))))
 
 (defun model-npu-projection-cache-pathnames
     (model tensor-name &optional (cache-directory
@@ -2374,58 +2579,59 @@ is invalidated here, but its handle remains owned by that scope."
                               (generator-path
                                 (default-npu-model-generator-pathname))
      &key (weight-format :bfloat16))
-  (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
-         (cache-key
-           (model-npu-projection-cache-key
-            model tensor-info generator-path
-            :weight-format weight-format))
-         (root (uiop:ensure-directory-pathname cache-directory))
-         (projection-directory
-           (merge-pathnames
-            (make-pathname :directory `(:relative ,cache-key))
-            root)))
-    (values (merge-pathnames #P"projection.onnx" projection-directory)
-            root
-            cache-key)))
+  (model-accelerator-projection-cache-pathnames
+   model
+   (if (eq weight-format :float32) :gpu :npu)
+   tensor-name
+   cache-directory
+   generator-path))
 
-(defun ensure-model-npu-projection
-    (model tensor-name
+(defun ensure-model-accelerator-projection
+    (model backend tensor-name
      &key
-       (cache-directory (default-npu-cache-directory))
+       cache-directory
        (python-command '("python"))
-       (generator-path (default-npu-model-generator-pathname)))
-  (when (gethash tensor-name (gguf-model-npu-projections model))
-    (return-from ensure-model-npu-projection (values model nil t)))
-  (multiple-value-bind (onnx-path provider-cache-directory cache-key)
-      (model-npu-projection-cache-pathnames
-       model tensor-name cache-directory generator-path)
-    (let ((reused-p (not (null (probe-file onnx-path)))))
-      (unless reused-p
-        (export-model-npu-projection
-         model tensor-name onnx-path
-         :python-command python-command
-         :generator-path generator-path))
-      (register-model-npu-projection
-       model tensor-name onnx-path
-       :cache-directory provider-cache-directory
-       :cache-key cache-key)
-      (values model onnx-path reused-p))))
+       (generator-path (default-accelerator-model-generator-pathname)))
+  (let ((resolved-backend (resolve-accelerator-backend backend)))
+    (when (model-accelerator-projection
+           model resolved-backend tensor-name)
+      (return-from ensure-model-accelerator-projection
+        (values model nil t)))
+    (multiple-value-bind (onnx-path provider-cache-directory cache-key)
+        (model-accelerator-projection-cache-pathnames
+         model resolved-backend tensor-name cache-directory generator-path)
+      (let ((reused-p (not (null (probe-file onnx-path)))))
+        (unless reused-p
+          (funcall
+           (accelerator-backend-export-projection-function
+            resolved-backend)
+           model
+           tensor-name
+           onnx-path
+           :python-command python-command
+           :generator-path generator-path))
+        (register-model-accelerator-projection
+         model resolved-backend tensor-name onnx-path
+         :cache-directory provider-cache-directory
+         :cache-key cache-key)
+        (values model onnx-path reused-p)))))
 
-(defun enable-model-npu-projections
-    (model tensor-names
+(defun enable-model-accelerator-projections
+    (model backend tensor-names
      &key
-       (cache-directory (default-npu-cache-directory))
+       cache-directory
        (python-command '("python"))
-       (generator-path (default-npu-model-generator-pathname)))
-  (let ((added-tensor-names '())
+       (generator-path (default-accelerator-model-generator-pathname)))
+  (let ((resolved-backend (resolve-accelerator-backend backend))
+        (added-tensor-names '())
         (completed-p nil))
     (unwind-protect
         (progn
           (dolist (tensor-name tensor-names)
-            (unless (gethash tensor-name
-                             (gguf-model-npu-projections model))
-              (ensure-model-npu-projection
-               model tensor-name
+            (unless (model-accelerator-projection
+                     model resolved-backend tensor-name)
+              (ensure-model-accelerator-projection
+               model resolved-backend tensor-name
                :cache-directory cache-directory
                :python-command python-command
                :generator-path generator-path)
@@ -2434,7 +2640,32 @@ is invalidated here, but its handle remains owned by that scope."
           model)
       (unless completed-p
         (dolist (tensor-name added-tensor-names)
-          (unregister-model-npu-projection model tensor-name))))))
+          (unregister-model-accelerator-projection
+           model resolved-backend tensor-name))))))
+
+(defun ensure-model-npu-projection
+    (model tensor-name
+     &key
+       (cache-directory (default-npu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (ensure-model-accelerator-projection
+   model :npu tensor-name
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
+
+(defun enable-model-npu-projections
+    (model tensor-names
+     &key
+       (cache-directory (default-npu-cache-directory))
+       (python-command '("python"))
+       (generator-path (default-npu-model-generator-pathname)))
+  (enable-model-accelerator-projections
+   model :npu tensor-names
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
 
 (defun ensure-model-gpu-projection
     (model tensor-name
@@ -2442,21 +2673,11 @@ is invalidated here, but its handle remains owned by that scope."
        (cache-directory (default-gpu-cache-directory))
        (python-command '("python"))
        (generator-path (default-npu-model-generator-pathname)))
-  (when (gethash tensor-name (gguf-model-gpu-projections model))
-    (return-from ensure-model-gpu-projection (values model nil t)))
-  (multiple-value-bind (onnx-path provider-cache-directory cache-key)
-      (model-npu-projection-cache-pathnames
-       model tensor-name cache-directory generator-path
-       :weight-format :float32)
-    (declare (ignore provider-cache-directory cache-key))
-    (let ((reused-p (not (null (probe-file onnx-path)))))
-      (unless reused-p
-        (export-model-gpu-projection
-          model tensor-name onnx-path
-          :python-command python-command
-          :generator-path generator-path))
-      (register-model-gpu-projection model tensor-name onnx-path)
-      (values model onnx-path reused-p))))
+  (ensure-model-accelerator-projection
+   model :gpu tensor-name
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
 
 (defun enable-model-gpu-projections
     (model tensor-names
@@ -2464,39 +2685,77 @@ is invalidated here, but its handle remains owned by that scope."
        (cache-directory (default-gpu-cache-directory))
        (python-command '("python"))
        (generator-path (default-npu-model-generator-pathname)))
-  (let ((added-tensor-names '())
-        (completed-p nil))
-    (unwind-protect
-        (progn
-           (dolist (tensor-name tensor-names)
-             (unless (gethash tensor-name
-                              (gguf-model-gpu-projections model))
-               (ensure-model-gpu-projection
-                model tensor-name
-                :cache-directory cache-directory
-                :python-command python-command
-                :generator-path generator-path)
-               (push tensor-name added-tensor-names)))
-           (setf completed-p t)
-           model)
-      (unless completed-p
-        (dolist (tensor-name added-tensor-names)
-           (unregister-model-gpu-projection model tensor-name))))))
+  (enable-model-accelerator-projections
+   model :gpu tensor-names
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
+
+(defun call-with-accelerator-setup-fallback (backend setup-function)
+  (let ((resolved-backend (resolve-accelerator-backend backend)))
+  (handler-case
+      (funcall setup-function)
+    (error (condition)
+        (warn "~a setup failed; continuing with the next available backend: ~a"
+              (accelerator-backend-display-name resolved-backend)
+              condition)
+        nil))))
 
 (defun call-with-npu-setup-fallback (setup-function)
-  (handler-case
-      (funcall setup-function)
-    (error (condition)
-      (warn "NPU setup failed; continuing on the CPU: ~a" condition)
-      nil)))
+  (call-with-accelerator-setup-fallback :npu setup-function))
 
 (defun call-with-gpu-setup-fallback (setup-function)
-  (handler-case
-      (funcall setup-function)
-    (error (condition)
-      (warn "GPU setup failed; continuing without GPU acceleration: ~a"
-            condition)
-      nil)))
+  (call-with-accelerator-setup-fallback :gpu setup-function))
+
+(defun try-enable-model-accelerator-projections
+    (model backend tensor-names
+     &key
+       layer-indices
+       (projection-roles
+         '(:attention-query
+           :attention-key
+           :attention-value
+           :attention-output
+           :ffn-gate
+           :ffn-up
+           :ffn-down))
+       cache-directory
+       (python-command '("python"))
+       (generator-path (default-accelerator-model-generator-pathname)))
+  (let ((resolved-backend (resolve-accelerator-backend backend)))
+    (call-with-accelerator-setup-fallback
+     resolved-backend
+     (lambda ()
+       (let ((resolved-tensor-names
+               (remove-duplicates
+                (append tensor-names
+                        (when layer-indices
+                          (model-accelerator-layer-projection-names
+                           model
+                           layer-indices
+                           :roles projection-roles)))
+                :test #'equal)))
+         (unless resolved-tensor-names
+           (signal-accelerator-backend-error
+            resolved-backend
+            "~a acceleration was requested without any projections."
+            (accelerator-backend-display-name resolved-backend)))
+         (funcall (accelerator-backend-load-function resolved-backend))
+         (unless
+             (funcall
+              (accelerator-backend-available-p-function resolved-backend))
+           (signal-accelerator-backend-error
+            resolved-backend
+            "~a acceleration is unavailable."
+            (accelerator-backend-display-name resolved-backend)))
+         (enable-model-accelerator-projections
+          model
+          resolved-backend
+          resolved-tensor-names
+          :cache-directory cache-directory
+          :python-command python-command
+          :generator-path generator-path)
+         t)))))
 
 (defun try-enable-model-npu-projections
     (model tensor-names
@@ -2513,31 +2772,13 @@ is invalidated here, but its handle remains owned by that scope."
        (cache-directory (default-npu-cache-directory))
        (python-command '("python"))
        (generator-path (default-npu-model-generator-pathname)))
-  (call-with-npu-setup-fallback
-   (lambda ()
-     (let ((resolved-tensor-names
-             (remove-duplicates
-              (append tensor-names
-                      (when layer-indices
-                        (model-npu-layer-projection-names
-                         model
-                         layer-indices
-                         :roles projection-roles)))
-              :test #'equal)))
-       (unless resolved-tensor-names
-         (npu-backend-error
-          "NPU acceleration was requested without any projections."))
-     (unless *npu-library*
-       (load-npu-backend))
-     (unless (npu-backend-available-p)
-       (npu-backend-error "NPU acceleration is unavailable."))
-     (enable-model-npu-projections
-      model
-      resolved-tensor-names
-      :cache-directory cache-directory
-      :python-command python-command
-      :generator-path generator-path)
-       t))))
+  (try-enable-model-accelerator-projections
+   model :npu tensor-names
+   :layer-indices layer-indices
+   :projection-roles projection-roles
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
 
 (defun try-enable-model-gpu-projections
     (model tensor-names
@@ -2554,33 +2795,15 @@ is invalidated here, but its handle remains owned by that scope."
        (cache-directory (default-gpu-cache-directory))
        (python-command '("python"))
        (generator-path (default-npu-model-generator-pathname)))
-  (call-with-gpu-setup-fallback
-   (lambda ()
-     (let ((resolved-tensor-names
-             (remove-duplicates
-              (append tensor-names
-                      (when layer-indices
-                        (model-npu-layer-projection-names
-                         model
-                         layer-indices
-                         :roles projection-roles)))
-              :test #'equal)))
-       (unless resolved-tensor-names
-         (gpu-backend-error
-          "GPU acceleration was requested without any projections."))
-       (unless *gpu-library*
-         (load-gpu-backend))
-       (unless (gpu-backend-available-p)
-         (gpu-backend-error "GPU acceleration is unavailable."))
-       (enable-model-gpu-projections
-        model
-        resolved-tensor-names
-        :cache-directory cache-directory
-        :python-command python-command
-        :generator-path generator-path)
-       t))))
+  (try-enable-model-accelerator-projections
+   model :gpu tensor-names
+   :layer-indices layer-indices
+   :projection-roles projection-roles
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
 
-(defparameter +npu-projection-role-suffixes+
+(defparameter +accelerator-projection-role-suffixes+
   '((:attention-query . "attn_q.weight")
     (:attention-key . "attn_k.weight")
     (:attention-value . "attn_v.weight")
@@ -2589,7 +2812,7 @@ is invalidated here, but its handle remains owned by that scope."
     (:ffn-up . "ffn_up.weight")
     (:ffn-down . "ffn_down.weight")))
 
-(defun model-npu-layer-projection-names
+(defun model-accelerator-layer-projection-names
     (model layer-indices
      &key
        (roles '(:attention-query
@@ -2608,9 +2831,10 @@ is invalidated here, but its handle remains owned by that scope."
                layer-index
                (gguf-model-layer-count model)))
       (dolist (role roles)
-        (let ((suffix (cdr (assoc role +npu-projection-role-suffixes+))))
+        (let ((suffix
+                (cdr (assoc role +accelerator-projection-role-suffixes+))))
           (unless suffix
-            (error "Unknown NPU projection role ~s." role))
+            (error "Unknown accelerator projection role ~s." role))
           (let ((tensor-name (format nil "blk.~d.~a" layer-index suffix)))
             (unless (gguf-model-tensor-info model tensor-name)
               (error "Model architecture ~a has no ~s projection in layer ~d."
@@ -2619,6 +2843,13 @@ is invalidated here, but its handle remains owned by that scope."
                      layer-index))
             (push tensor-name names)))))
     (nreverse names)))
+
+(defun model-npu-layer-projection-names
+    (model layer-indices &key roles)
+  (if roles
+      (model-accelerator-layer-projection-names
+       model layer-indices :roles roles)
+      (model-accelerator-layer-projection-names model layer-indices)))
 
 (defun enable-model-npu-layer-projections
     (model layer-indices
@@ -2633,17 +2864,42 @@ is invalidated here, but its handle remains owned by that scope."
        (cache-directory (default-npu-cache-directory))
        (python-command '("python"))
        (generator-path (default-npu-model-generator-pathname)))
-  (enable-model-npu-projections
+(enable-model-accelerator-layer-projections
    model
-   (model-npu-layer-projection-names model layer-indices :roles roles)
+   :npu
+   layer-indices
+   :roles roles
+   :cache-directory cache-directory
+   :python-command python-command
+   :generator-path generator-path))
+
+(defun enable-model-accelerator-layer-projections
+    (model backend layer-indices
+     &key
+       (roles '(:attention-query
+                :attention-key
+                :attention-value
+                :attention-output
+                :ffn-gate
+                :ffn-up
+                :ffn-down))
+       cache-directory
+       (python-command '("python"))
+       (generator-path (default-accelerator-model-generator-pathname)))
+  (enable-model-accelerator-projections
+   model
+   backend
+   (model-accelerator-layer-projection-names
+    model layer-indices :roles roles)
    :cache-directory cache-directory
    :python-command python-command
    :generator-path generator-path))
 
 (defun model-gpu-layer-projection-names (model layer-indices &key roles)
   (if roles
-      (model-npu-layer-projection-names model layer-indices :roles roles)
-      (model-npu-layer-projection-names model layer-indices)))
+      (model-accelerator-layer-projection-names
+       model layer-indices :roles roles)
+      (model-accelerator-layer-projection-names model layer-indices)))
 
 (defun enable-model-gpu-layer-projections
     (model layer-indices
@@ -2658,9 +2914,11 @@ is invalidated here, but its handle remains owned by that scope."
        (cache-directory (default-gpu-cache-directory))
        (python-command '("python"))
        (generator-path (default-npu-model-generator-pathname)))
-  (enable-model-gpu-projections
+  (enable-model-accelerator-layer-projections
    model
-   (model-gpu-layer-projection-names model layer-indices :roles roles)
+   :gpu
+   layer-indices
+   :roles roles
    :cache-directory cache-directory
    :python-command python-command
    :generator-path generator-path))
@@ -3924,66 +4182,86 @@ It extracts the underlying simple arrays once before entering the loop to elimin
         (setf (aref dest row-index)
               (dot-product-with-tensor-row mapping tensor-info (+ start-row row-index) vector)))))))
 
+(defun call-with-accelerator-runtime-fallback
+    (backend accelerator-function fallback-function disable-function
+     tensor-name)
+  (let ((resolved-backend (resolve-accelerator-backend backend)))
+    (handler-case
+        (funcall accelerator-function)
+      (error (condition)
+        (if (accelerator-backend-error-p resolved-backend condition)
+            (progn
+              (funcall disable-function)
+              (warn
+               "~a projection ~s failed and was disabled; using the next available backend: ~a"
+               (accelerator-backend-display-name resolved-backend)
+               tensor-name
+               condition)
+              (funcall fallback-function))
+            (error condition))))))
+
 (defun call-with-npu-runtime-fallback
     (npu-function cpu-function disable-function tensor-name)
-  (handler-case
-      (funcall npu-function)
-    (npu-backend-error (condition)
-      (funcall disable-function)
-      (warn "NPU projection ~s failed and was disabled; recomputing on the CPU: ~a"
-            tensor-name
-            condition)
-      (funcall cpu-function))))
+  (call-with-accelerator-runtime-fallback
+   :npu npu-function cpu-function disable-function tensor-name))
 
 (defun call-with-gpu-runtime-fallback
     (gpu-function cpu-function disable-function tensor-name)
-  (handler-case
-      (funcall gpu-function)
-    (gpu-backend-error (condition)
-      (funcall disable-function)
-      (warn "GPU projection ~s failed and was disabled; using the next available backend: ~a"
-            tensor-name
-            condition)
-      (funcall cpu-function))))
+  (call-with-accelerator-runtime-fallback
+   :gpu gpu-function cpu-function disable-function tensor-name))
 
 (defun gguf-model-matrix-vector-multiply-into (dest model tensor-name vector)
   (declare (optimize (speed 3) (safety 0))
           (type (simple-array single-float (*)) dest vector))
-  (flet ((run-on-cpu ()
-           (let* ((tensor-info
-                    (gguf-model-tensor-info model tensor-name t))
-                  (row-count (tensor-row-count tensor-info)))
-             (%gguf-model-matrix-vector-multiply-into
-              dest
-              (gguf-model-mapping model)
-              tensor-info
-              vector
-              0
-              row-count))))
-    (labels ((run-on-npu-or-cpu ()
-               (let ((npu-session
-                       (gethash tensor-name
-                                (gguf-model-npu-projections model))))
-                 (if npu-session
-                     (call-with-npu-runtime-fallback
-                      (lambda ()
-                        (run-npu-session-into dest npu-session vector))
-                      #'run-on-cpu
-                      (lambda ()
-                        (unregister-model-npu-projection model tensor-name))
-                      tensor-name)
-                     (run-on-cpu)))))
-      (let ((gpu-session
-              (gethash tensor-name (gguf-model-gpu-projections model))))
-        (if gpu-session
-            (call-with-gpu-runtime-fallback
-             (lambda ()
-               (run-gpu-session-into dest gpu-session vector))
-             #'run-on-npu-or-cpu
-             (lambda ()
-               (unregister-model-gpu-projection model tensor-name))
-             tensor-name)
-            (run-on-npu-or-cpu))))))
+  (let ((projections
+          (gethash tensor-name
+                  (gguf-model-accelerator-projections model))))
+    (if (null projections)
+        (let* ((tensor-info
+                (gguf-model-tensor-info model tensor-name t))
+              (row-count (tensor-row-count tensor-info)))
+          (%gguf-model-matrix-vector-multiply-into
+          dest
+          (gguf-model-mapping model)
+          tensor-info
+          vector
+          0
+          row-count))
+        (flet ((run-on-cpu ()
+                (let* ((tensor-info
+                         (gguf-model-tensor-info model tensor-name t))
+                       (row-count (tensor-row-count tensor-info)))
+                  (%gguf-model-matrix-vector-multiply-into
+                   dest
+                   (gguf-model-mapping model)
+                   tensor-info
+                   vector
+                   0
+                   row-count))))
+          (labels ((run-projection-or-cpu (index)
+                    (if (< index (length projections))
+                        (let* ((projection (aref projections index))
+                               (backend
+                                 (accelerator-projection-backend projection))
+                               (session
+                                 (accelerator-projection-session projection)))
+                          (call-with-accelerator-runtime-fallback
+                           backend
+                            (lambda ()
+                             (funcall
+                              (accelerator-backend-run-session-function
+                               backend)
+                              dest
+                              session
+                              vector))
+                           (lambda ()
+                             (run-projection-or-cpu (1+ index)))
+                           (lambda ()
+                             (unregister-model-accelerator-projection
+                              model backend tensor-name))
+                           tensor-name))
+                        (run-on-cpu))))
+           (run-projection-or-cpu 0))))))
 
 (defun gguf-model-matrix-vector-multiply (model tensor-name vector)
   (let* ((tensor-info (gguf-model-tensor-info model tensor-name t))
@@ -4143,8 +4421,8 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                       (results (list cpu-result)))
                  (when use-npu
                    (let ((session
-                           (gethash tensor-name
-                                    (gguf-model-npu-projections model))))
+                           (model-accelerator-session
+                            model :npu tensor-name)))
                      (push
                       (if session
                           (handler-case
@@ -4165,8 +4443,8 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                       results)))
                  (when use-gpu
                    (let ((session
-                           (gethash tensor-name
-                                    (gguf-model-gpu-projections model))))
+                           (model-accelerator-session
+                            model :gpu tensor-name)))
                      (push
                       (if session
                           (handler-case

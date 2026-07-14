@@ -92,10 +92,33 @@ float32 graphs for DirectML.
 ```
 
 If DirectML, a compatible GPU, graph conversion, or session setup is
-unavailable, llambda warns and continues on the CPU. A runtime GPU failure
-disables only that tensor's GPU session and tries an enabled NPU session before
-recomputing on the CPU. When both accelerators are enabled for a tensor, llambda
-tries the GPU first, then the NPU, and finally the CPU.
+unavailable, llambda warns and continues with the next enabled backend. A
+runtime GPU failure disables only that tensor's GPU session and tries an
+enabled NPU session before recomputing on the CPU. When both accelerators are
+enabled for a tensor, llambda tries the GPU first, then the NPU, and finally the
+CPU.
+
+### Accelerator backend protocol
+
+Accelerator behavior is defined by immutable `accelerator-backend` descriptors.
+Each descriptor supplies loading and capability probes, runtime and bridge
+versions, session creation/execution/cleanup, condition translation, cache and
+weight formats, projection export, and SHA-256 operations. DirectML and VitisAI
+are registered by the separate `accelerators/directml.lisp` and
+`accelerators/vitisai.lisp` adapters.
+
+Model projections share one tensor-indexed store. Each tensor contains its
+enabled backend bindings in descriptor priority order, so inference performs
+one lookup and then tries GPU, NPU, and CPU without registry lookup or
+allocation. Initialization has a separate descriptor order: VitisAI loads
+before DirectML because both providers currently share one native bridge DLL,
+while execution still prefers the GPU.
+
+`register-model-accelerator-projection`,
+`ensure-model-accelerator-projection`,
+`enable-model-accelerator-projections`, and
+`clear-model-accelerator-projections` provide the provider-neutral API.
+Existing GPU- and NPU-named functions remain compatibility wrappers.
 
 ### Optional AMD Ryzen AI NPU backend
 

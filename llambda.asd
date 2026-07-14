@@ -6,8 +6,13 @@
   :depends-on (#:cffi #:sb-simd #:lparallel)
   :in-order-to ((test-op (test-op "llambda/tests")))
   :components ((:file "package")
+               (:file "accelerator")
                (:file "architecture")
                (:file "llambda")
+               (:module "accelerators"
+                :serial t
+                :components ((:file "directml")
+                             (:file "vitisai")))
                (:module "architectures"
                 :serial t
                 :components ((:file "qwen3next")

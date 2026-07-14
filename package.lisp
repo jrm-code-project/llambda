@@ -17,6 +17,12 @@
            #:aligned-tensor-view-length
            #:aligned-tensor-view-p
            #:aligned-tensor-view-ref
+           #:accelerator-backend
+           #:accelerator-backend-display-name
+           #:accelerator-backend-initialization-priority
+           #:accelerator-backend-name
+           #:accelerator-backend-p
+           #:accelerator-backend-priority
            #:architecture-descriptor-for-kv-pairs
            #:architecture-descriptor-name
            #:architecture-descriptor-p
@@ -43,12 +49,16 @@
            #:decode-next-token
            #:default-gpu-cache-directory
            #:default-npu-cache-directory
+           #:default-accelerator-model-generator-pathname
            #:enable-model-gpu-projections
            #:enable-model-gpu-layer-projections
            #:enable-model-npu-projections
            #:enable-model-npu-layer-projections
+           #:enable-model-accelerator-projections
+           #:enable-model-accelerator-layer-projections
            #:ensure-model-gpu-projection
            #:ensure-model-npu-projection
+           #:ensure-model-accelerator-projection
            #:evaluate-prompt
            #:export-model-gpu-projection
            #:export-model-npu-projection
@@ -57,6 +67,7 @@
            #:generate-token-loop
            #:hello-message
            #:find-gguf-tensor-info
+           #:find-accelerator-backend
            #:find-architecture-descriptor
            #:load-gemma4-model
            #:load-architecture-model
@@ -67,22 +78,28 @@
            #:load-gguf-tensor
            #:load-gguf-tensor-by-name
            #:make-gemma4-step-function
+           #:make-accelerator-backend
            #:make-architecture-step-function
            #:make-llama-step-function
            #:make-qwen2-step-function
            #:model-gpu-layer-projection-names
            #:model-npu-layer-projection-names
+           #:model-accelerator-layer-projection-names
            #:gpu-backend-available-p
            #:gpu-backend-runtime-version
            #:npu-backend-available-p
            #:npu-backend-runtime-version
            #:register-model-gpu-projection
            #:register-model-npu-projection
+           #:register-accelerator-backend
+           #:register-model-accelerator-projection
            #:register-architecture
            #:clear-model-gpu-projections
            #:clear-model-npu-projections
+           #:clear-model-accelerator-projections
            #:unregister-model-gpu-projection
            #:unregister-model-npu-projection
+           #:unregister-model-accelerator-projection
            #:map-view-of-file
            #:main
            #:print-gguf-file
@@ -98,6 +115,7 @@
            #:sample-token-id-from-logits
            #:silu
            #:softmax
+           #:ordered-accelerator-backends
            #:supported-architecture-names
            #:test-gemma4-e2b-it-response
            #:test-gguf-file-response

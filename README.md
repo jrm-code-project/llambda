@@ -120,6 +120,32 @@ while execution still prefers the GPU.
 `clear-model-accelerator-projections` provide the provider-neutral API.
 Existing GPU- and NPU-named functions remain compatibility wrappers.
 
+### Reentrant inference contexts
+
+Low-level inference can use an explicit `inference-context` to keep request
+state separate while sharing one loaded model and step function. A context
+owns its KV/recurrent state, compute scratch, sampling workspaces, position,
+context limit, and logits policy. `reset-inference-context` clears request
+state while retaining reusable allocations; `close-inference-context`
+invalidates it.
+
+```lisp
+(let ((context (llambda:make-inference-context model)))
+  (unwind-protect
+      (let ((logits
+              (llambda:evaluate-prompt token-ids step-function context)))
+        (llambda:generate-token-loop
+          kv-pairs logits step-function context
+          :start-position (length token-ids)))
+    (llambda:close-inference-context context)))
+```
+
+One context cannot be used concurrently. Separate contexts can safely execute
+against the same model and step function; model tensor caches and accelerator
+sessions remain shared. The high-level GGUF generation API creates and closes
+one context per request automatically. Legacy hash-table state remains
+supported for compatibility.
+
 ### Optional AMD Ryzen AI NPU backend
 
 The experimental backend currently targets Ryzen AI Software 1.7.1 and its

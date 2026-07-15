@@ -17,6 +17,7 @@
                           #:accelerator-backend-priority
                           #:accelerator-backend-initialization-priority
                           #:call-with-aligned-tensor-mapping
+                          #:call-with-inference-context
                           #:call-with-file
                           #:call-with-mapped-file
                           #:apply-repetition-penalty
@@ -28,6 +29,7 @@
                           #:benchmark-gguf-projection-backends
                           #:close-aligned-tensor-mapping
                           #:close-gemv-runtime
+                          #:close-inference-context
                           #:close-handle
                           #:close-model
                           #:create-file
@@ -66,10 +68,16 @@
                           #:make-gemma4-step-function
                           #:make-accelerator-backend
                           #:make-architecture-step-function
+                          #:make-inference-context
                           #:make-llama-step-function
                           #:make-qwen2-step-function
                           #:model-gpu-layer-projection-names
                           #:model-npu-layer-projection-names
+                          #:inference-context-closed-p
+                          #:inference-context-context-limit
+                          #:inference-context-model
+                          #:inference-context-p
+                          #:inference-context-position
                           #:gpu-backend-available-p
                           #:gpu-backend-runtime-version
                           #:npu-backend-available-p
@@ -94,6 +102,7 @@
                           #:read-gguf-header
                           #:read-gguf-kv-pairs
                           #:read-gguf-tensor-infos
+                          #:reset-inference-context
                           #:rms-norm
                           #:sample-from-probabilities
                           #:sample-token-id-from-logits
@@ -107,6 +116,7 @@
                           #:unmap-view-of-file
                           #:vector-matrix-multiply
                           #:with-aligned-tensor-mapping
+                          #:with-inference-context
                           #:with-file-handle
                           #:with-mapped-file)
   (:export #:run-tests))
@@ -186,6 +196,7 @@
   (is (fboundp 'architecture-descriptor-p))
   (is (fboundp 'architecture-descriptor-tokenizer-policy))
   (is (fboundp 'call-with-aligned-tensor-mapping))
+  (is (fboundp 'call-with-inference-context))
   (is (fboundp 'call-with-file))
   (is (fboundp 'call-with-mapped-file))
   (is (fboundp 'apply-repetition-penalty))
@@ -197,6 +208,7 @@
   (is (fboundp 'benchmark-gguf-projection-backends))
   (is (fboundp 'close-aligned-tensor-mapping))
   (is (fboundp 'close-gemv-runtime))
+  (is (fboundp 'close-inference-context))
   (is (fboundp 'create-file))
   (is (fboundp 'close-handle))
   (is (fboundp 'close-model))
@@ -235,10 +247,16 @@
   (is (fboundp 'make-gemma4-step-function))
   (is (fboundp 'make-accelerator-backend))
   (is (fboundp 'make-architecture-step-function))
+  (is (fboundp 'make-inference-context))
   (is (fboundp 'make-llama-step-function))
   (is (fboundp 'make-qwen2-step-function))
   (is (fboundp 'model-gpu-layer-projection-names))
   (is (fboundp 'model-npu-layer-projection-names))
+  (is (fboundp 'inference-context-closed-p))
+  (is (fboundp 'inference-context-context-limit))
+  (is (fboundp 'inference-context-model))
+  (is (fboundp 'inference-context-p))
+  (is (fboundp 'inference-context-position))
   (is (fboundp 'gpu-backend-available-p))
   (is (fboundp 'gpu-backend-runtime-version))
   (is (fboundp 'npu-backend-available-p))
@@ -259,6 +277,7 @@
   (is (fboundp 'read-gguf-header))
   (is (fboundp 'read-gguf-kv-pairs))
   (is (fboundp 'read-gguf-tensor-infos))
+  (is (fboundp 'reset-inference-context))
   (is (fboundp 'rms-norm))
   (is (fboundp 'sample-from-probabilities))
   (is (fboundp 'sample-token-id-from-logits))
@@ -273,6 +292,7 @@
   (is (fboundp 'vector-matrix-multiply))
   (is (macro-function 'with-aligned-tensor-mapping))
   (is (macro-function 'with-file-handle))
+  (is (macro-function 'with-inference-context))
   (is (macro-function 'with-mapped-file)))
 
 (test forward-primitives
@@ -654,8 +674,33 @@
                     (is (null reused-p)))
                   (is (llambda::model-accelerator-projection
                        model :fake-gpu "test.weight"))
-                  (unregister-model-accelerator-projection
-                   model :fake-gpu "test.weight")
+                  (let ((left (make-inference-context model))
+                        (right (make-inference-context model))
+                        (closed-before
+                          (count :fake-gpu closed-sessions)))
+                    (unwind-protect
+                        (progn
+                          (call-with-inference-context
+                           left
+                           (lambda (left-context)
+                             (declare (ignore left-context))
+                             (call-with-inference-context
+                              right
+                              (lambda (right-context)
+                                (declare (ignore right-context))
+                                (is (= 2
+                                       (llambda::gguf-model-active-inference-count
+                                        model)))
+                                (unregister-model-accelerator-projection
+                                 model :fake-gpu "test.weight")
+                                (is (= closed-before
+                                       (count :fake-gpu closed-sessions)))))
+                             (is (= closed-before
+                                    (count :fake-gpu closed-sessions)))))
+                          (is (= (1+ closed-before)
+                                 (count :fake-gpu closed-sessions))))
+                      (close-inference-context left)
+                      (close-inference-context right)))
                   (setf available-p nil)
                   (handler-bind ((warning #'muffle-warning))
                     (is (null
@@ -668,6 +713,380 @@
                   (close-model model))))
           (remhash :fake-gpu llambda::*accelerator-backends*)
           (remhash :fake-npu llambda::*accelerator-backends*))))))
+
+(test accelerator-session-runs-are-serialized
+  (let ((active-run-count 0)
+        (maximum-active-run-count 0)
+        (run-count 0)
+        (close-count 0))
+    (let ((backend
+            (make-fake-accelerator-backend
+             :serialized
+             1
+             (lambda (dest session input)
+               (declare (ignore session input))
+               (incf active-run-count)
+               (setf maximum-active-run-count
+                     (max maximum-active-run-count active-run-count))
+               (unwind-protect
+                   (progn
+                     (sleep 0.02)
+                     (incf run-count)
+                     (setf (aref dest 0) 7.0f0)
+                     dest)
+                 (decf active-run-count)))
+             (lambda (session)
+               (declare (ignore session))
+               (incf close-count)))))
+      (cffi:with-foreign-object (mapping :float)
+        (setf (cffi:mem-ref mapping :float) 3.0f0)
+        (let* ((tensor-info
+                 '(:name "test.weight"
+                   :dimensions (1 1)
+                   :element-count 1
+                   :type-tag 0
+                   :data-offset 0
+                   :byte-size 4))
+               (tensor-info-table (make-hash-table :test #'equal))
+               (model
+                 (llambda::make-gguf-model
+                  :mapping mapping
+                  :tensor-infos (list tensor-info)
+                  :tensor-info-table tensor-info-table))
+               (ready (sb-thread:make-semaphore :count 0))
+               (start (sb-thread:make-semaphore :count 0))
+               (results (make-array 2 :initial-element nil)))
+          (setf (gethash "test.weight" tensor-info-table) tensor-info)
+          (unwind-protect
+              (progn
+                (register-model-accelerator-projection
+                 model backend "test.weight" #P"serialized.onnx")
+                (let ((threads
+                        (loop
+                          for index below 2
+                          collect
+                          (let ((result-index index))
+                            (sb-thread:make-thread
+                             (lambda ()
+                               (sb-thread:signal-semaphore ready)
+                               (sb-thread:wait-on-semaphore start)
+                               (handler-case
+                                   (let ((output
+                                           (make-array
+                                            1
+                                            :element-type 'single-float
+                                            :initial-element 0.0f0)))
+                                     (setf
+                                      (aref results result-index)
+                                      (llambda::gguf-model-matrix-vector-multiply-into
+                                       output
+                                       model
+                                       "test.weight"
+                                       #(2.0f0))))
+                                 (condition (condition)
+                                   (setf (aref results result-index)
+                                         condition))))
+                             :name
+                             (format nil
+                                     "llambda accelerator run ~d"
+                                     result-index))))))
+                  (loop repeat 2 do
+                    (sb-thread:wait-on-semaphore ready))
+                  (sb-thread:signal-semaphore start 2)
+                  (dolist (thread threads)
+                    (sb-thread:join-thread thread)))
+                (is (equalp #(7.0f0) (aref results 0)))
+                (is (equalp #(7.0f0) (aref results 1)))
+                (is (= 2 run-count))
+                (is (= 1 maximum-active-run-count)))
+            (close-model model)))
+        (is (= 1 close-count))))))
+
+(test concurrent-tensor-cache-publication
+  (let* ((element-count 100000)
+         (mapping
+           (cffi:foreign-alloc :float :count element-count))
+         (tensor-info
+           `(:name "test.weight"
+             :dimensions (,element-count)
+             :element-count ,element-count
+             :type-tag 0
+             :data-offset 0
+             :byte-size ,(* element-count 4)))
+         (tensor-info-table (make-hash-table :test #'equal))
+         (model
+           (llambda::make-gguf-model
+            :mapping mapping
+            :tensor-infos (list tensor-info)
+            :tensor-info-table tensor-info-table))
+         (initial-cache (llambda::gguf-model-tensor-cache model))
+         (ready (sb-thread:make-semaphore :count 0))
+         (start (sb-thread:make-semaphore :count 0))
+         (results (make-array 2 :initial-element nil)))
+    (setf (gethash "test.weight" tensor-info-table) tensor-info)
+    (unwind-protect
+        (let ((threads
+                (loop
+                  for index below 2
+                  collect
+                  (let ((result-index index))
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (sb-thread:signal-semaphore ready)
+                       (sb-thread:wait-on-semaphore start)
+                       (handler-case
+                           (setf (aref results result-index)
+                                 (llambda::gguf-model-load-tensor
+                                  model "test.weight"))
+                         (condition (condition)
+                           (setf (aref results result-index) condition))))
+                     :name
+                     (format nil "llambda tensor cache ~d" result-index))))))
+          (loop repeat 2 do
+            (sb-thread:wait-on-semaphore ready))
+          (sb-thread:signal-semaphore start 2)
+          (dolist (thread threads)
+            (sb-thread:join-thread thread))
+          (is (arrayp (aref results 0)))
+          (is (eq (aref results 0) (aref results 1)))
+          (is (zerop (hash-table-count initial-cache)))
+          (is (not (eq initial-cache
+                       (llambda::gguf-model-tensor-cache model))))
+          (is (eq (aref results 0)
+                  (gethash
+                   "test.weight"
+                   (llambda::gguf-model-tensor-cache model)))))
+      (close-model model)
+      (cffi:foreign-free mapping))))
+
+(test inference-context-lifecycle-and-reentrancy
+  (let* ((closed-sessions '())
+         (backend
+           (make-fake-accelerator-backend
+            :failing-close
+            1
+            (lambda (&rest arguments)
+              (declare (ignore arguments)))
+            (lambda (session)
+              (push session closed-sessions)
+              (error "simulated close failure"))))
+         (model (llambda::make-gguf-model))
+         (context (make-inference-context model)))
+    (unwind-protect
+        (progn
+          (setf
+           (llambda::gguf-model-retired-accelerator-projections model)
+           (list
+            (llambda::make-accelerator-projection
+             :backend backend :session :first)
+            (llambda::make-accelerator-projection
+             :backend backend :session :second)))
+          (signals error
+            (call-with-inference-context context #'identity))
+          (is (= 2 (length closed-sessions)))
+          (is (not (llambda::inference-context-in-use-p context)))
+          (is (eq context
+                  (call-with-inference-context context #'identity))))
+      (close-inference-context context)
+      (close-model model)))
+  (let* ((model (llambda::make-gguf-model))
+         (legacy-state (make-hash-table))
+         (protected-step
+           (llambda::protect-model-step-function
+            model
+            (lambda (token-id position context)
+              (declare (ignore position context))
+              (make-array
+               1
+               :element-type 'single-float
+               :initial-element (coerce token-id 'single-float)))))
+         (legacy-context nil)
+         (contexts nil))
+    (setf (gethash :caller-owned legacy-state) :preserved)
+    (unwind-protect
+        (progn
+          (is (equalp
+               #(7.0f0)
+               (evaluate-prompt '(7) protected-step legacy-state)))
+          (setf contexts
+                (gethash
+                 llambda::+legacy-inference-contexts-key+
+                 legacy-state)
+                legacy-context (gethash model contexts))
+          (is (inference-context-p legacy-context))
+          (close-model model)
+          (is (inference-context-closed-p legacy-context))
+          (is (null (gethash model contexts)))
+          (is (eq :preserved
+                  (gethash :caller-owned legacy-state))))
+      (close-model model)))
+  (let* ((model
+           (llambda::make-gguf-model
+            :architecture "test"
+            :kv-pairs '(("test.context_length" . 4))))
+         (other-model
+           (llambda::make-gguf-model
+            :architecture "other"
+            :kv-pairs '(("other.context_length" . 4))))
+         (left (make-inference-context model))
+         (right (make-inference-context model))
+         (seen-logits-policies '()))
+    (unwind-protect
+        (progn
+          (is (inference-context-p left))
+          (is (eq model (inference-context-model left)))
+          (is (= 4 (inference-context-context-limit left)))
+          (is (zerop (inference-context-position left)))
+          (call-with-inference-context
+           left
+           (lambda (context)
+             (is (eq left context))
+             (signals error
+               (call-with-inference-context left #'identity))
+             (signals error
+               (close-model model))))
+          (let ((last-logits
+                  (evaluate-prompt
+                   '(10 11)
+                   (lambda (token-id position context)
+                     (push
+                      (llambda::inference-context-compute-logits-p
+                       context)
+                      seen-logits-policies)
+                     (setf
+                      (gethash position
+                               (llambda::inference-context-state-table
+                                context))
+                      token-id)
+                     (make-array
+                      2
+                      :element-type 'single-float
+                      :initial-element (coerce token-id 'single-float)))
+                   left)))
+            (is (equalp #(11.0f0 11.0f0) last-logits)))
+          (is (equal '(nil t) (nreverse seen-logits-policies)))
+          (is (= 2 (inference-context-position left)))
+          (signals error
+            (llambda::validate-inference-context-position left 4))
+          (llambda::ensure-inference-context-sampling-workspaces left 8)
+          (let ((workspace
+                  (llambda::inference-context-top-k-workspace left)))
+            (is (eq left (reset-inference-context left)))
+            (is (eq workspace
+                    (llambda::inference-context-top-k-workspace left))))
+          (is (zerop (inference-context-position left)))
+          (is (zerop
+               (hash-table-count
+                (llambda::inference-context-state-table left))))
+          (is (not
+               (eq
+                (llambda::inference-context-compute-buffer-for-step left)
+                (llambda::inference-context-compute-buffer-for-step
+                 right))))
+          (signals error
+            (llambda::resolve-step-inference-context other-model left))
+          (let ((active-counts '())
+                (legacy-state (make-hash-table)))
+            (let ((protected-step
+                    (llambda::protect-model-step-function
+                     model
+                     (lambda (token-id position context)
+                       (declare (ignore position context))
+                       (push
+                        (llambda::gguf-model-active-inference-count model)
+                        active-counts)
+                       (signals error
+                         (close-model model))
+                       (make-array
+                        1
+                        :element-type 'single-float
+                        :initial-element
+                        (coerce token-id 'single-float))))))
+              (is (equalp
+                   #(32.0f0)
+                   (evaluate-prompt
+                    '(31 32) protected-step legacy-state))))
+            (is (equal '(1 1) (nreverse active-counts)))
+            (is (zerop
+                 (llambda::gguf-model-active-inference-count model)))
+            (maphash
+             (lambda (key contexts)
+               (declare (ignore key))
+               (when (hash-table-p contexts)
+                 (maphash
+                  (lambda (legacy-model legacy-context)
+                    (declare (ignore legacy-model))
+                    (close-inference-context legacy-context))
+                  contexts)))
+             legacy-state))
+          (let* ((legacy-state (make-hash-table))
+                 (legacy-left
+                   (llambda::resolve-step-inference-context
+                    model legacy-state))
+                 (legacy-left-again
+                   (llambda::resolve-step-inference-context
+                    model legacy-state))
+                 (legacy-other
+                   (llambda::resolve-step-inference-context
+                    other-model legacy-state)))
+            (is (eq legacy-left legacy-left-again))
+            (is (not (eq legacy-left legacy-other)))
+            (close-inference-context legacy-left)
+            (close-inference-context legacy-other))
+          (let ((results (make-array 2 :initial-element nil))
+                (threads nil))
+            (flet ((execute-request (index context token-id)
+                     (handler-case
+                         (setf
+                          (aref results index)
+                          (evaluate-prompt
+                           (list token-id)
+                           (lambda (current-token position current-context)
+                             (declare (ignore position))
+                             (setf
+                              (gethash
+                               :token
+                               (llambda::inference-context-state-table
+                                current-context))
+                              current-token)
+                             (sleep 0.02)
+                             (make-array
+                              1
+                              :element-type 'single-float
+                              :initial-element
+                              (coerce current-token 'single-float)))
+                           context))
+                       (condition (condition)
+                         (setf (aref results index) condition)))))
+              (setf threads
+                    (list
+                     (sb-thread:make-thread
+                      (lambda () (execute-request 0 left 21))
+                      :name "llambda context left")
+                     (sb-thread:make-thread
+                      (lambda () (execute-request 1 right 22))
+                      :name "llambda context right")))
+              (dolist (thread threads)
+                (sb-thread:join-thread thread)))
+            (is (equalp #(21.0f0) (aref results 0)))
+            (is (equalp #(22.0f0) (aref results 1)))
+            (is (= 21
+                   (gethash
+                    :token
+                    (llambda::inference-context-state-table left))))
+            (is (= 22
+                   (gethash
+                    :token
+                    (llambda::inference-context-state-table right))))
+            (is (zerop
+                 (llambda::gguf-model-active-inference-count model)))))
+      (close-inference-context left)
+      (close-inference-context right)
+      (close-model model)
+      (close-model other-model))
+    (is (inference-context-closed-p left))
+    (signals error
+      (reset-inference-context left))))
 
 (test native-runtime-close-lifecycle
   (let* ((tensor-cache (make-hash-table :test #'equal))

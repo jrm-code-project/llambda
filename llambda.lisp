@@ -36,12 +36,38 @@
 (defparameter *gemv-worker-count* 24)
 (defparameter *gemv-min-parallel-rows* 96)
 (defparameter *gemv-kernel* nil)
+(defparameter *gemv-kernel-mutex*
+  (sb-thread:make-mutex :name "llambda GEMV runtime"))
 (defparameter *gpt2-unicode-byte-table* nil)
 (defparameter *gpt2-byte-unicode-table* nil)
 (defparameter *npu-library* nil)
 (defparameter *gpu-library* nil)
 (defparameter *npu-runtime-library* nil)
 (defparameter *mapped-regions* nil)
+
+(defstruct (inference-context
+            (:constructor %make-inference-context
+                (&key model architecture state-table context-limit
+                      legacy-p)))
+  model
+  architecture
+  (state-table (make-hash-table) :type hash-table)
+  context-limit
+  (position 0 :type fixnum)
+  (compute-logits-p t)
+  compute-buffer
+  top-k-workspace
+  top-p-logit-workspace
+  top-p-index-workspace
+  (legacy-p nil)
+  (closed-p nil)
+  (in-use-p nil)
+  (use-mutex (sb-thread:make-mutex :name "llambda inference context")))
+
+(defparameter +legacy-inference-contexts-key+
+  (gensym "LLAMBDA-INFERENCE-CONTEXTS-"))
+(defparameter *legacy-inference-contexts-mutex*
+  (sb-thread:make-mutex :name "llambda legacy inference contexts"))
 
 (cffi:defcfun ("SetDllDirectoryW" %set-dll-directory) :boolean
   (pathname :pointer))
@@ -751,22 +777,30 @@
                (let ((lparallel:*kernel* *gemv-kernel*))
                  (= (the fixnum (lparallel:kernel-worker-count))
                     (the fixnum *gemv-worker-count*))))
-    (when *gemv-kernel*
-      (let ((lparallel:*kernel* *gemv-kernel*))
-        (lparallel:end-kernel :wait t)))
-    (setf *gemv-kernel*
-          (lparallel:make-kernel *gemv-worker-count* :name "llambda-gemv")))
+    (sb-thread:with-mutex (*gemv-kernel-mutex*)
+      (unless (and *gemv-kernel*
+                   (let ((lparallel:*kernel* *gemv-kernel*))
+                     (= (the fixnum (lparallel:kernel-worker-count))
+                        (the fixnum *gemv-worker-count*))))
+        (when *gemv-kernel*
+          (let ((lparallel:*kernel* *gemv-kernel*))
+            (lparallel:end-kernel :wait t)))
+        (setf *gemv-kernel*
+              (lparallel:make-kernel
+               *gemv-worker-count*
+               :name "llambda-gemv")))))
   *gemv-kernel*)
 
 (defun close-gemv-runtime ()
   "Stop and release the process-global GEMV worker kernel, if one exists.
 
 The caller must ensure that no inference request is using the kernel."
-  (when *gemv-kernel*
-    (let ((kernel *gemv-kernel*))
-      (let ((lparallel:*kernel* kernel))
-        (lparallel:end-kernel :wait t))
-      (setf *gemv-kernel* nil)))
+  (sb-thread:with-mutex (*gemv-kernel-mutex*)
+    (when *gemv-kernel*
+      (let ((kernel *gemv-kernel*))
+        (let ((lparallel:*kernel* kernel))
+          (lparallel:end-kernel :wait t))
+        (setf *gemv-kernel* nil))))
   nil)
 
 (defun parallel-gemv-row-count-p (row-count)
@@ -1282,19 +1316,39 @@ The caller must ensure that no inference request is using the kernel."
      :random-value random-value
      :random-state random-state)))
 
-(defun evaluate-prompt (token-ids step-function kv-cache)
+(defun %evaluate-prompt (token-ids step-function state)
   (unless token-ids
     (error "EVALUATE-PROMPT requires at least one token id."))
-  (let ((last-logits nil)
-        (last-position (1- (length token-ids))))
-    (declare (fixnum last-position))
-    (let ((position 0))
+  (let* ((context (and (inference-context-p state) state))
+         (start-position
+           (if context (inference-context-position context) 0))
+         (last-logits nil)
+         (last-position (+ start-position (1- (length token-ids)))))
+    (declare (fixnum start-position last-position))
+    (let ((position start-position))
       (declare (fixnum position))
       (dolist (token-id token-ids last-logits)
-        (let ((*compute-gguf-logits* (= position last-position)))
-         (setf last-logits
-               (funcall step-function token-id position kv-cache)))
+        (let ((compute-logits-p (= position last-position)))
+          (when context
+            (setf (inference-context-compute-logits-p context)
+                  compute-logits-p))
+          (let ((*compute-gguf-logits* compute-logits-p))
+            (setf last-logits
+                  (if context
+                      (call-inference-context-step
+                       step-function token-id position context)
+                      (funcall step-function token-id position state)))))
         (incf position)))))
+
+(defun evaluate-prompt
+    (token-ids step-function state &key context-already-acquired-p)
+  (if (and (inference-context-p state)
+           (not context-already-acquired-p))
+      (call-with-inference-context
+       state
+       (lambda (context)
+         (%evaluate-prompt token-ids step-function context)))
+      (%evaluate-prompt token-ids step-function state)))
 
 (defun decode-next-token (kv-pairs logits
                            &key
@@ -1326,7 +1380,7 @@ The caller must ensure that no inference request is using the kernel."
   (string= (or (tokenizer-model kv-pairs) "")
           "gpt2"))
 
-(defun generate-token-loop (kv-pairs initial-logits step-function kv-cache
+(defun %generate-token-loop (kv-pairs initial-logits step-function state
                              &key
                                eos-token-id
                                stop-token-ids
@@ -1340,7 +1394,8 @@ The caller must ensure that no inference request is using the kernel."
                               callback
                               (stream *standard-output*)
                               (random-state *random-state*))
-  (let ((effective-top-k (or top-k +default-top-k+))
+  (let ((context (and (inference-context-p state) state))
+        (effective-top-k (or top-k +default-top-k+))
         (current-logits initial-logits)
         (generated-token-ids '())
         (top-k-workspace nil)
@@ -1359,12 +1414,22 @@ The caller must ensure that no inference request is using the kernel."
                       (length initial-logits)
                       effective-top-k))))
       (declare (fixnum workspace-size))
-      (setf top-k-workspace
-           (make-array workspace-size :element-type 'single-float)
-           top-p-logit-workspace
-           (make-array workspace-size :element-type 'single-float)
-           top-p-index-workspace
-           (make-array workspace-size :element-type 'fixnum)))
+      (if context
+          (progn
+           (ensure-inference-context-sampling-workspaces
+            context workspace-size)
+           (setf top-k-workspace
+                 (inference-context-top-k-workspace context)
+                 top-p-logit-workspace
+                 (inference-context-top-p-logit-workspace context)
+                 top-p-index-workspace
+                 (inference-context-top-p-index-workspace context)))
+          (setf top-k-workspace
+               (make-array workspace-size :element-type 'single-float)
+               top-p-logit-workspace
+               (make-array workspace-size :element-type 'single-float)
+               top-p-index-workspace
+               (make-array workspace-size :element-type 'fixnum))))
     (dotimes (decode-index max-tokens)
       (declare (fixnum decode-index))
       (multiple-value-bind (token-id token-text)
@@ -1388,11 +1453,14 @@ The caller must ensure that no inference request is using the kernel."
           (write-string token-text stream)
           (when callback
             (funcall callback token-text)))
-        (setf current-logits
-              (funcall step-function
-                       token-id
-                       (+ start-position decode-index)
-                       kv-cache))))
+        (let ((position (+ start-position decode-index)))
+          (setf current-logits
+                (if context
+                    (progn
+                      (setf (inference-context-compute-logits-p context) t)
+                      (call-inference-context-step
+                       step-function token-id position context))
+                    (funcall step-function token-id position state))))))
     (let* ((ordered-token-ids (nreverse generated-token-ids))
            (generated-text
             (if (gpt2-tokenizer-p kv-pairs)
@@ -1401,6 +1469,42 @@ The caller must ensure that no inference request is using the kernel."
       (when (and callback (gpt2-tokenizer-p kv-pairs))
         (funcall callback generated-text))
       (values ordered-token-ids generated-text current-logits))))
+
+(defun generate-token-loop
+    (kv-pairs initial-logits step-function state
+     &key
+       eos-token-id
+       stop-token-ids
+       (start-position 0)
+       (repetition-penalty 1.15f0)
+       (top-k +default-top-k+)
+       (top-p +default-top-p+)
+       (temperature 1.0)
+       (max-tokens 256)
+       random-values
+       callback
+       (stream *standard-output*)
+       (random-state *random-state*)
+       context-already-acquired-p)
+  (flet ((run (effective-state)
+           (%generate-token-loop
+            kv-pairs initial-logits step-function effective-state
+            :eos-token-id eos-token-id
+            :stop-token-ids stop-token-ids
+            :start-position start-position
+            :repetition-penalty repetition-penalty
+            :top-k top-k
+            :top-p top-p
+            :temperature temperature
+            :max-tokens max-tokens
+            :random-values random-values
+            :callback callback
+            :stream stream
+            :random-state random-state)))
+    (if (and (inference-context-p state)
+             (not context-already-acquired-p))
+        (call-with-inference-context state #'run)
+        (run state))))
 
 (defun gemma4-chat-prompt-p (prompt)
   (or (search "<|turn>" prompt)
@@ -1489,7 +1593,7 @@ The caller must ensure that no inference request is using the kernel."
       (t
        (values prompt add-bos)))))
 
-(defun generate-from-prompt (kv-pairs prompt step-function kv-cache
+(defun generate-from-prompt (kv-pairs prompt step-function state
                               &key
                                 (add-bos t)
                                 use-thought-channel
@@ -1503,30 +1607,53 @@ The caller must ensure that no inference request is using the kernel."
                                 callback
                                 (stream *standard-output*)
                                 (random-state *random-state*))
-  (multiple-value-bind (prepared-prompt effective-add-bos)
-      (maybe-prepare-prompt-for-generation kv-pairs
-                                          prompt
-                                          add-bos
-                                          :use-thought-channel use-thought-channel)
-    (let* ((token-ids (tokenize-prompt kv-pairs prepared-prompt :add-bos effective-add-bos))
-           (stop-token-ids (resolve-stop-token-ids kv-pairs eos-token-id))
-           (prompt-logits (evaluate-prompt token-ids step-function kv-cache)))
-      (generate-token-loop kv-pairs
-                           prompt-logits
-                           step-function
-                           kv-cache
-                           :eos-token-id eos-token-id
-                           :stop-token-ids stop-token-ids
-                           :start-position (length token-ids)
-                           :repetition-penalty repetition-penalty
-                           :top-k top-k
-                           :top-p top-p
-                           :temperature temperature
-                           :max-tokens max-tokens
-                           :random-values random-values
-                           :callback callback
-                           :stream stream
-                           :random-state random-state))))
+  (flet ((run (effective-state)
+           (multiple-value-bind (prepared-prompt effective-add-bos)
+               (maybe-prepare-prompt-for-generation
+                kv-pairs
+                prompt
+                add-bos
+                :use-thought-channel use-thought-channel)
+             (let* ((token-ids
+                      (tokenize-prompt
+                       kv-pairs
+                       prepared-prompt
+                       :add-bos effective-add-bos))
+                    (stop-token-ids
+                      (resolve-stop-token-ids kv-pairs eos-token-id))
+                    (prompt-logits
+                      (evaluate-prompt
+                       token-ids
+                       step-function
+                       effective-state
+                       :context-already-acquired-p
+                       (inference-context-p effective-state)))
+                    (decode-start-position
+                      (if (inference-context-p effective-state)
+                          (inference-context-position effective-state)
+                          (length token-ids))))
+               (generate-token-loop
+                kv-pairs
+                prompt-logits
+                step-function
+                effective-state
+                :eos-token-id eos-token-id
+                :stop-token-ids stop-token-ids
+                :start-position decode-start-position
+                :repetition-penalty repetition-penalty
+                :top-k top-k
+                :top-p top-p
+                :temperature temperature
+                :max-tokens max-tokens
+                :random-values random-values
+                :callback callback
+                :stream stream
+                :random-state random-state
+                :context-already-acquired-p
+                (inference-context-p effective-state))))))
+    (if (inference-context-p state)
+        (call-with-inference-context state #'run)
+        (run state))))
 
 (defun resolve-eos-token-id (kv-pairs)
   (or (gguf-kv-value-or-nil kv-pairs "tokenizer.ggml.eos_token_id")
@@ -1657,7 +1784,16 @@ The caller must ensure that no inference request is using the kernel."
                                         (make-architecture-step-function
                                          architecture-descriptor
                                          model))))
-                             (effective-kv-cache (or kv-cache (make-hash-table)))
+                             (effective-inference-state
+                               (or kv-cache
+                                   (and model
+                                        (make-inference-context model))
+                                   (make-hash-table)))
+                             (owned-inference-context-p
+                               (and model
+                                    (null kv-cache)
+                                    (inference-context-p
+                                     effective-inference-state)))
                              (effective-eos-token-id
                               (or eos-token-id (resolve-eos-token-id kv-pairs))))
                         (unwind-protect
@@ -1712,7 +1848,7 @@ The caller must ensure that no inference request is using the kernel."
                                   kv-pairs
                                   prompt
                                   effective-step-function
-                                  effective-kv-cache
+                                  effective-inference-state
                                   :use-thought-channel use-thought-channel
                                   :eos-token-id effective-eos-token-id
                                   :repetition-penalty repetition-penalty
@@ -1731,6 +1867,9 @@ The caller must ensure that no inference request is using the kernel."
                                        generated-ids
                                        generated-text
                                        last-logits)))
+                          (when owned-inference-context-p
+                            (close-inference-context
+                             effective-inference-state))
                           (when model
                             (close-model model))))))))
 
@@ -2219,14 +2358,17 @@ Write a haiku about a hacker drinking coffee.<turn|>
            :type accelerator-backend
            :read-only t)
   (session (error "Accelerator projection session is required.")
-           :read-only t))
+           :read-only t)
+  (run-mutex
+    (sb-thread:make-mutex :name "llambda accelerator projection run")
+    :read-only t))
 
 (defstruct gguf-model
   mapping
   kv-pairs
   tensor-infos
   tensor-info-table
-  tensor-cache
+  (tensor-cache (make-hash-table :test #'equal))
   architecture
   hidden-size
   layer-count
@@ -2245,12 +2387,246 @@ Write a haiku about a hacker drinking coffee.<turn|>
   final-logit-softcap
   output-tensor-name
   (accelerator-projections (make-hash-table :test #'equal))
+  (retired-accelerator-projections nil)
+  (legacy-context-tables nil)
+  (runtime-mutex (sb-thread:make-mutex :name "llambda model runtime"))
+  (active-inference-count 0 :type fixnum)
   (closed-p nil))
 
 (defun ensure-model-open (model operation)
   (when (gguf-model-closed-p model)
     (error "~a cannot use a closed GGUF model." operation))
   model)
+
+(defun model-declared-context-limit (model)
+  (when model
+    (let* ((architecture (gguf-model-architecture model))
+           (architecture-key
+             (and architecture
+                  (format nil "~a.context_length" architecture))))
+      (or (and architecture-key
+               (cdr (assoc architecture-key
+                           (gguf-model-kv-pairs model)
+                           :test #'string=)))
+          (cdr (assoc "general.context_length"
+                      (gguf-model-kv-pairs model)
+                      :test #'string=))))))
+
+(defun make-inference-context (model &key context-limit state-table legacy-p)
+  (when model
+    (ensure-model-open model "MAKE-INFERENCE-CONTEXT"))
+  (let ((effective-limit
+          (or context-limit (model-declared-context-limit model))))
+    (when (and effective-limit
+               (not (and (integerp effective-limit)
+                         (plusp effective-limit))))
+      (error "Inference context limit must be a positive integer, got ~s."
+             effective-limit))
+    (%make-inference-context
+     :model model
+     :architecture (and model (gguf-model-architecture model))
+     :state-table (or state-table (make-hash-table))
+     :context-limit effective-limit
+     :legacy-p legacy-p)))
+
+(defun ensure-inference-context-open (context operation)
+  (when (inference-context-closed-p context)
+    (error "~a cannot use a closed inference context." operation))
+  (let ((model (inference-context-model context)))
+    (when model
+      (ensure-model-open model operation)))
+  context)
+
+(defun validate-inference-context-model (context model)
+  (ensure-inference-context-open context "INFERENCE STEP")
+  (unless (eq model (inference-context-model context))
+    (error "Inference context belongs to a different model."))
+  (unless (equal (gguf-model-architecture model)
+                 (inference-context-architecture context))
+    (error "Inference context architecture ~s does not match model architecture ~s."
+           (inference-context-architecture context)
+           (gguf-model-architecture model)))
+  context)
+
+(defun resolve-step-inference-context (model state)
+  (let ((context
+          (cond
+            ((inference-context-p state)
+             (validate-inference-context-model state model))
+            ((hash-table-p state)
+             (sb-thread:with-mutex (*legacy-inference-contexts-mutex*)
+              (let ((contexts
+                      (gethash +legacy-inference-contexts-key+ state)))
+                (unless contexts
+                  (setf contexts (make-hash-table :test #'eq)
+                        (gethash +legacy-inference-contexts-key+ state)
+                        contexts))
+                (let ((existing (gethash model contexts)))
+                  (if (and existing
+                           (not (inference-context-closed-p existing)))
+                      existing
+                      (sb-thread:with-mutex
+                          ((gguf-model-runtime-mutex model))
+                        (ensure-model-open model "LEGACY INFERENCE")
+                        (let ((context
+                                (make-inference-context
+                                 model
+                                 :state-table state
+                                 :legacy-p t)))
+                          (pushnew
+                           contexts
+                           (gguf-model-legacy-context-tables model)
+                           :test #'eq)
+                          (setf (gethash model contexts) context))))))))
+            (t
+             (error
+              "Step state must be an inference context or legacy KV hash table, got ~s."
+              state)))))
+    (when (inference-context-legacy-p context)
+      (setf (inference-context-compute-logits-p context)
+            *compute-gguf-logits*))
+    context))
+
+(defun protect-model-step-function (model step-function)
+  (lambda (token-id position state)
+    (if (hash-table-p state)
+        (let ((context (resolve-step-inference-context model state)))
+          (call-with-inference-context
+           context
+           (lambda (acquired-context)
+             (funcall
+              step-function token-id position acquired-context))))
+        (funcall step-function token-id position state))))
+
+(defun validate-inference-context-position (context position)
+  (ensure-inference-context-open context "INFERENCE STEP")
+  (unless (and (typep position 'fixnum) (not (minusp position)))
+    (error "Inference position must be a nonnegative fixnum, got ~s."
+           position))
+  (unless (= position (inference-context-position context))
+    (error "Inference context expected position ~d, got ~d."
+           (inference-context-position context)
+           position))
+  (let ((limit (inference-context-context-limit context)))
+    (when (and limit (>= position limit))
+      (error "Inference position ~d exceeds context limit ~d."
+             position
+             limit)))
+  context)
+
+(defun close-retired-accelerator-projections (projections)
+  (let ((first-error nil))
+    (dolist (projection projections)
+      (let ((backend (accelerator-projection-backend projection)))
+        (handler-case
+            (funcall
+             (accelerator-backend-close-session-function backend)
+             (accelerator-projection-session projection))
+          (error (condition)
+            (unless first-error
+              (setf first-error condition))))))
+    (when first-error
+      (error first-error))))
+
+(defun acquire-model-inference-use (model)
+  (when model
+    (sb-thread:with-mutex ((gguf-model-runtime-mutex model))
+      (ensure-model-open model "INFERENCE")
+      (incf (gguf-model-active-inference-count model))))
+  model)
+
+(defun release-model-inference-use (model)
+  (let ((retired nil))
+    (when model
+      (sb-thread:with-mutex ((gguf-model-runtime-mutex model))
+        (decf (gguf-model-active-inference-count model))
+        (when (minusp (gguf-model-active-inference-count model))
+          (error "Model inference use count became negative."))
+        (when (zerop (gguf-model-active-inference-count model))
+          (setf retired (gguf-model-retired-accelerator-projections model)
+                (gguf-model-retired-accelerator-projections model) nil))))
+    (close-retired-accelerator-projections retired))
+  model)
+
+(defun call-with-inference-context (context function)
+  (unless (inference-context-p context)
+    (error "Expected an inference context, got ~s." context))
+  (sb-thread:with-mutex ((inference-context-use-mutex context))
+    (ensure-inference-context-open context "CALL-WITH-INFERENCE-CONTEXT")
+    (when (inference-context-in-use-p context)
+      (error "Inference context is already in use."))
+    (setf (inference-context-in-use-p context) t))
+  (let ((model (inference-context-model context))
+        (model-acquired-p nil))
+    (unwind-protect
+        (progn
+          (acquire-model-inference-use model)
+          (setf model-acquired-p t)
+          (funcall function context))
+      (when model-acquired-p
+        (unwind-protect
+            (release-model-inference-use model)
+          (sb-thread:with-mutex ((inference-context-use-mutex context))
+            (setf (inference-context-in-use-p context) nil))))
+      (unless model-acquired-p
+        (sb-thread:with-mutex ((inference-context-use-mutex context))
+          (setf (inference-context-in-use-p context) nil))))))
+
+(defmacro with-inference-context ((variable context) &body body)
+  `(call-with-inference-context
+    ,context
+    (lambda (,variable)
+      ,@body)))
+
+(defun reset-inference-context (context)
+  (sb-thread:with-mutex ((inference-context-use-mutex context))
+    (ensure-inference-context-open context "RESET-INFERENCE-CONTEXT")
+    (when (inference-context-in-use-p context)
+      (error "Cannot reset an inference context while it is in use."))
+    (clrhash (inference-context-state-table context))
+    (setf (inference-context-position context) 0
+          (inference-context-compute-logits-p context) t))
+  context)
+
+(defun close-inference-context (context)
+  (unless (inference-context-closed-p context)
+    (sb-thread:with-mutex ((inference-context-use-mutex context))
+      (when (inference-context-in-use-p context)
+        (error "Cannot close an inference context while it is in use."))
+      (unless (inference-context-legacy-p context)
+        (clrhash (inference-context-state-table context)))
+      (setf (inference-context-compute-buffer context) nil
+            (inference-context-top-k-workspace context) nil
+            (inference-context-top-p-logit-workspace context) nil
+            (inference-context-top-p-index-workspace context) nil
+            (inference-context-closed-p context) t)))
+  context)
+
+(defun call-inference-context-step
+    (step-function token-id position context)
+  (validate-inference-context-position context position)
+  (let ((result (funcall step-function token-id position context)))
+    (setf (inference-context-position context) (1+ position))
+    result))
+
+(defun ensure-inference-context-sampling-workspaces (context size)
+  (labels ((ensure-workspace (workspace element-type)
+             (if (and workspace (>= (length workspace) size))
+                 workspace
+                 (make-array size :element-type element-type))))
+    (setf (inference-context-top-k-workspace context)
+          (ensure-workspace
+           (inference-context-top-k-workspace context)
+           'single-float)
+          (inference-context-top-p-logit-workspace context)
+          (ensure-workspace
+           (inference-context-top-p-logit-workspace context)
+           'single-float)
+          (inference-context-top-p-index-workspace context)
+          (ensure-workspace
+           (inference-context-top-p-index-workspace context)
+           'fixnum)))
+  context)
 
 (defun resolve-accelerator-backend (backend)
   (etypecase backend
@@ -2273,24 +2649,32 @@ Write a haiku about a hacker drinking coffee.<turn|>
           (model-accelerator-projection model backend tensor-name)))
     (and projection (accelerator-projection-session projection))))
 
+(defun copy-hash-table-shallow (table)
+  (let ((copy
+          (make-hash-table
+           :test (hash-table-test table)
+           :size (max 1 (hash-table-count table)))))
+    (maphash (lambda (key value)
+               (setf (gethash key copy) value))
+             table)
+    copy))
+
+(defun defer-or-collect-accelerator-projections
+    (model projections)
+  (if (plusp (gguf-model-active-inference-count model))
+      (progn
+        (setf (gguf-model-retired-accelerator-projections model)
+              (nconc projections
+                     (gguf-model-retired-accelerator-projections model)))
+        nil)
+      projections))
+
 (defun register-model-accelerator-projection
     (model backend tensor-name onnx-path &key cache-directory cache-key)
-  (ensure-model-open model "REGISTER-MODEL-ACCELERATOR-PROJECTION")
   (let* ((resolved-backend (resolve-accelerator-backend backend))
          (tensor-info (gguf-model-tensor-info model tensor-name t))
-         (projection-table (gguf-model-accelerator-projections model))
-         (projections (gethash tensor-name projection-table))
          (display-name
            (accelerator-backend-display-name resolved-backend)))
-    (when (find (accelerator-backend-name resolved-backend)
-                projections
-                :key (lambda (projection)
-                       (accelerator-backend-name
-                        (accelerator-projection-backend projection)))
-                :test #'eq)
-      (error "Tensor ~s already has a ~a projection."
-             tensor-name
-             display-name))
     (let ((session
             (funcall
              (accelerator-backend-make-session-function resolved-backend)
@@ -2317,20 +2701,44 @@ Write a haiku about a hacker drinking coffee.<turn|>
               (error "~a output size does not match tensor ~s."
                      display-name
                      tensor-name))
-            (setf (gethash tensor-name projection-table)
-                  (sort
-                   (concatenate
-                    'vector
-                    projections
-                    (vector
-                     (make-accelerator-projection
-                      :backend resolved-backend
-                      :session session)))
-                   #'<
-                   :key
-                   (lambda (projection)
-                     (accelerator-backend-priority
-                      (accelerator-projection-backend projection)))))
+            (sb-thread:with-mutex ((gguf-model-runtime-mutex model))
+              (ensure-model-open
+               model "REGISTER-MODEL-ACCELERATOR-PROJECTION")
+              (let* ((projection-table
+                       (gguf-model-accelerator-projections model))
+                     (projections
+                       (gethash tensor-name projection-table)))
+                (when
+                    (find
+                     (accelerator-backend-name resolved-backend)
+                     projections
+                     :key
+                     (lambda (projection)
+                       (accelerator-backend-name
+                        (accelerator-projection-backend projection)))
+                     :test #'eq)
+                  (error "Tensor ~s already has a ~a projection."
+                         tensor-name
+                         display-name))
+                (let ((new-table
+                        (copy-hash-table-shallow projection-table)))
+                  (setf
+                   (gethash tensor-name new-table)
+                   (sort
+                    (concatenate
+                     'vector
+                     projections
+                     (vector
+                      (make-accelerator-projection
+                       :backend resolved-backend
+                       :session session)))
+                    #'<
+                    :key
+                    (lambda (projection)
+                      (accelerator-backend-priority
+                       (accelerator-projection-backend projection))))
+                   (gguf-model-accelerator-projections model)
+                   new-table))))
             (setf session nil))
         (when session
           (funcall
@@ -2339,69 +2747,80 @@ Write a haiku about a hacker drinking coffee.<turn|>
   model)
 
 (defun unregister-model-accelerator-projection (model backend tensor-name)
-  (let* ((resolved-backend (resolve-accelerator-backend backend))
-         (projection-table (gguf-model-accelerator-projections model))
-         (projections (gethash tensor-name projection-table))
-         (backend-name (accelerator-backend-name resolved-backend))
-         (projection
-           (find backend-name
-                 projections
-                 :key (lambda (candidate)
-                        (accelerator-backend-name
-                         (accelerator-projection-backend candidate)))
-                 :test #'eq)))
-    (when projection
-      (let* ((projection-backend
-               (accelerator-projection-backend projection))
-             (remaining
-              (remove backend-name
-                      projections
-                      :key (lambda (candidate)
-                             (accelerator-backend-name
-                              (accelerator-projection-backend candidate)))
-                      :test #'eq)))
-        (if (plusp (length remaining))
-            (setf (gethash tensor-name projection-table) remaining)
-            (remhash tensor-name projection-table))
-        (funcall
-         (accelerator-backend-close-session-function projection-backend)
-         (accelerator-projection-session projection))))
-  model))
+  (let ((resolved-backend (resolve-accelerator-backend backend))
+        (to-close nil))
+    (sb-thread:with-mutex ((gguf-model-runtime-mutex model))
+      (let* ((projection-table
+               (gguf-model-accelerator-projections model))
+             (projections (gethash tensor-name projection-table))
+             (backend-name
+               (accelerator-backend-name resolved-backend))
+             (projection
+               (find
+                backend-name
+                projections
+                :key
+                (lambda (candidate)
+                  (accelerator-backend-name
+                   (accelerator-projection-backend candidate)))
+                :test #'eq)))
+        (when projection
+          (let* ((remaining
+                   (remove
+                    backend-name
+                    projections
+                    :key
+                    (lambda (candidate)
+                      (accelerator-backend-name
+                       (accelerator-projection-backend candidate)))
+                    :test #'eq))
+                 (new-table
+                   (copy-hash-table-shallow projection-table)))
+            (if (plusp (length remaining))
+                (setf (gethash tensor-name new-table) remaining)
+                (remhash tensor-name new-table))
+            (setf (gguf-model-accelerator-projections model)
+                  new-table
+                  to-close
+                  (defer-or-collect-accelerator-projections
+                   model
+                   (list projection)))))))
+    (close-retired-accelerator-projections to-close))
+  model)
 
 (defun clear-model-accelerator-projections (model &optional backend)
-  (let ((projection-table (gguf-model-accelerator-projections model)))
-    (if backend
-        (let ((resolved-backend (resolve-accelerator-backend backend))
-              (tensor-names '()))
-          (maphash
-           (lambda (tensor-name projections)
-             (when (find (accelerator-backend-name resolved-backend)
-                         projections
-                         :key (lambda (projection)
-                                (accelerator-backend-name
-                                 (accelerator-projection-backend
-                                  projection)))
-                         :test #'eq)
-               (push tensor-name tensor-names)))
-           projection-table)
-          (dolist (tensor-name tensor-names)
-            (unregister-model-accelerator-projection
-             model resolved-backend tensor-name)))
-        (progn
-          (maphash
-           (lambda (tensor-name projections)
-             (declare (ignore tensor-name))
+  (let ((resolved-backend
+          (and backend (resolve-accelerator-backend backend)))
+        (to-close nil))
+    (sb-thread:with-mutex ((gguf-model-runtime-mutex model))
+      (let ((new-table (make-hash-table :test #'equal))
+            (removed nil))
+        (maphash
+         (lambda (tensor-name projections)
+           (let ((remaining
+                   (if resolved-backend
+                       (remove
+                        (accelerator-backend-name resolved-backend)
+                        projections
+                        :key
+                        (lambda (projection)
+                          (accelerator-backend-name
+                           (accelerator-projection-backend projection)))
+                        :test #'eq)
+                       #())))
              (map nil
                   (lambda (projection)
-                    (let ((projection-backend
-                            (accelerator-projection-backend projection)))
-                      (funcall
-                       (accelerator-backend-close-session-function
-                        projection-backend)
-                       (accelerator-projection-session projection))))
-                  projections))
-           projection-table)
-          (clrhash projection-table))))
+                    (unless (find projection remaining :test #'eq)
+                      (push projection removed)))
+                  projections)
+             (when (plusp (length remaining))
+               (setf (gethash tensor-name new-table) remaining))))
+         (gguf-model-accelerator-projections model))
+        (setf (gguf-model-accelerator-projections model) new-table
+              to-close
+              (defer-or-collect-accelerator-projections
+               model removed))))
+    (close-retired-accelerator-projections to-close))
   model)
 
 (defun register-model-npu-projection
@@ -2432,14 +2851,45 @@ Write a haiku about a hacker drinking coffee.<turn|>
 
 The GGUF mapping is borrowed from the surrounding WITH-MAPPED-FILE scope and
 is invalidated here, but its handle remains owned by that scope."
-(unless (gguf-model-closed-p model)
-  (clear-model-accelerator-projections model)
-    (let ((tensor-cache (gguf-model-tensor-cache model)))
-      (when tensor-cache
-        (clrhash tensor-cache)))
-    (setf (gguf-model-mapping model) nil
-          (gguf-model-closed-p model) t))
-  model)
+(let ((projections nil)
+      (tensor-cache nil)
+      (legacy-contexts nil))
+  (sb-thread:with-mutex (*legacy-inference-contexts-mutex*)
+    (sb-thread:with-mutex ((gguf-model-runtime-mutex model))
+      (unless (gguf-model-closed-p model)
+        (when (plusp (gguf-model-active-inference-count model))
+          (error "Cannot close a model while ~d inference context~:p active."
+                 (gguf-model-active-inference-count model)))
+        (maphash
+         (lambda (tensor-name bindings)
+           (declare (ignore tensor-name))
+           (map nil (lambda (binding)
+                      (push binding projections))
+                bindings))
+         (gguf-model-accelerator-projections model))
+        (dolist (contexts (gguf-model-legacy-context-tables model))
+          (let ((context (gethash model contexts)))
+            (when context
+              (push context legacy-contexts)
+              (remhash model contexts))))
+        (setf projections
+              (nconc projections
+                     (gguf-model-retired-accelerator-projections model))
+              tensor-cache (gguf-model-tensor-cache model)
+              (gguf-model-accelerator-projections model)
+              (make-hash-table :test #'equal)
+              (gguf-model-retired-accelerator-projections model) nil
+              (gguf-model-legacy-context-tables model) nil
+              (gguf-model-tensor-cache model)
+              (make-hash-table :test #'equal)
+              (gguf-model-mapping model) nil
+              (gguf-model-closed-p model) t))))
+  (dolist (context legacy-contexts)
+    (close-inference-context context))
+  (close-retired-accelerator-projections projections)
+  (when tensor-cache
+    (clrhash tensor-cache)))
+model)
 
 (defun foreign-data-sha256 (pointer byte-size)
   (require-npu-backend)
@@ -3409,8 +3859,15 @@ It extracts the underlying simple arrays once before entering the loop to elimin
   (gethash tensor-name (gguf-model-tensor-cache model)))
 
 (defun (setf gguf-model-cached-tensor) (value model tensor-name)
-  (setf (gethash tensor-name (gguf-model-tensor-cache model))
-        value))
+  (sb-thread:with-mutex ((gguf-model-runtime-mutex model))
+    (ensure-model-open model "CACHE GGUF TENSOR")
+    (let ((new-cache
+            (copy-hash-table-shallow
+             (or (gguf-model-tensor-cache model)
+                 (make-hash-table :test #'equal)))))
+      (setf (gethash tensor-name new-cache) value
+            (gguf-model-tensor-cache model) new-cache)))
+  value)
 
 (defun gguf-model-load-vector-tensor (model tensor-name)
   (let* ((tensor (gguf-model-load-tensor model tensor-name))
@@ -3420,10 +3877,28 @@ It extracts the underlying simple arrays once before entering the loop to elimin
     tensor))
 
 (defun gguf-model-load-tensor (model tensor-name)
-  (or (gguf-model-cached-tensor model tensor-name)
-      (let ((tensor-info (gguf-model-tensor-info model tensor-name t)))
-        (setf (gguf-model-cached-tensor model tensor-name)
-              (load-gguf-tensor (gguf-model-mapping model) tensor-info)))))
+  (multiple-value-bind (cached presentp)
+      (gethash tensor-name (gguf-model-tensor-cache model))
+    (if presentp
+        cached
+        (sb-thread:with-mutex ((gguf-model-runtime-mutex model))
+          (ensure-model-open model "LOAD GGUF TENSOR")
+          (multiple-value-bind (locked-cached locked-present-p)
+              (gethash tensor-name (gguf-model-tensor-cache model))
+            (if locked-present-p
+                locked-cached
+                (let* ((tensor-info
+                         (gguf-model-tensor-info model tensor-name t))
+                       (tensor
+                         (load-gguf-tensor
+                          (gguf-model-mapping model)
+                          tensor-info))
+                       (new-cache
+                         (copy-hash-table-shallow
+                          (gguf-model-tensor-cache model))))
+                  (setf (gethash tensor-name new-cache) tensor
+                        (gguf-model-tensor-cache model) new-cache)
+                  tensor)))))))
 
 (defun gguf-model-load-scalar-tensor (model tensor-name)
   (let ((tensor (gguf-model-load-vector-tensor model tensor-name)))
@@ -4248,12 +4723,14 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                           (call-with-accelerator-runtime-fallback
                            backend
                             (lambda ()
-                             (funcall
-                              (accelerator-backend-run-session-function
-                               backend)
-                              dest
-                              session
-                              vector))
+                             (sb-thread:with-mutex
+                                 ((accelerator-projection-run-mutex projection))
+                               (funcall
+                                (accelerator-backend-run-session-function
+                                 backend)
+                                dest
+                                session
+                                vector)))
                            (lambda ()
                              (run-projection-or-cpu (1+ index)))
                            (lambda ()
@@ -4531,6 +5008,11 @@ It extracts the underlying simple arrays once before entering the loop to elimin
   (vectors (make-hash-table :test #'eq))
   (fixnum-vectors (make-hash-table :test #'eq))
   (chunk-views (make-hash-table :test #'eq)))
+
+(defun inference-context-compute-buffer-for-step (context)
+  (or (inference-context-compute-buffer context)
+      (setf (inference-context-compute-buffer context)
+            (make-compute-buffer))))
 
 (defun compute-buffer-vector (buffer key length)
   (let ((vector (gethash key (compute-buffer-vectors buffer))))
@@ -4974,10 +5456,15 @@ It extracts the underlying simple arrays once before entering the loop to elimin
         (hidden-size (gguf-model-hidden-size model))
         (norm-epsilon (gguf-model-norm-epsilon model))
         (rope-dimension (gguf-model-rope-dimension model))
-        (rope-base (gguf-model-rope-base model))
-        (compute-buffer (make-compute-buffer)))
-    (lambda (token-id position kv-cache)
-      (let* ((input-embedding (compute-buffer-vector compute-buffer :qwen-input-embedding hidden-size))
+        (rope-base (gguf-model-rope-base model)))
+    (protect-model-step-function
+     model
+     (lambda (token-id position state)
+      (let* ((context (resolve-step-inference-context model state))
+             (kv-cache (inference-context-state-table context))
+             (compute-buffer
+               (inference-context-compute-buffer-for-step context))
+             (input-embedding (compute-buffer-vector compute-buffer :qwen-input-embedding hidden-size))
              (x (compute-buffer-vector compute-buffer :qwen-x hidden-size))
              (attn-norm (compute-buffer-vector compute-buffer :qwen-attn-norm hidden-size))
              (ffn-input (compute-buffer-vector compute-buffer :qwen-ffn-input hidden-size))
@@ -5257,14 +5744,14 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                          :epsilon norm-epsilon)
           (qwen3next-moe-into ffn-output model layer-index ffn-input compute-buffer)
           (vector-add-into x x ffn-output))
-        (when *compute-gguf-logits*
+        (when (inference-context-compute-logits-p context)
           (gguf-model-matrix-vector-multiply
            model
            (gguf-model-output-tensor-name model)
            (rms-norm-into (compute-buffer-vector compute-buffer :qwen-output-norm hidden-size)
                           x
                           (gguf-model-load-vector-tensor model "output_norm.weight")
-                          :epsilon norm-epsilon)))))))
+                          :epsilon norm-epsilon))))))))
 
 (defun nemotron-h-moe-recurrent-layer-p (model layer-index)
   (and (zerop (gguf-model-layer-kv-head-count model layer-index))
@@ -5681,10 +6168,15 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                      1.0f0)
                  'single-float))
         (expert-weights-normalized-p
-         (not (null (gguf-kv-value-or-nil (gguf-model-kv-pairs model) "nemotron_h_moe.expert_weights_norm"))))
-        (compute-buffer (make-compute-buffer)))
-    (lambda (token-id position kv-cache)
-      (let* ((input-embedding (compute-buffer-vector compute-buffer :nemotron-input-embedding hidden-size))
+         (not (null (gguf-kv-value-or-nil (gguf-model-kv-pairs model) "nemotron_h_moe.expert_weights_norm")))))
+    (protect-model-step-function
+     model
+     (lambda (token-id position state)
+      (let* ((context (resolve-step-inference-context model state))
+             (kv-cache (inference-context-state-table context))
+             (compute-buffer
+               (inference-context-compute-buffer-for-step context))
+             (input-embedding (compute-buffer-vector compute-buffer :nemotron-input-embedding hidden-size))
              (x (compute-buffer-vector compute-buffer :nemotron-x hidden-size))
              (block-input (compute-buffer-vector compute-buffer :nemotron-block-input hidden-size))
              (block-output (compute-buffer-vector compute-buffer :nemotron-block-output hidden-size)))
@@ -5737,14 +6229,14 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                     (gguf-model-layer-kv-head-count model layer-index)
                     (gguf-model-layer-ffn-size model layer-index))))
           (vector-add-into x x block-output))
-        (when *compute-gguf-logits*
+        (when (inference-context-compute-logits-p context)
           (gguf-model-matrix-vector-multiply
            model
            (gguf-model-output-tensor-name model)
            (rms-norm-into (compute-buffer-vector compute-buffer :nemotron-output-norm hidden-size)
                           x
                           (gguf-model-load-vector-tensor model "output_norm.weight")
-                          :epsilon norm-epsilon)))))))
+                          :epsilon norm-epsilon))))))))
 
 (defun load-qwen2-model (mapping kv-pairs tensor-infos)
   (let ((architecture (gguf-kv-value kv-pairs "general.architecture")))
@@ -5809,8 +6301,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
          (rope-base (gguf-model-rope-base model))
          (rope-factors (when (gguf-model-tensor-info model "rope_freqs.weight" nil)
                          (gguf-model-load-vector-tensor model "rope_freqs.weight")))
-         (attention-scale (coerce (/ (sqrt head-size)) 'single-float))
-         (compute-buffer (make-compute-buffer)))
+         (attention-scale (coerce (/ (sqrt head-size)) 'single-float)))
     (unless (zerop (mod hidden-size head-count))
       (error "Llama hidden size ~d is not divisible by head count ~d."
              hidden-size
@@ -5819,8 +6310,14 @@ It extracts the underlying simple arrays once before entering the loop to elimin
       (error "Llama head count ~d is not divisible by KV head count ~d."
              head-count
              kv-head-count))
-    (lambda (token-id position kv-cache)
-      (let ((input-embedding
+    (protect-model-step-function
+     model
+     (lambda (token-id position state)
+      (let* ((context (resolve-step-inference-context model state))
+             (kv-cache (inference-context-state-table context))
+             (compute-buffer
+              (inference-context-compute-buffer-for-step context))
+             (input-embedding
               (compute-buffer-vector compute-buffer :llama-input-embedding hidden-size))
             (x (compute-buffer-vector compute-buffer :llama-x hidden-size)))
         (gguf-model-token-row-into input-embedding model "token_embd.weight" token-id)
@@ -5942,7 +6439,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
             (gguf-model-matrix-vector-multiply-into
              ffn-down model (make-layer-tensor-name layer-index "ffn_down") ffn-gate)
             (vector-add-into x x ffn-down)))
-        (when *compute-gguf-logits*
+        (when (inference-context-compute-logits-p context)
           (gguf-model-matrix-vector-multiply
            model
            (gguf-model-output-tensor-name model)
@@ -5951,7 +6448,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                                                 hidden-size)
                           x
                           (gguf-model-load-vector-tensor model "output_norm.weight")
-                          :epsilon norm-epsilon)))))))
+                          :epsilon norm-epsilon))))))))
 
 (defun make-qwen2-step-function (model)
   (unless (string= (gguf-model-architecture model) "qwen2")
@@ -6031,10 +6528,15 @@ It extracts the underlying simple arrays once before entering the loop to elimin
 (defun make-gemma4-step-function (model)
   (let ((rope-factors (gguf-model-load-vector-tensor model "rope_freqs.weight"))
         (head-count (gguf-model-head-count model))
-        (norm-epsilon (gguf-model-norm-epsilon model))
-        (compute-buffer (make-compute-buffer)))
-    (lambda (token-id position kv-cache)
-      (let* ((hidden-size (gguf-model-hidden-size model))
+        (norm-epsilon (gguf-model-norm-epsilon model)))
+    (protect-model-step-function
+     model
+     (lambda (token-id position state)
+      (let* ((context (resolve-step-inference-context model state))
+             (kv-cache (inference-context-state-table context))
+             (compute-buffer
+               (inference-context-compute-buffer-for-step context))
+             (hidden-size (gguf-model-hidden-size model))
              (input-embedding
               (compute-buffer-vector compute-buffer :input-embedding hidden-size))
              (x (compute-buffer-vector compute-buffer :x hidden-size))
@@ -6252,7 +6754,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                                :epsilon norm-epsilon)
                 (vector-add-into x x post-ple)))
             (maybe-layer-output-scale model layer-index x)))
-        (when *compute-gguf-logits*
+        (when (inference-context-compute-logits-p context)
           (softcap-logits
            (gguf-model-matrix-vector-multiply
             model
@@ -6261,7 +6763,7 @@ It extracts the underlying simple arrays once before entering the loop to elimin
                            x
                            (gguf-model-load-vector-tensor model "output_norm.weight")
                            :epsilon norm-epsilon))
-           (gguf-model-final-logit-softcap model)))))))
+           (gguf-model-final-logit-softcap model))))))))
 
 (defun gguf-kv-value (kv-pairs key)
   (let ((entry (assoc key kv-pairs :test #'string=)))

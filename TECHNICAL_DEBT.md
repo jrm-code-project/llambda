@@ -6,7 +6,7 @@ request to replace the specialized numeric kernels.
 
 ## Snapshot
 
-- `llambda.lisp` contains 7,182 lines and 323 `defun` forms.
+- `llambda.lisp` contains 7,972 lines and 364 `defun` forms.
 - It combines Win32 resource management, GGUF parsing, tensor formats,
   quantized kernels, accelerator integration, sampling, tokenization, and five
   model architectures.
@@ -29,7 +29,7 @@ Priority meanings:
 | 2 | P0 | Native resource ownership and forged arrays lacked a safe lifecycle (**addressed 2026-07-14**) | Dangling arrays, leaked views/handles/sessions, and SBCL-version fragility |
 | 3 | P1 | Architecture dispatch was centralized (**addressed 2026-07-14**) | Adding or changing a model family required edits to multiple coupled dispatch sites |
 | 4 | P1 | Accelerator lifecycle was duplicated (**addressed 2026-07-14**) | Backend behavior could drift and another provider would multiply code paths |
-| 5 | P1 | Inference state is implicit and step functions are non-reentrant | Concurrent or interleaved use can corrupt scratch or architecture-specific state |
+| 5 | P1 | Inference state was implicit and step functions were non-reentrant (**addressed 2026-07-14**) | Concurrent or interleaved use could corrupt scratch or architecture-specific state |
 | 6 | P1 | GGML type behavior is spread across several independent dispatch tables | New formats are easy to implement partially or inconsistently |
 | 7 | P1 | Chat templates are detected but not interpreted | Valid model templates can silently receive the wrong conversation format |
 | 8 | P2 | Runtime tuning and sampling state are global or repeatedly recomputed | Hardware underutilization, thread contention, and avoidable per-token work |
@@ -231,18 +231,29 @@ adapter, not another copy of projection lifecycle or inference-routing code.
 
 ## 5. Make inference state explicit and reentrant
 
+**Status: Addressed on 2026-07-14.** Each request now uses an explicit
+`inference-context` that owns architecture state, compute and sampling
+workspaces, position, context limit, logits policy, and lifecycle state.
+Architecture step closures no longer capture mutable compute buffers. Separate
+contexts can execute concurrently against one model and step implementation,
+while legacy hash-table callers retain source compatibility.
+
 **Evidence**
 
-- Step functions close over one mutable `compute-buffer`
-  (`llambda.lisp:4443-4457`, `5140-5162`, `5274-5297`, `5503-5513`).
-- Scratch storage is dynamically keyed in hash tables
-  (`llambda.lisp:4002-4045`).
-- KV and recurrent state use architecture-specific hash-table/plist layouts
-  (`llambda.lisp:3996-4000`, `4199-4213`, `4754-4766`).
-- `*compute-gguf-logits*` is a hidden dynamic contract between prompt
-  evaluation and all step implementations (`llambda.lisp:34`, `1189-1194`).
+- Context ownership, validation, reset, close, scoped use, and legacy adaptation
+  are implemented at `llambda.lisp:48-68` and `2409-2588`.
+- Prompt evaluation and token generation use context-owned position, logits
+  policy, and sampling workspaces (`llambda.lisp:1317-1498`).
+- Qwen3Next, Nemotron-H, Llama/Qwen2, and Gemma4 steps resolve context-owned
+  scratch and state once per token (`llambda.lisp:5411-6715`).
+- Model tensor-cache publication and accelerator binding updates use locked
+  copy-on-write snapshots, while successful reads remain lock-free
+  (`llambda.lisp:2611-2783`, `3810-3850`).
+- Lifecycle, independent threaded contexts, cache publication, deferred session
+  retirement, cleanup failure, and compatibility behavior are covered in
+  `tests.lisp`.
 
-**Why this is debt**
+**Original debt**
 
 A step closure is safe only for one active execution at a time, but that
 constraint is not represented or enforced. Concurrent requests sharing a
@@ -250,18 +261,30 @@ closure can overwrite scratch buffers. Bare hash tables provide no model
 identity, context limit, reset contract, or validation that state belongs to
 the architecture consuming it.
 
-**Remediation**
+**Implemented remediation**
 
-1. Introduce an `inference-context` owning scratch, KV/recurrent state,
+1. Introduced an `inference-context` owning scratch, KV/recurrent state,
    position, logits policy, and model identity.
-2. Make architecture steps accept a context instead of closing over mutable
+2. Made architecture steps accept a context instead of closing over mutable
    scratch.
-3. Provide initialize/reset/close operations and enforce context limits.
-4. Allocate one context per request; add pooling only after ownership is
+3. Added initialize/reset/close operations and enforced context limits.
+4. Allocated one context per request; pooling remains deferred until ownership is
    explicit.
 
-**Exit criterion:** the same model/step implementation can safely serve two
-independent contexts concurrently.
+Model tensor data and accelerator sessions remain shared and model-owned.
+Cache misses and accelerator mutations publish immutable table snapshots;
+failed or removed sessions are retired only after active contexts drain.
+Shared accelerator sessions serialize provider runs because DirectML sessions
+do not support concurrent execution. Locks and registry lookups remain outside
+layer and quantized inner loops, and the CPU path remains lock-free.
+
+Against commit `e908599`, a paired warmed benchmark measured a 20-token Gemma4
+prompt at 29.44 seconds versus 30.18 seconds, and six decoded tokens at 10.66
+seconds versus 10.68 seconds. Allocation was effectively unchanged (109.00 MB
+prompt and 69.33 MB decode in both revisions).
+
+**Exit criterion met:** the same model and step implementation safely serve two
+independent contexts concurrently, with no measured inference regression.
 
 ## 6. Centralize GGML type descriptors
 

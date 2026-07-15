@@ -28,6 +28,7 @@
            #:architecture-descriptor-p
            #:architecture-descriptor-tokenizer-policy
            #:call-with-aligned-tensor-mapping
+           #:call-with-inference-context
            #:call-with-file
            #:call-with-mapped-file
            #:apply-repetition-penalty
@@ -41,6 +42,7 @@
            #:close-gemv-runtime
            #:close-handle
            #:close-model
+           #:close-inference-context
            #:create-file
            #:dequantize-q4-k-m
            #:dequantize-q6-k
@@ -80,11 +82,17 @@
            #:make-gemma4-step-function
            #:make-accelerator-backend
            #:make-architecture-step-function
+           #:make-inference-context
            #:make-llama-step-function
            #:make-qwen2-step-function
            #:model-gpu-layer-projection-names
            #:model-npu-layer-projection-names
            #:model-accelerator-layer-projection-names
+           #:inference-context-closed-p
+           #:inference-context-context-limit
+           #:inference-context-model
+           #:inference-context-p
+           #:inference-context-position
            #:gpu-backend-available-p
            #:gpu-backend-runtime-version
            #:npu-backend-available-p
@@ -110,6 +118,7 @@
            #:read-gguf-header
            #:read-gguf-kv-pairs
            #:read-gguf-tensor-infos
+           #:reset-inference-context
            #:rms-norm
            #:sample-from-probabilities
            #:sample-token-id-from-logits
@@ -124,5 +133,6 @@
            #:unmap-view-of-file
            #:vector-matrix-multiply
            #:with-aligned-tensor-mapping
+           #:with-inference-context
            #:with-file-handle
            #:with-mapped-file))

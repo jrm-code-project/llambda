@@ -252,7 +252,7 @@ runs skip export.
 ;; Load a model and run an end-to-end inference pass
 (llambda:test-gguf-file-response 
   "D:/path/to/your/model/gemma-4-E4B-it-Q4_K_M.gguf" 
-  "Write a haiku about a hacker drinking coffee."
+  :prompt "Write a haiku about a hacker drinking coffee."
   :top-k 40 
   :top-p 0.95
   :repetition-penalty 1.15)
